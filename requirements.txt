@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+google-genai
+deep-translator
+python-docx
+python-pptx
+openpyxl
+pypdf
+pillow
+requests
+python-multipart
