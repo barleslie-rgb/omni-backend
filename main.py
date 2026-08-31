@@ -7,7 +7,7 @@ from typing import Optional
 
 from deep_translator import GoogleTranslator
 from docx import Document
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from google import genai
@@ -41,7 +41,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-import os
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 client: Optional[genai.Client] = None
@@ -66,6 +65,16 @@ latest_uploaded_filename: str = "document"
 detected_travel_destination: Optional[str] = None
 chat_conversation_history: list[str] = []
 AVAILABLE_MODELS = ['gemini-3.6-flash', 'gemini-3.7-flash']
+
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "Omni Super-App Enterprise API",
+        "version": "40.0.0",
+        "docs_url": "/docs"
+    }
 
 
 def call_gemini_with_retry(prompt: str) -> str:
@@ -232,7 +241,11 @@ Provide specific named places, addresses, contact details, and practical booking
 
 
 @app.post("/api/v1/convert-file")
-async def convert_file(file: UploadFile = File(...), target_format: str = Form(...)):
+async def convert_file(
+    request: Request,
+    file: UploadFile = File(...),
+    target_format: str = Form(...)
+):
     filename = file.filename or "uploaded_file"
     file_path = os.path.join(UPLOAD_DIR, filename)
     with open(file_path, "wb") as buffer:
@@ -306,7 +319,8 @@ async def convert_file(file: UploadFile = File(...), target_format: str = Form(.
         else:
             shutil.copy(file_path, out_path)
 
-        download_url = f"http://localhost:8000/api/v1/download-file/{out_filename}"
+        base_url = str(request.base_url).rstrip("/")
+        download_url = f"{base_url}/api/v1/download-file/{out_filename}"
         return JSONResponse(content={"status": "success", "download_url": download_url, "converted_filename": out_filename})
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Conversion failed: {str(e)}")
@@ -419,12 +433,15 @@ Text:
 
 @app.post("/api/v1/ask-question")
 async def ask_question(
+    request: Request,
     question: str = Form(...),
     target_language: str = Form("English"),
     export_format: str = Form("none"),
     file: Optional[UploadFile] = File(None)
 ):
     global latest_document_context, latest_uploaded_filename, chat_conversation_history
+
+    base_url = str(request.base_url).rstrip("/")
 
     if file is not None and file.filename:
         latest_uploaded_filename = file.filename
@@ -460,7 +477,6 @@ async def ask_question(
 
     chat_conversation_history.append(f"User: {question}")
 
-    # Check for image generation request
     intent_prompt = f"""
 Analyze the user's message: "{question}"
 Is the user asking to generate, create, draw, design, or render an image, photo, visual artwork, or logo?
@@ -478,7 +494,7 @@ Respond with a strict JSON:
         img_prompt = intent_data.get("image_prompt") or question
         saved_img_name = generate_ai_image(img_prompt, "chat_ai_gen")
         if saved_img_name:
-            generated_img_url = f"http://localhost:8000/api/v1/download-file/{saved_img_name}"
+            generated_img_url = f"{base_url}/api/v1/download-file/{saved_img_name}"
             answer = intent_data.get("text_response") or f"Here is the generated image for: '{question}'"
         else:
             answer = "Image generated based on your prompt."
@@ -516,7 +532,7 @@ Task: Answer the user's question, analyze document details, verify against scams
             for line in answer.split("\n"):
                 doc.add_paragraph(line)
             doc.save(out_path)
-            download_url = f"http://localhost:8000/api/v1/download-file/{out_filename}"
+            download_url = f"{base_url}/api/v1/download-file/{out_filename}"
         elif export_format == "xlsx":
             out_filename = f"{base_name}_studio_export.xlsx"
             out_path = os.path.join(EXPORT_DIR, out_filename)
@@ -526,7 +542,7 @@ Task: Answer the user's question, analyze document details, verify against scams
                 for i, line in enumerate(answer.split("\n"), start=1):
                     ws.cell(row=i, column=1, value=line)
                 wb.save(out_path)
-            download_url = f"http://localhost:8000/api/v1/download-file/{out_filename}"
+            download_url = f"{base_url}/api/v1/download-file/{out_filename}"
         elif export_format == "pptx" and HAS_PPTX:
             out_filename = f"{base_name}_studio_export.pptx"
             out_path = os.path.join(EXPORT_DIR, out_filename)
@@ -535,13 +551,13 @@ Task: Answer the user's question, analyze document details, verify against scams
             slide.shapes.title.text = "Omni Studio Export"
             slide.placeholders[1].text = answer[:1000]
             prs.save(out_path)
-            download_url = f"http://localhost:8000/api/v1/download-file/{out_filename}"
+            download_url = f"{base_url}/api/v1/download-file/{out_filename}"
         elif export_format == "txt":
             out_filename = f"{base_name}_studio_export.txt"
             out_path = os.path.join(EXPORT_DIR, out_filename)
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(answer)
-            download_url = f"http://localhost:8000/api/v1/download-file/{out_filename}"
+            download_url = f"{base_url}/api/v1/download-file/{out_filename}"
 
     return JSONResponse(content={
         "status": "success",
@@ -569,4 +585,4 @@ async def play_audio(filename: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port =
