@@ -41,13 +41,14 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 client: Optional[genai.Client] = None
-try:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-except Exception:
-    client = None
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        client = None
 
 LANG_MAP = {
     "English": "en", "Hindi (हिन्दी)": "hi", "Marathi (मराठी)": "mr",
@@ -113,14 +114,13 @@ def call_gemini_json(prompt: str) -> dict:
 
 
 def generate_ai_image(prompt: str, filename_prefix: str = "ai_gen") -> Optional[str]:
-    """Generates a high-quality AI raster image (.jpg) and saves it to EXPORT_DIR."""
     try:
         out_filename = f"{filename_prefix}_{int(time.time())}.jpg"
         out_path = os.path.join(EXPORT_DIR, out_filename)
 
         encoded_prompt = urllib.parse.quote(prompt.strip())
         pollinations_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true&seed={int(time.time())}"
-        
+
         resp = requests.get(pollinations_url, timeout=25)
         if resp.status_code == 200 and len(resp.content) > 5000:
             with open(out_path, "wb") as f:
@@ -581,8 +581,3 @@ async def play_audio(filename: str):
     if os.path.exists(path):
         return FileResponse(path, media_type="audio/mpeg")
     raise HTTPException(status_code=404, detail="Not found")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port =
