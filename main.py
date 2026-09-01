@@ -34,10 +34,21 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# STABLE MODEL DEFINITIONS
+# ACTIVE PRODUCTION MODEL REGISTRIES
 # -------------------------------------------------------------
-GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
-GEMINI_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "llama3-70b-8192",
+    "llama3-8b-8192"
+]
+
+GEMINI_MODELS = [
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.0-flash"
+]
 
 
 def get_groq_client() -> Optional[Groq]:
@@ -51,10 +62,10 @@ def get_gemini_keys() -> list:
 
 
 # -------------------------------------------------------------
-# AI ENGINE HELPERS (WITH MULTI-MODEL CASCADE)
+# AI ENGINE HELPERS (WITH DETAILED FALLBACK LOGS)
 # -------------------------------------------------------------
 def ask_groq(prompt: str, system_prompt: str = "You are Omni AI inside Omni TouristOS.") -> str:
-    """Executes pure text queries across Groq models sequentially."""
+    """Executes text generation sequentially across active Groq models."""
     client = get_groq_client()
     if not client:
         raise ValueError("GROQ_API_KEY is not configured on Render.")
@@ -75,10 +86,11 @@ def ask_groq(prompt: str, system_prompt: str = "You are Omni AI inside Omni Tour
             if res:
                 return res.strip()
         except Exception as e:
+            print(f"[Groq Attempt Failed on {model_name}]: {e}")
             last_err = e
             continue
 
-    raise Exception(f"Groq cascade failed: {last_err}")
+    raise Exception(f"All Groq models exhausted. Last error: {last_err}")
 
 
 def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str:
@@ -100,6 +112,7 @@ def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str
                 if response and response.text:
                     return response.text.strip()
             except Exception as e:
+                print(f"[Gemini Attempt Failed on {model_name}]: {e}")
                 last_err = e
                 continue
 
@@ -107,7 +120,7 @@ def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str
 
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
-    """Uses Groq as primary engine, falls back to Gemini if throttled."""
+    """Uses Groq LPU as primary engine; falls back to Gemini if throttled."""
     # 1. Primary: Groq LPU
     try:
         return ask_groq(prompt, system_prompt)
@@ -124,7 +137,8 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
                 res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}")
                 if res and res.text:
                     return res.text.strip()
-            except Exception:
+            except Exception as gem_err:
+                print(f"[Gemini Fallback Error on {model_name}]: {gem_err}")
                 continue
 
     return "Omni AI is currently processing high volume. Please tap send again in a few seconds."
@@ -314,7 +328,7 @@ async def touristos_recommend(
                 {"title": f"The Grand {location} Architectural Arch", "rating": "⭐ 4.8 (21k+)", "dist": "West Corridor", "phone": "Public Landmark", "images": ["[https://images.unsplash.com/photo-1595658658481-d53d3f999875?q=80&w=800](https://images.unsplash.com/photo-1595658658481-d53d3f999875?q=80&w=800)"], "tag": "Iconic Architecture"}
             ],
             "hotels": [
-                {"name": f"The Grand Palace Hotel {location}", "type": "Luxury Hotel", "price": "₹3,499/night", "rating": "⭐ 4.8", "reviews": "1,450+ Verified Reviews", "address": f"Prime District, {location}", "phone": "+91 98200 11223", "description": "Sanitized accommodation with certified safety standards.", "amenities": ["Free Wi-Fi", "AC", "Breakfast Included", "Pool"]},
+                {"name": f"The Grand Palace Hotel {location}", "type": "Luxury Hotel", "price": "₹3,499/night", "rating": "⭐ 4.8", "reviews": "1,450+ Verified Reviews", "address": f"Prime District, {location}", "phone": "+91 98200 11223", "description": "Prime sanitized accommodation with certified safety standards.", "amenities": ["Free Wi-Fi", "AC", "Breakfast Included", "Pool"]},
                 {"name": f"Comfort Suites Residency {location}", "type": "Boutique Hotel", "price": "₹2,199/night", "rating": "⭐ 4.7", "reviews": "920+ Verified Reviews", "address": f"Station Road, {location}", "phone": "+91 98200 44556", "description": "Highly rated executive hotel with complimentary breakfast.", "amenities": ["Free Wi-Fi", "AC", "Breakfast Included"]}
             ],
             "best_things_to_do": [
