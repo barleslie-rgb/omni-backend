@@ -4,7 +4,7 @@ import re
 import uuid
 import urllib.parse
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,44 +34,66 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# ACTIVE PRODUCTION MODEL REGISTRIES
+# DYNAMIC MODEL DISCOVERY HELPERS
 # -------------------------------------------------------------
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "gemma2-9b-it",
-    "llama3-70b-8192",
-    "llama3-8b-8192"
-]
-
-GEMINI_MODELS = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash"
-]
-
-
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
     return Groq(api_key=key) if key else None
 
 
-def get_gemini_keys() -> list:
+def get_gemini_keys() -> List[str]:
     raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
     return [k.strip() for k in raw_keys.split(",") if k.strip()]
 
 
+def get_active_groq_models(client: Groq) -> List[str]:
+    """Queries Groq API live to get only valid, non-decommissioned chat models."""
+    try:
+        models_data = client.models.list().data
+        active_ids = [m.id for m in models_data if "whisper" not in m.id and "distil" not in m.id]
+        
+        # Priority sort: text & general reasoning first
+        priority = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192"]
+        sorted_models = []
+        for p in priority:
+            if p in active_ids:
+                sorted_models.append(p)
+        for m_id in active_ids:
+            if m_id not in sorted_models:
+                sorted_models.append(m_id)
+        return sorted_models if sorted_models else ["llama-3.1-8b-instant"]
+    except Exception as e:
+        print(f"[Groq Model Discovery Warning]: {e}")
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+
+
+def get_active_gemini_models() -> List[str]:
+    """Queries Google Gemini API live to get only valid, accessible models."""
+    try:
+        valid_models = []
+        for m in genai.list_models():
+            if "generateContent" in m.supported_generation_methods:
+                model_clean = m.name.replace("models/", "")
+                valid_models.append(model_clean)
+        return valid_models if valid_models else ["gemini-1.5-flash", "gemini-pro"]
+    except Exception as e:
+        print(f"[Gemini Model Discovery Warning]: {e}")
+        return ["gemini-1.5-flash", "gemini-pro"]
+
+
 # -------------------------------------------------------------
-# AI ENGINE HELPERS (WITH DETAILED FALLBACK LOGS)
+# AI EXECUTION ENGINES
 # -------------------------------------------------------------
 def ask_groq(prompt: str, system_prompt: str = "You are Omni AI inside Omni TouristOS.") -> str:
-    """Executes text generation sequentially across active Groq models."""
+    """Executes text generation using Groq's active live model pool."""
     client = get_groq_client()
     if not client:
         raise ValueError("GROQ_API_KEY is not configured on Render.")
     
+    active_models = get_active_groq_models(client)
     last_err = None
-    for model_name in GROQ_MODELS:
+
+    for model_name in active_models:
         try:
             completion = client.chat.completions.create(
                 model=model_name,
@@ -84,17 +106,18 @@ def ask_groq(prompt: str, system_prompt: str = "You are Omni AI inside Omni Tour
             )
             res = completion.choices[0].message.content
             if res:
+                print(f"[Groq Success] Generated using {model_name}")
                 return res.strip()
         except Exception as e:
-            print(f"[Groq Attempt Failed on {model_name}]: {e}")
+            print(f"[Groq Model Skipped on {model_name}]: {e}")
             last_err = e
             continue
 
-    raise Exception(f"All Groq models exhausted. Last error: {last_err}")
+    raise Exception(f"All active Groq models failed. Last error: {last_err}")
 
 
 def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str:
-    """Executes document/image analysis across valid Gemini models."""
+    """Executes multimodal analysis using Gemini's live model pool."""
     keys = get_gemini_keys()
     if not keys:
         raise ValueError("No GEMINI_API_KEY configured.")
@@ -102,7 +125,9 @@ def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str
     last_err = None
     for key in keys:
         genai.configure(api_key=key)
-        for model_name in GEMINI_MODELS:
+        active_models = get_active_gemini_models()
+        
+        for model_name in active_models:
             try:
                 model = genai.GenerativeModel(model_name)
                 response = model.generate_content([
@@ -110,38 +135,41 @@ def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str
                     {"mime_type": mime_type, "data": file_bytes}
                 ])
                 if response and response.text:
+                    print(f"[Gemini Success] Processed audit with {model_name}")
                     return response.text.strip()
             except Exception as e:
-                print(f"[Gemini Attempt Failed on {model_name}]: {e}")
+                print(f"[Gemini Model Skipped on {model_name}]: {e}")
                 last_err = e
                 continue
 
-    raise Exception(f"Gemini audit error: {last_err}")
+    raise Exception(f"Gemini processing error: {last_err}")
 
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
-    """Uses Groq LPU as primary engine; falls back to Gemini if throttled."""
+    """Uses Groq LPU primary, with live Gemini fallback."""
     # 1. Primary: Groq LPU
     try:
         return ask_groq(prompt, system_prompt)
     except Exception as groq_err:
-        print(f"[Groq Notice]: {groq_err}. Falling back to Gemini...")
+        print(f"[Groq Throttled/Error]: {groq_err}. Falling back to Gemini...")
 
-    # 2. Fallback: Gemini Flash/Pro
+    # 2. Fallback: Gemini
     keys = get_gemini_keys()
     for key in keys:
         genai.configure(api_key=key)
-        for model_name in GEMINI_MODELS:
+        active_models = get_active_gemini_models()
+        for model_name in active_models:
             try:
                 model = genai.GenerativeModel(model_name)
                 res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}")
                 if res and res.text:
+                    print(f"[Gemini Fallback Success] using {model_name}")
                     return res.text.strip()
             except Exception as gem_err:
-                print(f"[Gemini Fallback Error on {model_name}]: {gem_err}")
+                print(f"[Gemini Fallback Skipped on {model_name}]: {gem_err}")
                 continue
 
-    return "Omni AI is currently processing high volume. Please tap send again in a few seconds."
+    return "Omni AI is processing requests. Please tap send again in a moment."
 
 
 def generate_dynamic_image_url(prompt: str) -> str:
@@ -216,7 +244,7 @@ async def ask_question(
 
 
 # -------------------------------------------------------------
-# 2. PAPERPILOT DOCUMENT AUDITOR (Gemini Multimodal)
+# 2. PAPERPILOT DOCUMENT AUDITOR (Gemini Multimodal Vision)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
