@@ -29,52 +29,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Create local storage for exports & converted files
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# INITIALIZE CLIENTS (Groq + Gemini)
+# STABLE MODEL DEFINITIONS
 # -------------------------------------------------------------
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-raw_gemini_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
-GEMINI_KEYS = [k.strip() for k in raw_gemini_keys.split(",") if k.strip()]
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+GEMINI_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-if GEMINI_KEYS:
-    genai.configure(api_key=GEMINI_KEYS[0])
+def get_groq_client() -> Optional[Groq]:
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    return Groq(api_key=key) if key else None
 
-GEMINI_MODELS = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-8b"]
+
+def get_gemini_keys() -> list:
+    raw_keys = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
+    return [k.strip() for k in raw_keys.split(",") if k.strip()]
 
 
 # -------------------------------------------------------------
-# AI ENGINE HELPERS
+# AI ENGINE HELPERS (WITH MULTI-MODEL CASCADE)
 # -------------------------------------------------------------
 def ask_groq(prompt: str, system_prompt: str = "You are Omni AI inside Omni TouristOS.") -> str:
-    """Ultra-fast LPU generation with 14,400 free requests/day"""
-    if not groq_client:
+    """Executes pure text queries across Groq models sequentially."""
+    client = get_groq_client()
+    if not client:
         raise ValueError("GROQ_API_KEY is not configured on Render.")
     
-    completion = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.6,
-        max_tokens=2048,
-    )
-    return completion.choices[0].message.content or ""
+    last_err = None
+    for model_name in GROQ_MODELS:
+        try:
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.6,
+                max_tokens=2048,
+            )
+            res = completion.choices[0].message.content
+            if res:
+                return res.strip()
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise Exception(f"Groq cascade failed: {last_err}")
 
 
 def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str:
-    """Multimodal document analysis with API key and model rotation fallback"""
+    """Executes document/image analysis across valid Gemini models."""
+    keys = get_gemini_keys()
+    if not keys:
+        raise ValueError("No GEMINI_API_KEY configured.")
+
     last_err = None
-    for key in (GEMINI_KEYS or [""]):
-        if key:
-            genai.configure(api_key=key)
+    for key in keys:
+        genai.configure(api_key=key)
         for model_name in GEMINI_MODELS:
             try:
                 model = genai.GenerativeModel(model_name)
@@ -83,44 +98,45 @@ def ask_gemini_multimodal(prompt: str, file_bytes: bytes, mime_type: str) -> str
                     {"mime_type": mime_type, "data": file_bytes}
                 ])
                 if response and response.text:
-                    return response.text
+                    return response.text.strip()
             except Exception as e:
                 last_err = e
                 continue
-    raise Exception(f"Gemini processing error: {last_err}")
+
+    raise Exception(f"Gemini audit error: {last_err}")
 
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
-    """Prefers Groq for speed; falls back to Gemini if throttled."""
-    if groq_client:
-        try:
-            return ask_groq(prompt, system_prompt)
-        except Exception as groq_err:
-            print(f"[Groq Throttled/Error]: {groq_err}. Falling back to Gemini Flash...")
-    
-    # Fallback to Gemini
-    for key in (GEMINI_KEYS or [""]):
-        if key:
-            genai.configure(api_key=key)
+    """Uses Groq as primary engine, falls back to Gemini if throttled."""
+    # 1. Primary: Groq LPU
+    try:
+        return ask_groq(prompt, system_prompt)
+    except Exception as groq_err:
+        print(f"[Groq Notice]: {groq_err}. Falling back to Gemini...")
+
+    # 2. Fallback: Gemini Flash/Pro
+    keys = get_gemini_keys()
+    for key in keys:
+        genai.configure(api_key=key)
         for model_name in GEMINI_MODELS:
             try:
                 model = genai.GenerativeModel(model_name)
                 res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}")
                 if res and res.text:
-                    return res.text
+                    return res.text.strip()
             except Exception:
                 continue
-    return "Omni AI is currently busy. Please try sending your query again in a moment."
+
+    return "Omni AI is currently processing high volume. Please tap send again in a few seconds."
 
 
 def generate_dynamic_image_url(prompt: str) -> str:
-    """Generates a high-quality 3D render image URL based on the prompt."""
     cleaned_prompt = urllib.parse.quote(prompt.strip())
     return f"https://image.pollinations.ai/prompt/{cleaned_prompt}?width=1024&height=1024&nologo=true&seed={uuid.uuid4().hex[:8]}"
 
 
 # -------------------------------------------------------------
-# 1. LIVE OMNI AI STUDIO CHAT (Groq LPU + Gemini Vision)
+# 1. OMNI AI STUDIO CHAT (Groq Primary -> Gemini Fallback)
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -135,42 +151,33 @@ async def ask_question(
         image_url = ""
         download_url = ""
 
-        # A. If an image generation query is requested
         if is_image_request and not file:
             image_url = generate_dynamic_image_url(question)
             system_msg = (
                 f"You are Omni AI Studio inside Omni TouristOS developed by Velnova Enterprises. "
-                f"The user requested an image: '{question}'. Acknowledge the generation creatively, explain the 3D design attributes, "
-                f"and provide tips in {target_language}."
+                f"The user requested an image: '{question}'. Acknowledge the creation and explain its visual concept in {target_language}."
             )
             answer = ask_hybrid_text(question, system_msg)
 
-        # B. If a file is uploaded alongside the question -> Use Gemini Multimodal
         elif file:
             file_bytes = await file.read()
             mime_type = file.content_type or "application/octet-stream"
-            prompt = (
-                f"Language: {target_language}. Answer this question based on the attached document: {question}. "
-                f"Use clean Markdown formatting."
-            )
+            prompt = f"In {target_language}: {question}. Review and analyze this document thoroughly."
             answer = ask_gemini_multimodal(prompt, file_bytes, mime_type)
 
-        # C. Pure Text Conversation -> Ultra-fast Groq LPU
         else:
             system_msg = (
                 f"You are Omni AI Studio inside Omni TouristOS developed by Velnova Enterprises. "
-                f"Answer accurately and comprehensively in {target_language}. "
-                f"Use bold headers, bullet points, and clean Markdown formatting."
+                f"Provide helpful, well-structured responses in {target_language}. Use Markdown formatting."
             )
             answer = ask_hybrid_text(question, system_msg)
 
-        # D. Generate file export if requested
         if export_format in ["docx", "xlsx", "pptx", "txt"]:
             file_id = f"OmniExport_{uuid.uuid4().hex[:6]}.{export_format}"
             file_path = os.path.join(DOWNLOADS_DIR, file_id)
             
             with open(file_path, "w", encoding="utf-8") as f:
-                f.write(f"--- OMNI TOURISTOS EXPORT ---\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nLanguage: {target_language}\n\n")
+                f.write(f"--- OMNI TOURISTOS EXPORT ---\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nLanguage: {target_language}\n\n")
                 f.write(answer)
             
             base_url = str(request.base_url).rstrip("/")
@@ -187,7 +194,7 @@ async def ask_question(
     except Exception as e:
         return {
             "status": "error",
-            "answer": f"Omni AI Core Notice: {str(e)}",
+            "answer": f"Omni Assistant Notice: {str(e)}",
             "image_url": "",
             "audio_url": "",
             "download_url": ""
@@ -195,7 +202,7 @@ async def ask_question(
 
 
 # -------------------------------------------------------------
-# 2. PAPERPILOT DOCUMENT AUDITOR (Gemini Multimodal Vision)
+# 2. PAPERPILOT DOCUMENT AUDITOR (Gemini Multimodal)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -207,23 +214,23 @@ async def analyze_document(
         mime_type = file.content_type or "application/pdf"
         
         audit_prompt = (
-            f"You are Omni PaperPilot, the Document Security & Fraud Auditor in Omni TouristOS (Velnova Enterprises). "
-            f"Audit this uploaded document in {target_language}. "
-            f"Format strictly with these sections:\n"
+            f"You are Omni PaperPilot in Omni TouristOS (Velnova Enterprises). "
+            f"Audit this uploaded document in {target_language}.\n"
+            f"Structure your response with these exact headers:\n"
             f"### 📋 Executive Summary\n"
             f"### 🛡️ Fraud, Penalty & Trap Analysis\n"
             f"### 💰 Financial & Transaction Totals\n"
             f"### ✅ Verification Verdict\n\n"
-            f"If this document mentions a destination, city, hotel location, or flight route, append at the very end on a new line: "
-            f"DESTINATION: <City Name>"
+            f"If this is a travel ticket, flight booking, hotel receipt, or travel brochure, append at the end:\n"
+            f"DESTINATION: <City/Place Name>"
         )
 
         analysis_text = ask_gemini_multimodal(audit_prompt, file_bytes, mime_type)
 
-        detected_destination = ""
+        detected_destination = None
         if "DESTINATION:" in analysis_text:
             match = re.search(r"DESTINATION:\s*([^\n\r]+)", analysis_text)
-            if match:
+            if match and match.group(1).strip():
                 detected_destination = match.group(1).strip()
 
         return {
@@ -239,13 +246,13 @@ async def analyze_document(
             "status": "error",
             "data": {
                 "plain_summary": f"Document Audit Notice: {str(e)}",
-                "detected_destination": ""
+                "detected_destination": None
             }
         }
 
 
 # -------------------------------------------------------------
-# 3. TOURISTOS TRAVEL & STAYS ENGINE
+# 3. TOURISTOS DESTINATION & HOTEL PLANNER
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -256,27 +263,24 @@ async def touristos_recommend(
     target_language: str = Form("English")
 ):
     system_prompt = (
-        f"You are the TouristOS Smart Destination Planner for Omni TouristOS. "
-        f"Generate a comprehensive travel dossier for '{location}' in {target_language} for a {group_type} with dietary preference '{dietary_preference}' and duration '{time_available}'. "
-        f"Return ONLY valid, raw JSON (no Markdown backticks, no markdown fence) matching this schema exactly:\n"
+        f"You are the TouristOS Planner for Omni TouristOS. "
+        f"Generate a travel dossier for '{location}' in {target_language} for a {group_type} with dietary preference '{dietary_preference}' and duration '{time_available}'. "
+        f"Return ONLY raw JSON matching this schema:\n"
         f"{{\n"
-        f'  "destination_summary": "Comprehensive overview of {location}...",\n'
+        f'  "destination_summary": "Overview of {location}...",\n'
         f'  "distance_from_center": "Central Location",\n'
-        f'  "transport_availability": "Metro, Cabs, Local Transit",\n'
+        f'  "transport_availability": "Metro, Cabs, Transit",\n'
         f'  "facilities": ["High-Speed Wi-Fi", "Verified Stays", "ATM Access", "24/7 Transit"],\n'
         f'  "spots": [\n'
-        f'    {{"title": "Spot Name 1", "rating": "⭐ 4.9 (40k+)", "dist": "Downtown", "phone": "+91 22 2284 3989", "images": ["https://images.unsplash.com/photo-1570168007204-dfb528c6958f?q=80&w=800"], "tag": "Historic Landmark"}},\n'
-        f'    {{"title": "Spot Name 2", "rating": "⭐ 4.8 (35k+)", "dist": "Coastline", "phone": "Public Promenade", "images": ["https://images.unsplash.com/photo-1566552881560-0be862a7c445?q=80&w=800"], "tag": "Scenic View"}},\n'
-        f'    {{"title": "Spot Name 3", "rating": "⭐ 4.7 (20k+)", "dist": "City Center", "phone": "Cultural Center", "images": ["https://images.unsplash.com/photo-1595658658481-d53d3f999875?q=80&w=800"], "tag": "Architecture"}}\n'
+        f'    {{"title": "Spot 1", "rating": "⭐ 4.9 (40k+)", "dist": "Downtown", "phone": "+91 22 2284 3989", "images": ["https://images.unsplash.com/photo-1570168007204-dfb528c6958f?q=80&w=800"], "tag": "Historic Landmark"}}\n'
         f'  ],\n'
         f'  "hotels": [\n'
-        f'    {{"name": "Verified Stay 1", "type": "Luxury Hotel", "price": "₹3,499/night", "rating": "⭐ 4.8", "reviews": "1,400+ Reviews", "address": "Prime Location, {location}", "phone": "+91 98200 11223", "description": "Sanitized accommodation with premium amenities.", "amenities": ["Free Wi-Fi", "AC", "Breakfast", "Pool"]}},\n'
-        f'    {{"name": "Verified Stay 2", "type": "Boutique Residency", "price": "₹2,199/night", "rating": "⭐ 4.6", "reviews": "850+ Reviews", "address": "City Central, {location}", "phone": "+91 98200 44556", "description": "Cozy verified stay close to transit hubs.", "amenities": ["Free Wi-Fi", "AC", "Breakfast"]}}\n'
+        f'    {{"name": "Verified Stay 1", "type": "Luxury Hotel", "price": "₹3,499/night", "rating": "⭐ 4.8", "reviews": "1,400+ Reviews", "address": "Prime Location, {location}", "phone": "+91 98200 11223", "description": "Sanitized accommodation.", "amenities": ["Free Wi-Fi", "AC", "Breakfast"]}}\n'
         f'  ],\n'
-        f'  "best_things_to_do": ["Explore prime cultural landmarks", "Experience local shoreline promenade", "Visit heritage architecture"],\n'
-        f'  "best_food_to_try": ["Local specialty dishes", "Traditional street delicacies", "Top-rated vegetarian food hubs"],\n'
+        f'  "best_things_to_do": ["Explore prime cultural landmarks"],\n'
+        f'  "best_food_to_try": ["Local specialty dishes"],\n'
         f'  "emergency": {{\n'
-        f'    "hospital_name": "Apollo / Lilavati Multi-Specialty Hospital",\n'
+        f'    "hospital_name": "Apollo Multi-Specialty Hospital",\n'
         f'    "hospital_phone": "+91 22 2675 1000",\n'
         f'    "police_name": "{location} Police HQ",\n'
         f'    "police_phone": "+91 22 2262 0111",\n'
@@ -310,7 +314,7 @@ async def touristos_recommend(
                 {"title": f"The Grand {location} Architectural Arch", "rating": "⭐ 4.8 (21k+)", "dist": "West Corridor", "phone": "Public Landmark", "images": ["[https://images.unsplash.com/photo-1595658658481-d53d3f999875?q=80&w=800](https://images.unsplash.com/photo-1595658658481-d53d3f999875?q=80&w=800)"], "tag": "Iconic Architecture"}
             ],
             "hotels": [
-                {"name": f"The Grand Palace Hotel {location}", "type": "Luxury Hotel", "price": "₹3,499/night", "rating": "⭐ 4.8", "reviews": "1,450+ Verified Reviews", "address": f"Prime District, {location}", "phone": "+91 98200 11223", "description": "Prime sanitized accommodation with certified safety standards.", "amenities": ["Free Wi-Fi", "AC", "Breakfast Included", "Pool"]},
+                {"name": f"The Grand Palace Hotel {location}", "type": "Luxury Hotel", "price": "₹3,499/night", "rating": "⭐ 4.8", "reviews": "1,450+ Verified Reviews", "address": f"Prime District, {location}", "phone": "+91 98200 11223", "description": "Sanitized accommodation with certified safety standards.", "amenities": ["Free Wi-Fi", "AC", "Breakfast Included", "Pool"]},
                 {"name": f"Comfort Suites Residency {location}", "type": "Boutique Hotel", "price": "₹2,199/night", "rating": "⭐ 4.7", "reviews": "920+ Verified Reviews", "address": f"Station Road, {location}", "phone": "+91 98200 44556", "description": "Highly rated executive hotel with complimentary breakfast.", "amenities": ["Free Wi-Fi", "AC", "Breakfast Included"]}
             ],
             "best_things_to_do": [
@@ -352,7 +356,7 @@ async def explore_chat(
         system_msg = (
             f"You are the Omni Tour Concierge inside Omni TouristOS (Velnova Enterprises) for '{spot_name}'. "
             f"The user is traveling as a {group_type} with dietary preference '{dietary_preference}'. "
-            f"Provide helpful, concise, local safety and logistical guidance in {target_language}. Use Markdown."
+            f"Provide local safety and logistical guidance in {target_language}. Use Markdown formatting."
         )
         answer = ask_hybrid_text(f"Regarding {spot_name}: {question}", system_msg)
         return {"status": "success", "answer": answer, "audio_url": ""}
@@ -395,10 +399,12 @@ async def convert_file(
 # -------------------------------------------------------------
 @app.get("/")
 def root():
+    groq_ok = bool(os.environ.get("GROQ_API_KEY", "").strip())
+    gemini_keys = get_gemini_keys()
     return {
         "app": "Omni TouristOS Cloud Backend",
         "publisher": "Velnova Enterprises",
         "status": "Live & Operational",
-        "groq_lpu": "Active" if groq_client else "Missing Key",
-        "gemini_keys_loaded": len(GEMINI_KEYS)
+        "groq_lpu": "Active" if groq_ok else "Missing Key",
+        "gemini_keys_loaded": len(gemini_keys)
     }
