@@ -18,8 +18,8 @@ import google.generativeai as genai
 
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="Fast Dual-Engine Forensic & Travel Platform",
-    version="48.1.0"
+    description="High-Throughput Vision & Travel Engine",
+    version="48.5.0"
 )
 
 app.add_middleware(
@@ -35,7 +35,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & CLIENT DISCOVERY
+# KEYS & FAST DISCOVERY
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -46,16 +46,22 @@ def get_gemini_keys() -> List[str]:
     return [k.strip() for k in raw.split(",") if k.strip()]
 
 def get_active_groq_model(client: Groq) -> str:
+    """Prioritizes standard high-rate-limit models, avoiding restrictive preview/scout models."""
     try:
         models_data = client.models.list().data
-        active_ids = [m.id for m in models_data if "whisper" not in m.id and "guard" not in m.id]
-        for p in ["llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]:
+        active_ids = [m.id for m in models_data]
+        # llama-3.1-8b-instant has a 500k+ TPM limit on Groq
+        for p in ["llama-3.1-8b-instant", "llama3-8b-8192", "mixtral-8x7b-32768", "llama-3.3-70b-versatile"]:
             if p in active_ids:
                 return p
         if active_ids:
+            # Filter out scout/experimental models
+            filtered = [m for m in active_ids if "scout" not in m and "guard" not in m and "whisper" not in m]
+            if filtered:
+                return filtered[0]
             return active_ids[0]
     except Exception as e:
-        print(f"[Groq Discovery]: {e}")
+        print(f"[Groq Model Discovery]: {e}")
     return "llama-3.1-8b-instant"
 
 def sanitize_ai_output(text: str) -> str:
@@ -63,35 +69,21 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# HIGH-SPEED MULTIMODAL FORENSIC VISION
+# MULTIMODAL FORENSIC VISION PIPELINE
 # -------------------------------------------------------------
-def prepare_image_payload(file_bytes: bytes):
-    """Normalizes, corrects EXIF orientation, and scales to prevent large network latency."""
+def prepare_image(file_bytes: bytes):
     pil_img = Image.open(io.BytesIO(file_bytes))
     pil_img = ImageOps.exif_transpose(pil_img)
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
-    
-    # Scale if exceeding 1600px
-    max_dim = 1600
-    if max(pil_img.size) > max_dim:
-        pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-        
+    if max(pil_img.size) > 1600:
+        pil_img.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=85)
-    jpeg_bytes = buf.getvalue()
-    b64_str = base64.b64encode(jpeg_bytes).decode("utf-8")
-    return pil_img, jpeg_bytes, b64_str
+    b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return pil_img, buf.getvalue(), b64_str
 
-def execute_gemini_call(key: str, model_name: str, prompt: str, pil_img: Image.Image) -> Optional[str]:
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel(model_name)
-    res = model.generate_content([prompt, pil_img], request_options={"timeout": 12})
-    if res and res.text:
-        return sanitize_ai_output(res.text)
-    return None
-
-def ask_groq_vision_fast(prompt: str, b64_img: str) -> Optional[str]:
+def ask_groq_vision_direct(prompt: str, b64_img: str) -> Optional[str]:
     client = get_groq_client()
     if not client:
         return None
@@ -116,39 +108,39 @@ def ask_groq_vision_fast(prompt: str, b64_img: str) -> Optional[str]:
             if txt:
                 return sanitize_ai_output(txt)
         except Exception as e:
-            print(f"[Groq Vision {vm}]: {e}")
-            continue
+            print(f"[Groq Vision]: {e}")
     return None
 
-def audit_document_dual(prompt: str, file_bytes: bytes) -> Optional[str]:
+def ask_gemini_vision_direct(prompt: str, pil_img: Image.Image) -> Optional[str]:
+    for key in get_gemini_keys():
+        for m in ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
+            try:
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(m)
+                res = model.generate_content([prompt, pil_img], request_options={"timeout": 12})
+                if res and res.text:
+                    return sanitize_ai_output(res.text)
+            except Exception as e:
+                print(f"[Gemini Vision {m}]: {e}")
+                continue
+    return None
+
+def audit_document(prompt: str, file_bytes: bytes) -> Optional[str]:
     try:
-        pil_img, jpeg_bytes, b64_img = prepare_image_payload(file_bytes)
+        pil_img, _, b64_img = prepare_image(file_bytes)
     except Exception as e:
-        print(f"[Image Preparation Error]: {e}")
+        print(f"[Image Prep]: {e}")
         return None
 
-    # Target the verified Gemini models first with strict 12s timeout
-    keys = get_gemini_keys()
-    gemini_candidates = ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro-vision"]
-    
-    for key in keys:
-        for model_name in gemini_candidates:
-            try:
-                print(f"[PaperPilot]: Trying Google {model_name}...")
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(execute_gemini_call, key, model_name, prompt, pil_img)
-                    out = future.result(timeout=14)
-                    if out and len(out.strip()) > 20:
-                        return out
-            except Exception as e:
-                print(f"[PaperPilot Gemini Error]: {e}")
-                continue
+    # 1. Primary: Groq Vision LPU (Processes in under 2 seconds, avoiding timeouts)
+    groq_res = ask_groq_vision_direct(prompt, b64_img)
+    if groq_res and len(groq_res.strip()) > 20:
+        return groq_res
 
-    # Instant Failover to Groq LPU Vision (Completes in 1-2 seconds)
-    print("[PaperPilot Vision Failover]: Running Groq Vision LPU...")
-    groq_out = ask_groq_vision_fast(prompt, b64_img)
-    if groq_out and len(groq_out.strip()) > 20:
-        return groq_out
+    # 2. Secondary: Google Gemini Vision
+    gemini_res = ask_gemini_vision_direct(prompt, pil_img)
+    if gemini_res and len(gemini_res.strip()) > 20:
+        return gemini_res
 
     return None
 
@@ -161,7 +153,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
                 model=chosen,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=3500,
+                max_tokens=3000,
                 timeout=15
             )
             raw = completion.choices[0].message.content
@@ -184,7 +176,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
         except Exception:
             continue
 
-    return "Service is currently busy. Please retry in a few seconds."
+    return "Service is busy. Please try again in a few seconds."
 
 # -------------------------------------------------------------
 # 1. FORENSIC FRAUD & DOCUMENT AUDITOR ENDPOINT
@@ -225,11 +217,11 @@ async def analyze_document(
             f"}}"
         )
 
-        analysis_raw = audit_document_dual(forensic_prompt, file_bytes)
+        analysis_raw = audit_document(forensic_prompt, file_bytes)
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": "Visual analysis engine timed out on current keys. Please check Render logs.",
+                "message": "Visual analysis engine timed out. Please retry.",
                 "data": None
             }
 
@@ -246,10 +238,10 @@ async def analyze_document(
                 "classification": "LEGAL_PROPERTY",
                 "status": "VERIFIED DOCUMENT",
                 "document_title": "Audited Document",
-                "issuing_authority_or_registry": "Identified Registry",
+                "issuing_authority_or_registry": "Registry Department",
                 "parties_and_dates": "Parties & Dates Extracted",
-                "metadata_identifiers": "Serials Extracted",
-                "traps_risks_and_penalties": "Review fine print for cancellation or liability terms.",
+                "metadata_identifiers": "Serials Identified",
+                "traps_risks_and_penalties": "Inspect fine print for liability or cancellation terms.",
                 "financials_or_valuation": {
                     "base_amount": "Recorded",
                     "taxes_and_surcharges": "Recorded fees",
@@ -299,7 +291,7 @@ async def ask_question(
 
         if file:
             fbytes = await file.read()
-            ans = audit_document_dual(f"Answer in {target_language}: {clean_q}", fbytes) or "Unable to inspect document."
+            ans = audit_document(f"Answer in {target_language}: {clean_q}", fbytes) or "Unable to inspect document."
         else:
             ans = ask_hybrid_text(clean_q, sys_prompt)
 
