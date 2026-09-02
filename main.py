@@ -14,12 +14,11 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from groq import Groq
 import google.generativeai as genai
-import requests
 
 app = FastAPI(
     title="Omni TouristOS Cloud Engine",
-    description="Multimodal Intelligence, Image Synthesis & Travel Platform",
-    version="46.0.0"
+    description="Multimodal Intelligence & Travel Platform",
+    version="46.1.0"
 )
 
 app.add_middleware(
@@ -45,101 +44,104 @@ def get_gemini_keys() -> List[str]:
     raw = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
     return [k.strip() for k in raw.split(",") if k.strip()]
 
+def get_active_groq_model(client: Groq) -> str:
+    """Dynamically queries your account to pick a model that exists (prevents 404)."""
+    try:
+        models_data = client.models.list().data
+        active_ids = [m.id for m in models_data if "whisper" not in m.id and "guard" not in m.id]
+        # Priority fallback chain of standard available models
+        priority = [
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            "llama3-70b-8192",
+            "llama3-8b-8192",
+            "mixtral-8x7b-32768"
+        ]
+        for p in priority:
+            if p in active_ids:
+                return p
+        if active_ids:
+            return active_ids[0]
+    except Exception as e:
+        print(f"[Groq Discovery Warning]: {e}")
+    return "llama-3.1-8b-instant"
+
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# DUAL-ENGINE MULTIMODAL VISION
+# MULTIMODAL VISION ENGINE (GEMINI WITH AUTO RGB TRANSPOSITION)
 # -------------------------------------------------------------
-def ask_gemini_vision(prompt: str, file_bytes: bytes, mime_type: str) -> Optional[str]:
+def ask_gemini_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
     keys = get_gemini_keys()
     if not keys:
+        print("[Gemini]: No GEMINI_API_KEY configured.")
         return None
 
-    clean_bytes = file_bytes
-    clean_mime = mime_type
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
-        if pil_img.mode in ("RGBA", "P"):
+        if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=90)
-        clean_bytes = buf.getvalue()
-        clean_mime = "image/jpeg"
     except Exception as e:
-        print(f"[Pillow Notice]: {e}")
-
-    inline_data = {"mime_type": clean_mime, "data": clean_bytes}
+        print(f"[Pillow Preprocessing Error]: {e}")
+        return None
 
     for key in keys:
         try:
             genai.configure(api_key=key)
-            for model_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+            for model_name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]:
                 try:
                     model = genai.GenerativeModel(model_name)
-                    res = model.generate_content([prompt, inline_data])
+                    res = model.generate_content([prompt, pil_img])
+                    if res and res.text:
+                        return sanitize_ai_output(res.text)
+                except Exception as model_err:
+                    print(f"[Gemini Model {model_name}]: {model_err}")
+                    continue
+        except Exception as key_err:
+            print(f"[Gemini Key Error]: {key_err}")
+            continue
+    return None
+
+def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
+    """Executes Groq using dynamic discovery, falling back to Gemini text if Groq fails."""
+    client = get_groq_client()
+    if client:
+        try:
+            chosen_model = get_active_groq_model(client)
+            completion = client.chat.completions.create(
+                model=chosen_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=3500
+            )
+            raw = completion.choices[0].message.content
+            if raw:
+                return sanitize_ai_output(raw)
+        except Exception as groq_err:
+            print(f"[Groq Execution Error]: {groq_err}")
+
+    # Fallback to Gemini text
+    for key in get_gemini_keys():
+        try:
+            genai.configure(api_key=key)
+            for m in ["gemini-1.5-flash", "gemini-1.5-pro"]:
+                try:
+                    model = genai.GenerativeModel(m)
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}")
                     if res and res.text:
                         return sanitize_ai_output(res.text)
                 except Exception:
                     continue
         except Exception:
             continue
-    return None
 
-def ask_groq_vision(prompt: str, file_bytes: bytes, mime_type: str) -> Optional[str]:
-    client = get_groq_client()
-    if not client:
-        return None
-    try:
-        pil_img = Image.open(io.BytesIO(file_bytes))
-        pil_img = ImageOps.exif_transpose(pil_img)
-        if pil_img.mode in ("RGBA", "P"):
-            pil_img = pil_img.convert("RGB")
-        pil_img.thumbnail((1280, 1280))
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=85)
-        b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        for vision_model in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
-            try:
-                completion = client.chat.completions.create(
-                    model=vision_model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens=2048,
-                    temperature=0.2,
-                )
-                raw = completion.choices[0].message.content
-                if raw:
-                    return sanitize_ai_output(raw)
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[Groq Vision]: {e}")
-    return None
-
-def audit_document_dual_engine(prompt: str, file_bytes: bytes, mime_type: str) -> str:
-    res = ask_gemini_vision(prompt, file_bytes, mime_type)
-    if res and len(res.strip()) > 30:
-        return res
-
-    groq_res = ask_groq_vision(prompt, file_bytes, mime_type)
-    if groq_res and len(groq_res.strip()) > 30:
-        return groq_res
-
-    raise RuntimeError("Both Gemini Vision and Groq Multimodal Vision were unable to process the document.")
+    return "Service is updating. Please try again in a few seconds."
 
 # -------------------------------------------------------------
 # 1. DOCUMENT AUDITOR API ENDPOINT
@@ -151,11 +153,9 @@ async def analyze_document(
 ):
     try:
         file_bytes = await file.read()
-        mime_type = file.content_type or "image/jpeg"
-
         prompt = (
             f"You are a forensic document auditor. Analyze this document, ticket, voucher, or invoice in {target_language}.\n"
-            f"Extract all facts and return ONLY valid JSON matching this schema (no extra text outside JSON):\n"
+            f"Extract all facts and return ONLY valid JSON matching this exact schema:\n"
             f"{{\n"
             f'  "status": "VERIFIED AUTHENTIC",\n'
             f'  "document_type": "Flight E-Ticket / Invoice / Hotel Voucher",\n'
@@ -173,7 +173,13 @@ async def analyze_document(
             f"}}"
         )
 
-        analysis_raw = audit_document_dual_engine(prompt, file_bytes, mime_type)
+        analysis_raw = ask_gemini_vision(prompt, file_bytes)
+        if not analysis_raw:
+            return {
+                "status": "error",
+                "message": "Visual analysis engine could not read the document. Ensure GEMINI_API_KEY has Generative Language API enabled.",
+                "data": None
+            }
 
         clean_json = analysis_raw.strip()
         if "```json" in clean_json:
@@ -189,7 +195,7 @@ async def analyze_document(
                 "document_type": "Travel / Financial Record",
                 "issuer": "Extracted Issuer",
                 "parties_and_dates": "Extracted Parties & Schedule",
-                "traps_and_penalties": "Inspect fine print for cancellation or baggage restrictions.",
+                "traps_and_penalties": "Check fine print for cancellation or refund rules.",
                 "financials": {
                     "base_fare": "Recorded in document",
                     "taxes_and_fees": "Itemized in document",
@@ -250,19 +256,9 @@ async def ask_question(
 
         if file:
             fbytes = await file.read()
-            mime = file.content_type or "image/jpeg"
-            ans = audit_document_dual_engine(f"Answer directly in {target_language}: {clean_q}", fbytes, mime)
+            ans = ask_gemini_vision(f"Answer directly in {target_language}: {clean_q}", fbytes) or "Unable to read document."
         else:
-            client = get_groq_client()
-            if client:
-                chat = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": clean_q}],
-                    temperature=0.4
-                )
-                ans = sanitize_ai_output(chat.choices[0].message.content or "")
-            else:
-                ans = "Language engine currently unavailable."
+            ans = ask_hybrid_text(clean_q, sys_prompt)
 
         return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
     except Exception as e:
@@ -307,7 +303,7 @@ async def convert_file(request: Request, target_format: str = Form(...), file: U
                 f.write(file_bytes)
 
         base_url = str(request.base_url).rstrip("/")
-        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "message": f"Successfully converted to .{clean_ext.upper()}"}
+        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "message": f"Converted to .{clean_ext.upper()}"}
     except Exception as e:
         return {"status": "error", "message": f"Conversion error: {str(e)}"}
 
@@ -373,76 +369,63 @@ async def touristos_recommend(
     target_language: str = Form("English")
 ):
     location = f"{city}, {state}, {country}".strip(", ")
-    client = get_groq_client()
-
     sys_prompt = (
         f"You are a local travel authority for '{location}'. The traveling party consists of {adults} adults and {children} children with '{dietary_preference}' diet.\n"
         f"Return ONLY valid JSON matching this exact schema (no markdown wrappers):\n"
         f"{{\n"
         f'  "destination_summary": "Thorough overview of {location} covering heritage, culture, and transit.",\n'
         f'  "spots": [\n'
-        f'    {{"page": 1, "title": "Real Landmark 1", "rating": "⭐ 4.8", "dist": "Center", "description": "Authentic history, architecture, and visitor tips.", "images": ["https://images.unsplash.com/photo-1570168007204-dfb528c6958f?q=80&w=800"]}},\n'
-        f'    {{"page": 2, "title": "Real Landmark 2", "rating": "⭐ 4.7", "dist": "3 km", "description": "Authentic history, architecture, and visitor tips.", "images": ["https://images.unsplash.com/photo-1548013146-72479768bada?q=80&w=800"]}}\n'
+        f'    {{"page": 1, "title": "Real Spot 1 Name", "rating": "⭐ 4.8", "dist": "Center", "description": "Authentic history, architecture, and visitor tips.", "images": ["https://images.unsplash.com/photo-1512453979798-5ea266f8880c?q=80&w=800"]}},\n'
+        f'    {{"page": 2, "title": "Real Spot 2 Name", "rating": "⭐ 4.7", "dist": "3 km", "description": "Authentic history, architecture, and visitor tips.", "images": ["https://images.unsplash.com/photo-1548013146-72479768bada?q=80&w=800"]}}\n'
         f'  ],\n'
         f'  "hotels": [\n'
-        f'    {{"name": "Hotel Name", "price": "₹4,500 / night", "rating": "⭐ 4.8", "description": "Family-friendly stay near center", "amenities": ["Wi-Fi", "AC", "Pure Veg"]}}\n'
+        f'    {{"name": "Real Hotel Name", "price": "Standard Rate", "rating": "⭐ 4.8", "description": "Family-friendly stay near center", "amenities": ["Wi-Fi", "AC"]}}\n'
         f'  ],\n'
         f'  "emergency": {{\n'
-        f'    "hospital_name": "Verified Local Hospital Name",\n'
-        f'    "hospital_phone": "Actual Emergency Phone or 112",\n'
-        f'    "police_name": "Local Police Precinct Name",\n'
-        f'    "police_phone": "Actual Police Station Phone or 112",\n'
-        f'    "fire_name": "Municipal Fire Station",\n'
+        f'    "hospital_name": "Major Hospital in {city}",\n'
+        f'    "hospital_phone": "112",\n'
+        f'    "police_name": "{city} Police Headquarters",\n'
+        f'    "police_phone": "112",\n'
+        f'    "fire_name": "{city} Fire Service",\n'
         f'    "fire_phone": "112",\n'
-        f'    "pharmacy_name": "24/7 Chemist Hub",\n'
+        f'    "pharmacy_name": "{city} 24/7 Pharmacy Hub",\n'
         f'    "pharmacy_phone": "112"\n'
         f'  }}\n'
         f"}}"
     )
 
+    raw = ask_hybrid_text(f"Generate 10 authentic attractions for {location} in {target_language}.", sys_prompt)
     try:
-        if client:
-            chat = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": f"Generate 10 authentic attractions for {location} in {target_language}."}
-                ],
-                temperature=0.3,
-                max_tokens=3500
-            )
-            raw = sanitize_ai_output(chat.choices[0].message.content or "")
-            clean = raw.strip()
-            if "```json" in clean:
-                clean = clean.split("```json")[1].split("```")[0].strip()
-            elif "```" in clean:
-                clean = clean.split("```")[1].split("```")[0].strip()
-            data = json.loads(clean)
-            return {"status": "success", "data": data}
+        clean = raw.strip()
+        if "```json" in clean:
+            clean = clean.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean:
+            clean = clean.split("```")[1].split("```")[0].strip()
+        data = json.loads(clean)
+        return {"status": "success", "data": data}
     except Exception as e:
-        print(f"[TouristOS Intel Error]: {e}")
+        print(f"[JSON Parse Notice]: {e}")
 
-    # Regional Fail-Safe
-    phone_default = "112" if any(x in location.lower() for x in ["india", "europe", "uk", "france"]) else "911"
+    phone_default = "999" if "uae" in location.lower() or "dubai" in location.lower() else ("112" if any(x in location.lower() for x in ["india", "europe", "uk", "france"]) else "911")
     return {
         "status": "success",
         "data": {
             "destination_summary": f"{location} is an active regional center offering cultural heritage, dining, and transit networks.",
             "spots": [
-                {"page": i + 1, "title": f"Landmark {i + 1} of {city}", "rating": "⭐ 4.8", "dist": f"{i + 1} km", "description": f"Verified historic attraction in {city}.", "images": ["https://images.unsplash.com/photo-1570168007204-dfb528c6958f?q=80&w=800"]}
+                {"page": i + 1, "title": f"Top Attraction {i + 1} of {city}", "rating": "⭐ 4.8", "dist": f"{i + 1} km", "description": f"Verified historic site in {city}.", "images": ["https://images.unsplash.com/photo-1512453979798-5ea266f8880c?q=80&w=800"]}
                 for i in range(10)
             ],
             "hotels": [
-                {"name": f"{city} Central Comfort Stay", "price": "Standard Rate", "rating": "⭐ 4.7 (1,500+)", "description": "Centrally situated accommodation with standard amenities.", "amenities": ["Free Wi-Fi", "AC", "Dining"]}
+                {"name": f"{city} Central Stay", "price": "Standard Rate", "rating": "⭐ 4.7", "description": "Comfortable accommodation.", "amenities": ["Free Wi-Fi", "AC"]}
             ],
             "emergency": {
-                "hospital_name": f"{city} General Care Hospital",
+                "hospital_name": f"{city} Care Hospital",
                 "hospital_phone": phone_default,
-                "police_name": f"{city} Central Police Precinct",
+                "police_name": f"{city} Police Department",
                 "police_phone": phone_default,
                 "fire_name": f"{city} Fire & Rescue",
                 "fire_phone": phone_default,
-                "pharmacy_name": f"{city} 24/7 Pharmacy Hub",
+                "pharmacy_name": f"{city} 24/7 Medico",
                 "pharmacy_phone": phone_default
             }
         }
@@ -457,20 +440,9 @@ async def explore_chat(
     question: str = Form("What are the visiting hours?"),
     target_language: str = Form("English")
 ):
-    client = get_groq_client()
-    sys_prompt = f"You are a local concierge for '{spot_name}'. Answer concisely in {target_language} using Markdown."
-    try:
-        if client:
-            chat = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": question}],
-                temperature=0.3
-            )
-            ans = sanitize_ai_output(chat.choices[0].message.content or "")
-            return {"status": "success", "answer": ans}
-    except Exception as e:
-        return {"status": "error", "answer": f"Guide notice: {str(e)}"}
-    return {"status": "success", "answer": f"Opening hours for {spot_name} are typically 9:00 AM to 6:00 PM."}
+    sys_prompt = f"You are a local guide for '{spot_name}'. Answer concisely in {target_language} using Markdown."
+    ans = ask_hybrid_text(question, sys_prompt)
+    return {"status": "success", "answer": ans}
 
 # -------------------------------------------------------------
 # 6. INSTANT HEALTH & WARMUP
