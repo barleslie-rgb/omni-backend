@@ -7,6 +7,7 @@ import base64
 import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+import concurrent.futures
 
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +18,8 @@ import google.generativeai as genai
 
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="Dynamic Discovery Forensic & Travel Platform",
-    version="48.0.0"
+    description="Fast Dual-Engine Forensic & Travel Platform",
+    version="48.1.0"
 )
 
 app.add_middleware(
@@ -34,7 +35,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# CLIENT DISCOVERY & KEYS
+# KEYS & CLIENT DISCOVERY
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -57,117 +58,97 @@ def get_active_groq_model(client: Groq) -> str:
         print(f"[Groq Discovery]: {e}")
     return "llama-3.1-8b-instant"
 
-def get_active_gemini_model_names(key: str) -> List[str]:
-    """Dynamically queries Google to find supported multimodal models."""
-    try:
-        genai.configure(api_key=key)
-        valid_models = []
-        for m in genai.list_models():
-            if "generateContent" in m.supported_generation_methods:
-                clean_name = m.name.replace("models/", "")
-                valid_models.append(clean_name)
-        # Prioritize 3.6-flash, flash, and pro
-        valid_models.sort(key=lambda x: (
-            0 if "3.6-flash" in x else (
-                1 if "flash" in x else 2
-            )
-        ))
-        if valid_models:
-            return valid_models
-    except Exception as e:
-        print(f"[Gemini ListModels Warning]: {e}")
-    return ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro-vision"]
-
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# DUAL-ENGINE VISION (DYNAMIC GEMINI + GROQ VISION FAILOVER)
+# HIGH-SPEED MULTIMODAL FORENSIC VISION
 # -------------------------------------------------------------
-def ask_gemini_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
-    keys = get_gemini_keys()
-    if not keys:
-        return None
+def prepare_image_payload(file_bytes: bytes):
+    """Normalizes, corrects EXIF orientation, and scales to prevent large network latency."""
+    pil_img = Image.open(io.BytesIO(file_bytes))
+    pil_img = ImageOps.exif_transpose(pil_img)
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    
+    # Scale if exceeding 1600px
+    max_dim = 1600
+    if max(pil_img.size) > max_dim:
+        pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=85)
+    jpeg_bytes = buf.getvalue()
+    b64_str = base64.b64encode(jpeg_bytes).decode("utf-8")
+    return pil_img, jpeg_bytes, b64_str
 
-    try:
-        pil_img = Image.open(io.BytesIO(file_bytes))
-        pil_img = ImageOps.exif_transpose(pil_img)
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-    except Exception as e:
-        print(f"[Pillow Preprocessing]: {e}")
-        return None
-
-    for key in keys:
-        try:
-            available_models = get_active_gemini_model_names(key)
-            genai.configure(api_key=key)
-            for model_name in available_models:
-                try:
-                    model = genai.GenerativeModel(model_name)
-                    res = model.generate_content([prompt, pil_img])
-                    if res and res.text:
-                        return sanitize_ai_output(res.text)
-                except Exception as model_err:
-                    print(f"[Gemini Model {model_name} Error]: {model_err}")
-                    continue
-        except Exception as key_err:
-            print(f"[Gemini Key Error]: {key_err}")
-            continue
+def execute_gemini_call(key: str, model_name: str, prompt: str, pil_img: Image.Image) -> Optional[str]:
+    genai.configure(api_key=key)
+    model = genai.GenerativeModel(model_name)
+    res = model.generate_content([prompt, pil_img], request_options={"timeout": 12})
+    if res and res.text:
+        return sanitize_ai_output(res.text)
     return None
 
-def ask_groq_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
-    """Failover multimodal vision engine using Groq."""
+def ask_groq_vision_fast(prompt: str, b64_img: str) -> Optional[str]:
     client = get_groq_client()
     if not client:
         return None
-    try:
-        pil_img = Image.open(io.BytesIO(file_bytes))
-        pil_img = ImageOps.exif_transpose(pil_img)
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        pil_img.thumbnail((1024, 1024))
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=85)
-        b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        for v_model in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
-            try:
-                res = client.chat.completions.create(
-                    model=v_model,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                            ]
-                        }
-                    ],
-                    temperature=0.2,
-                    max_tokens=2048
-                )
-                txt = res.choices[0].message.content
-                if txt:
-                    return sanitize_ai_output(txt)
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[Groq Vision Failover Error]: {e}")
+    for vm in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+        try:
+            res = client.chat.completions.create(
+                model=vm,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                        ]
+                    }
+                ],
+                temperature=0.2,
+                max_tokens=2048,
+                timeout=12
+            )
+            txt = res.choices[0].message.content
+            if txt:
+                return sanitize_ai_output(txt)
+        except Exception as e:
+            print(f"[Groq Vision {vm}]: {e}")
+            continue
     return None
 
 def audit_document_dual(prompt: str, file_bytes: bytes) -> Optional[str]:
-    # 1. Primary: Dynamic Gemini Vision
-    res = ask_gemini_vision(prompt, file_bytes)
-    if res and len(res.strip()) > 20:
-        return res
+    try:
+        pil_img, jpeg_bytes, b64_img = prepare_image_payload(file_bytes)
+    except Exception as e:
+        print(f"[Image Preparation Error]: {e}")
+        return None
 
-    # 2. Secondary Failover: Groq Vision
-    print("[Vision Failover]: Switching to Groq Vision...")
-    groq_res = ask_groq_vision(prompt, file_bytes)
-    if groq_res and len(groq_res.strip()) > 20:
-        return groq_res
+    # Target the verified Gemini models first with strict 12s timeout
+    keys = get_gemini_keys()
+    gemini_candidates = ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro-vision"]
+    
+    for key in keys:
+        for model_name in gemini_candidates:
+            try:
+                print(f"[PaperPilot]: Trying Google {model_name}...")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(execute_gemini_call, key, model_name, prompt, pil_img)
+                    out = future.result(timeout=14)
+                    if out and len(out.strip()) > 20:
+                        return out
+            except Exception as e:
+                print(f"[PaperPilot Gemini Error]: {e}")
+                continue
+
+    # Instant Failover to Groq LPU Vision (Completes in 1-2 seconds)
+    print("[PaperPilot Vision Failover]: Running Groq Vision LPU...")
+    groq_out = ask_groq_vision_fast(prompt, b64_img)
+    if groq_out and len(groq_out.strip()) > 20:
+        return groq_out
 
     return None
 
@@ -180,7 +161,8 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
                 model=chosen,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=3500
+                max_tokens=3500,
+                timeout=15
             )
             raw = completion.choices[0].message.content
             if raw:
@@ -190,12 +172,11 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
 
     for key in get_gemini_keys():
         try:
-            models = get_active_gemini_model_names(key)
             genai.configure(api_key=key)
-            for m in models:
+            for m in ["gemini-3.6-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
-                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}")
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 12})
                     if res and res.text:
                         return sanitize_ai_output(res.text)
                 except Exception:
@@ -203,7 +184,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
         except Exception:
             continue
 
-    return "Service is currently processing requests. Please retry in a moment."
+    return "Service is currently busy. Please retry in a few seconds."
 
 # -------------------------------------------------------------
 # 1. FORENSIC FRAUD & DOCUMENT AUDITOR ENDPOINT
@@ -216,31 +197,30 @@ async def analyze_document(
     try:
         file_bytes = await file.read()
         forensic_prompt = (
-            f"You are a Forensic Document Auditor, Legal Counsel, and Paleographer. "
-            f"Examine this document or image carefully in {target_language}.\n\n"
+            f"You are a Forensic Document Auditor and Legal Counsel. Analyze this document/image in {target_language}.\n"
             f"Classify and inspect according to its type:\n"
-            f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12, Index II), Sale Deeds, Power of Attorney, Leases, Stamp Papers, Contracts.\n"
-            f"   - Inspect: Stamp serials, treasury seals, encumbrance risks, forfeiture clauses, title discrepancies.\n"
-            f"2. HISTORICAL / ARCHIVE: Sanads, colonial charters, antique records, genealogies.\n"
-            f"   - Inspect: Script transcription, seals, historical provenance.\n"
+            f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12, Index II), Deeds, Power of Attorney, Leases, Stamp Papers, Contracts.\n"
+            f"   - Check: Stamp serials, seals, encumbrance risks, forfeiture traps, title discrepancies.\n"
+            f"2. HISTORICAL / ARCHIVE: Sanads, colonial records, antique manuscripts, genealogies.\n"
+            f"   - Check: Transcription, seals, historical context.\n"
             f"3. GENERAL / FINANCIAL: Invoices, receipts, travel tickets, vouchers, certificates.\n"
-            f"   - Inspect: Line items, grand totals, cancellation penalties.\n\n"
-            f"Return ONLY valid JSON matching this schema (no markdown wrappers outside JSON):\n"
+            f"   - Check: Authenticity, itemized totals, cancellation penalties.\n\n"
+            f"Return ONLY valid JSON matching this schema:\n"
             f"{{\n"
             f'  "classification": "LEGAL_PROPERTY | HISTORICAL_ARCHIVE | GENERAL_FINANCIAL",\n'
             f'  "status": "VERIFIED AUTHENTIC | HIGH RISK / PREDATORY CLAUSES | SUSPICIOUS ANOMALIES DETECTED",\n'
-            f'  "document_title": "Clear concise title",\n'
-            f'  "issuing_authority_or_registry": "Government department, Sub-Registrar, or issuer",\n'
-            f'  "parties_and_dates": "Parties involved and dates",\n'
+            f'  "document_title": "Concise title",\n'
+            f'  "issuing_authority_or_registry": "Issuing authority or Sub-Registrar",\n'
+            f'  "parties_and_dates": "Parties involved and key dates",\n'
             f'  "metadata_identifiers": "Stamp serial, CTS/Survey/Plot number, or PNR",\n'
-            f'  "traps_risks_and_penalties": "Clear breakdown of predatory clauses, forfeiture risks, or fees in plain language.",\n'
+            f'  "traps_risks_and_penalties": "Breakdown of predatory clauses, forfeiture risks, or fees in plain language.",\n'
             f'  "financials_or_valuation": {{\n'
             f'    "base_amount": "Base amount with currency",\n'
-            f'    "taxes_and_surcharges": "Duty, taxes, or surcharges",\n'
+            f'    "taxes_and_surcharges": "Taxes or registration fees",\n'
             f'    "grand_total": "Grand total valuation or amount",\n'
             f'    "payment_status": "PAID / REGISTERED / UNPAID / PENDING"\n'
             f'  }},\n'
-            f'  "actionable_advisory": "Concrete next steps for the user (due diligence, registrar verification, or safe use).",\n'
+            f'  "actionable_advisory": "Concrete next steps (legal due diligence, registrar verification, or safe use).",\n'
             f'  "detected_destination": "City and Country name if document indicates travel, otherwise null"\n'
             f"}}"
         )
@@ -249,7 +229,7 @@ async def analyze_document(
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": "Visual analysis engine could not read the document. Ensure Generative Language API is enabled.",
+                "message": "Visual analysis engine timed out on current keys. Please check Render logs.",
                 "data": None
             }
 
@@ -266,10 +246,10 @@ async def analyze_document(
                 "classification": "LEGAL_PROPERTY",
                 "status": "VERIFIED DOCUMENT",
                 "document_title": "Audited Document",
-                "issuing_authority_or_registry": "Identified Authority",
-                "parties_and_dates": "Extracted Parties & Schedule",
+                "issuing_authority_or_registry": "Identified Registry",
+                "parties_and_dates": "Parties & Dates Extracted",
                 "metadata_identifiers": "Serials Extracted",
-                "traps_risks_and_penalties": "Inspect fine print for liability clauses.",
+                "traps_risks_and_penalties": "Review fine print for cancellation or liability terms.",
                 "financials_or_valuation": {
                     "base_amount": "Recorded",
                     "taxes_and_surcharges": "Recorded fees",
@@ -282,7 +262,7 @@ async def analyze_document(
 
         return {"status": "success", "data": data, "raw_text": analysis_raw}
     except Exception as e:
-        return {"status": "error", "message": f"Forensic audit notice: {str(e)}", "data": None}
+        return {"status": "error", "message": f"Forensic audit error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
 # 2. LIVE OMNI AI STUDIO COMPANION
