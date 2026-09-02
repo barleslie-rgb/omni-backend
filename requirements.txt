@@ -1,6 +1,7 @@
-fastapi
-uvicorn
-python-multipart
-groq
-google-generativeai
-requests
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
+Pillow>=10.2.0
+groq>=0.5.0
+google-generativeai>=0.5.0
+requests>=2.31.0
