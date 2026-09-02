@@ -6,8 +6,7 @@ import uuid
 import base64
 import urllib.parse
 from datetime import datetime
-from typing import Optional, List, Dict, Any
-import concurrent.futures
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,8 +17,8 @@ import google.generativeai as genai
 
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="High-Throughput Vision & Travel Engine",
-    version="48.5.0"
+    description="Dynamic Vision & Travel Platform",
+    version="49.0.0"
 )
 
 app.add_middleware(
@@ -35,7 +34,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & FAST DISCOVERY
+# KEYS & DYNAMIC DISCOVERY
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -45,110 +44,150 @@ def get_gemini_keys() -> List[str]:
     raw = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
     return [k.strip() for k in raw.split(",") if k.strip()]
 
-def get_active_groq_model(client: Groq) -> str:
-    """Prioritizes standard high-rate-limit models, avoiding restrictive preview/scout models."""
+def get_active_groq_text_model(client: Groq) -> str:
     try:
         models_data = client.models.list().data
         active_ids = [m.id for m in models_data]
-        # llama-3.1-8b-instant has a 500k+ TPM limit on Groq
         for p in ["llama-3.1-8b-instant", "llama3-8b-8192", "mixtral-8x7b-32768", "llama-3.3-70b-versatile"]:
             if p in active_ids:
                 return p
-        if active_ids:
-            # Filter out scout/experimental models
-            filtered = [m for m in active_ids if "scout" not in m and "guard" not in m and "whisper" not in m]
-            if filtered:
-                return filtered[0]
-            return active_ids[0]
+        filtered = [m for m in active_ids if "scout" not in m and "guard" not in m and "whisper" not in m]
+        if filtered:
+            return filtered[0]
     except Exception as e:
-        print(f"[Groq Model Discovery]: {e}")
+        print(f"[Groq Text Discovery]: {e}")
     return "llama-3.1-8b-instant"
+
+def get_active_groq_vision_model(client: Groq) -> Optional[str]:
+    try:
+        models_data = client.models.list().data
+        for m in models_data:
+            if "vision" in m.id:
+                return m.id
+    except Exception as e:
+        print(f"[Groq Vision Discovery]: {e}")
+    return "llama-3.2-11b-vision-preview"
 
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# MULTIMODAL FORENSIC VISION PIPELINE
+# IMAGE PREPARATION (UNDER 1MB FOR ULTRA-FAST TRANSMISSION)
 # -------------------------------------------------------------
 def prepare_image(file_bytes: bytes):
     pil_img = Image.open(io.BytesIO(file_bytes))
     pil_img = ImageOps.exif_transpose(pil_img)
     if pil_img.mode != "RGB":
         pil_img = pil_img.convert("RGB")
-    if max(pil_img.size) > 1600:
-        pil_img.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+    
+    # Scale down if width/height exceeds 1400px
+    if max(pil_img.size) > 1400:
+        pil_img.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+        
     buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=85)
-    b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return pil_img, buf.getvalue(), b64_str
+    pil_img.save(buf, format="JPEG", quality=82)
+    clean_bytes = buf.getvalue()
+    b64_str = base64.b64encode(clean_bytes).decode("utf-8")
+    return pil_img, clean_bytes, b64_str
 
-def ask_groq_vision_direct(prompt: str, b64_img: str) -> Optional[str]:
+# -------------------------------------------------------------
+# DUAL-ENGINE VISION EXECUTION WITH DETAILED ERROR TRACKING
+# -------------------------------------------------------------
+def run_groq_vision(prompt: str, b64_img: str) -> Tuple[Optional[str], Optional[str]]:
     client = get_groq_client()
     if not client:
-        return None
-    for vm in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+        return None, "Groq API key not configured."
+    
+    vm = get_active_groq_vision_model(client)
+    if not vm:
+        return None, "No active vision model found on Groq."
+        
+    try:
+        print(f"[Groq Vision]: Calling model {vm}...")
+        res = client.chat.completions.create(
+            model=vm,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    ]
+                }
+            ],
+            temperature=0.2,
+            max_tokens=2048,
+            timeout=15
+        )
+        txt = res.choices[0].message.content
+        if txt and len(txt.strip()) > 10:
+            return sanitize_ai_output(txt), None
+        return None, "Groq Vision returned empty response."
+    except Exception as e:
+        err_msg = str(e)
+        print(f"[Groq Vision Failed]: {err_msg}")
+        return None, f"Groq Error: {err_msg[:120]}"
+
+def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
+    keys = get_gemini_keys()
+    if not keys:
+        return None, "Gemini API key not configured."
+
+    last_error = ""
+    for key in keys:
         try:
-            res = client.chat.completions.create(
-                model=vm,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                        ]
-                    }
-                ],
-                temperature=0.2,
-                max_tokens=2048,
-                timeout=12
-            )
-            txt = res.choices[0].message.content
-            if txt:
-                return sanitize_ai_output(txt)
-        except Exception as e:
-            print(f"[Groq Vision]: {e}")
-    return None
-
-def ask_gemini_vision_direct(prompt: str, pil_img: Image.Image) -> Optional[str]:
-    for key in get_gemini_keys():
-        for m in ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
+            genai.configure(api_key=key)
+            # Query actual models live on this project
+            supported = []
             try:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel(m)
-                res = model.generate_content([prompt, pil_img], request_options={"timeout": 12})
-                if res and res.text:
-                    return sanitize_ai_output(res.text)
-            except Exception as e:
-                print(f"[Gemini Vision {m}]: {e}")
-                continue
-    return None
+                for m in genai.list_models():
+                    if "generateContent" in m.supported_generation_methods:
+                        supported.append(m.name.replace("models/", ""))
+            except Exception as le:
+                last_error = f"ListModels error: {le}"
 
-def audit_document(prompt: str, file_bytes: bytes) -> Optional[str]:
+            candidates = [m for m in supported if "flash" in m] or ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
+            for model_name in candidates:
+                try:
+                    print(f"[Gemini Vision]: Calling {model_name}...")
+                    model = genai.GenerativeModel(model_name)
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 14})
+                    if res and res.text and len(res.text.strip()) > 10:
+                        return sanitize_ai_output(res.text), None
+                except Exception as me:
+                    last_error = f"Model {model_name}: {str(me)[:100]}"
+                    continue
+        except Exception as ke:
+            last_error = f"Key config error: {str(ke)[:100]}"
+            continue
+
+    return None, f"Gemini Error: {last_error}"
+
+def audit_document_robust(prompt: str, file_bytes: bytes) -> Tuple[Optional[str], str]:
     try:
         pil_img, _, b64_img = prepare_image(file_bytes)
     except Exception as e:
-        print(f"[Image Prep]: {e}")
-        return None
+        return None, f"Image conversion error: {str(e)}"
 
-    # 1. Primary: Groq Vision LPU (Processes in under 2 seconds, avoiding timeouts)
-    groq_res = ask_groq_vision_direct(prompt, b64_img)
-    if groq_res and len(groq_res.strip()) > 20:
-        return groq_res
+    # 1. Primary Attempt: Groq Vision (Fastest LPU)
+    groq_res, groq_err = run_groq_vision(prompt, b64_img)
+    if groq_res:
+        return groq_res, ""
 
-    # 2. Secondary: Google Gemini Vision
-    gemini_res = ask_gemini_vision_direct(prompt, pil_img)
-    if gemini_res and len(gemini_res.strip()) > 20:
-        return gemini_res
+    # 2. Secondary Attempt: Google Gemini Vision
+    gemini_res, gemini_err = run_gemini_vision(prompt, pil_img)
+    if gemini_res:
+        return gemini_res, ""
 
-    return None
+    # Both failed — return descriptive diagnosis
+    return None, f"Audit Notice: {groq_err} | {gemini_err}"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
     if client:
         try:
-            chosen = get_active_groq_model(client)
+            chosen = get_active_groq_text_model(client)
             completion = client.chat.completions.create(
                 model=chosen,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
@@ -189,7 +228,7 @@ async def analyze_document(
     try:
         file_bytes = await file.read()
         forensic_prompt = (
-            f"You are a Forensic Document Auditor and Legal Counsel. Analyze this document/image in {target_language}.\n"
+            f"You are an expert Forensic Document Auditor and Legal Counsel. Analyze this document in {target_language}.\n"
             f"Classify and inspect according to its type:\n"
             f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12, Index II), Deeds, Power of Attorney, Leases, Stamp Papers, Contracts.\n"
             f"   - Check: Stamp serials, seals, encumbrance risks, forfeiture traps, title discrepancies.\n"
@@ -205,7 +244,7 @@ async def analyze_document(
             f'  "issuing_authority_or_registry": "Issuing authority or Sub-Registrar",\n'
             f'  "parties_and_dates": "Parties involved and key dates",\n'
             f'  "metadata_identifiers": "Stamp serial, CTS/Survey/Plot number, or PNR",\n'
-            f'  "traps_risks_and_penalties": "Breakdown of predatory clauses, forfeiture risks, or fees in plain language.",\n'
+            f'  "traps_risks_and_penalties": "Clear breakdown of predatory clauses, forfeiture risks, or fees in plain language.",\n'
             f'  "financials_or_valuation": {{\n'
             f'    "base_amount": "Base amount with currency",\n'
             f'    "taxes_and_surcharges": "Taxes or registration fees",\n'
@@ -217,11 +256,11 @@ async def analyze_document(
             f"}}"
         )
 
-        analysis_raw = audit_document(forensic_prompt, file_bytes)
+        analysis_raw, diagnostic_err = audit_document_robust(forensic_prompt, file_bytes)
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": "Visual analysis engine timed out. Please retry.",
+                "message": diagnostic_err or "Visual analysis engine timed out. Please retry.",
                 "data": None
             }
 
@@ -291,7 +330,8 @@ async def ask_question(
 
         if file:
             fbytes = await file.read()
-            ans = audit_document(f"Answer in {target_language}: {clean_q}", fbytes) or "Unable to inspect document."
+            ans, _ = audit_document_robust(f"Answer in {target_language}: {clean_q}", fbytes)
+            ans = ans or "Unable to inspect document."
         else:
             ans = ask_hybrid_text(clean_q, sys_prompt)
 
