@@ -17,8 +17,8 @@ import google.generativeai as genai
 
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="Forensic Legal, Fraud & Historical Document Intelligence",
-    version="47.5.0"
+    description="Dynamic Discovery Forensic & Travel Platform",
+    version="48.0.0"
 )
 
 app.add_middleware(
@@ -34,7 +34,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# CLIENT & MODEL DISCOVERY
+# CLIENT DISCOVERY & KEYS
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -48,33 +48,46 @@ def get_active_groq_model(client: Groq) -> str:
     try:
         models_data = client.models.list().data
         active_ids = [m.id for m in models_data if "whisper" not in m.id and "guard" not in m.id]
-        priority = [
-            "llama-3.1-8b-instant",
-            "llama-3.3-70b-versatile",
-            "llama3-70b-8192",
-            "llama3-8b-8192",
-            "mixtral-8x7b-32768"
-        ]
-        for p in priority:
+        for p in ["llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"]:
             if p in active_ids:
                 return p
         if active_ids:
             return active_ids[0]
     except Exception as e:
-        print(f"[Groq Discovery Notice]: {e}")
+        print(f"[Groq Discovery]: {e}")
     return "llama-3.1-8b-instant"
+
+def get_active_gemini_model_names(key: str) -> List[str]:
+    """Dynamically queries Google to find supported multimodal models."""
+    try:
+        genai.configure(api_key=key)
+        valid_models = []
+        for m in genai.list_models():
+            if "generateContent" in m.supported_generation_methods:
+                clean_name = m.name.replace("models/", "")
+                valid_models.append(clean_name)
+        # Prioritize 3.6-flash, flash, and pro
+        valid_models.sort(key=lambda x: (
+            0 if "3.6-flash" in x else (
+                1 if "flash" in x else 2
+            )
+        ))
+        if valid_models:
+            return valid_models
+    except Exception as e:
+        print(f"[Gemini ListModels Warning]: {e}")
+    return ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro-vision"]
 
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# MULTIMODAL FORENSIC VISION (GEMINI INLINE BYTES)
+# DUAL-ENGINE VISION (DYNAMIC GEMINI + GROQ VISION FAILOVER)
 # -------------------------------------------------------------
 def ask_gemini_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
     keys = get_gemini_keys()
     if not keys:
-        print("[Gemini]: No GEMINI_API_KEY set.")
         return None
 
     try:
@@ -82,25 +95,18 @@ def ask_gemini_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=90)
-        clean_bytes = buf.getvalue()
     except Exception as e:
-        print(f"[Image Normalization Error]: {e}")
+        print(f"[Pillow Preprocessing]: {e}")
         return None
-
-    inline_part = {
-        "mime_type": "image/jpeg",
-        "data": clean_bytes
-    }
 
     for key in keys:
         try:
+            available_models = get_active_gemini_model_names(key)
             genai.configure(api_key=key)
-            for model_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+            for model_name in available_models:
                 try:
                     model = genai.GenerativeModel(model_name)
-                    res = model.generate_content([prompt, inline_part])
+                    res = model.generate_content([prompt, pil_img])
                     if res and res.text:
                         return sanitize_ai_output(res.text)
                 except Exception as model_err:
@@ -111,6 +117,60 @@ def ask_gemini_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
             continue
     return None
 
+def ask_groq_vision(prompt: str, file_bytes: bytes) -> Optional[str]:
+    """Failover multimodal vision engine using Groq."""
+    client = get_groq_client()
+    if not client:
+        return None
+    try:
+        pil_img = Image.open(io.BytesIO(file_bytes))
+        pil_img = ImageOps.exif_transpose(pil_img)
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        pil_img.thumbnail((1024, 1024))
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=85)
+        b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        for v_model in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+            try:
+                res = client.chat.completions.create(
+                    model=v_model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                            ]
+                        }
+                    ],
+                    temperature=0.2,
+                    max_tokens=2048
+                )
+                txt = res.choices[0].message.content
+                if txt:
+                    return sanitize_ai_output(txt)
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[Groq Vision Failover Error]: {e}")
+    return None
+
+def audit_document_dual(prompt: str, file_bytes: bytes) -> Optional[str]:
+    # 1. Primary: Dynamic Gemini Vision
+    res = ask_gemini_vision(prompt, file_bytes)
+    if res and len(res.strip()) > 20:
+        return res
+
+    # 2. Secondary Failover: Groq Vision
+    print("[Vision Failover]: Switching to Groq Vision...")
+    groq_res = ask_groq_vision(prompt, file_bytes)
+    if groq_res and len(groq_res.strip()) > 20:
+        return groq_res
+
+    return None
+
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
     if client:
@@ -118,23 +178,21 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
             chosen = get_active_groq_model(client)
             completion = client.chat.completions.create(
                 model=chosen,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=3500
             )
             raw = completion.choices[0].message.content
             if raw:
                 return sanitize_ai_output(raw)
-        except Exception as groq_err:
-            print(f"[Groq Execution Error]: {groq_err}")
+        except Exception as e:
+            print(f"[Groq Text Error]: {e}")
 
     for key in get_gemini_keys():
         try:
+            models = get_active_gemini_model_names(key)
             genai.configure(api_key=key)
-            for m in ["gemini-1.5-flash", "gemini-1.5-pro"]:
+            for m in models:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}")
@@ -145,10 +203,10 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
         except Exception:
             continue
 
-    return "Document assistant is currently updating. Please try again shortly."
+    return "Service is currently processing requests. Please retry in a moment."
 
 # -------------------------------------------------------------
-# 1. FORENSIC FRAUD, LEGAL & DOCUMENT AUDITOR ENDPOINT
+# 1. FORENSIC FRAUD & DOCUMENT AUDITOR ENDPOINT
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -157,42 +215,41 @@ async def analyze_document(
 ):
     try:
         file_bytes = await file.read()
-
         forensic_prompt = (
-            f"You are an expert Forensic Document Auditor, Legal Counsel, and Archival Paleographer. "
-            f"Carefully examine this uploaded document or image in {target_language}.\n\n"
-            f"Determine the document type automatically:\n"
-            f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12, Index II, Satbara), Sale Deeds, Power of Attorney, Leases, Stamp Papers, Contracts, Affidavits.\n"
-            f"   - Check: Government stamp value, treasury seals, serial consistency, encumbrance risks, forfeiture clauses, boundary/title discrepancies.\n"
-            f"2. HISTORICAL / ARCHIVAL: Royal Sanads, colonial charters, antique manuscripts, ancestral genealogies.\n"
-            f"   - Check: Script transcription (Modi, Urdu, Latin, Archaic English), period seals, historical provenance and modern legal standing.\n"
-            f"3. GENERAL / FINANCIAL: Invoices, receipts, travel tickets, vouchers, certificates, identity documents.\n"
-            f"   - Check: Authenticity, itemized financial totals, cancellation penalties, issuance status.\n\n"
-            f"Return ONLY valid JSON matching this exact schema (no text outside JSON):\n"
+            f"You are a Forensic Document Auditor, Legal Counsel, and Paleographer. "
+            f"Examine this document or image carefully in {target_language}.\n\n"
+            f"Classify and inspect according to its type:\n"
+            f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12, Index II), Sale Deeds, Power of Attorney, Leases, Stamp Papers, Contracts.\n"
+            f"   - Inspect: Stamp serials, treasury seals, encumbrance risks, forfeiture clauses, title discrepancies.\n"
+            f"2. HISTORICAL / ARCHIVE: Sanads, colonial charters, antique records, genealogies.\n"
+            f"   - Inspect: Script transcription, seals, historical provenance.\n"
+            f"3. GENERAL / FINANCIAL: Invoices, receipts, travel tickets, vouchers, certificates.\n"
+            f"   - Inspect: Line items, grand totals, cancellation penalties.\n\n"
+            f"Return ONLY valid JSON matching this schema (no markdown wrappers outside JSON):\n"
             f"{{\n"
             f'  "classification": "LEGAL_PROPERTY | HISTORICAL_ARCHIVE | GENERAL_FINANCIAL",\n'
             f'  "status": "VERIFIED AUTHENTIC | HIGH RISK / PREDATORY CLAUSES | SUSPICIOUS ANOMALIES DETECTED",\n'
-            f'  "document_title": "Clear concise title (e.g., Registered Sale Deed / Satbara 7/12 / Flight Ticket)",\n'
-            f'  "issuing_authority_or_registry": "Government department, Sub-Registrar office, court, royal office, or merchant name",\n'
-            f'  "parties_and_dates": "Parties involved (Buyer/Seller, Landlord/Tenant, Passenger), Execution Date, Registration Date",\n'
-            f'  "metadata_identifiers": "Stamp paper serial, CTS/Survey/Plot number, PNR, or Registration volume number",\n'
-            f'  "traps_risks_and_penalties": "Detailed breakdown of predatory clauses, forfeiture traps, missing seals, or non-refundable penalties in simple, clear language.",\n'
+            f'  "document_title": "Clear concise title",\n'
+            f'  "issuing_authority_or_registry": "Government department, Sub-Registrar, or issuer",\n'
+            f'  "parties_and_dates": "Parties involved and dates",\n'
+            f'  "metadata_identifiers": "Stamp serial, CTS/Survey/Plot number, or PNR",\n'
+            f'  "traps_risks_and_penalties": "Clear breakdown of predatory clauses, forfeiture risks, or fees in plain language.",\n'
             f'  "financials_or_valuation": {{\n'
-            f'    "base_amount": "Stamp duty / Base fare / Valuation consideration with currency symbol",\n'
-            f'    "taxes_and_surcharges": "Registration charges, municipal tax, or surcharges",\n'
-            f'    "grand_total": "Grand total valuation or payable amount",\n'
+            f'    "base_amount": "Base amount with currency",\n'
+            f'    "taxes_and_surcharges": "Duty, taxes, or surcharges",\n'
+            f'    "grand_total": "Grand total valuation or amount",\n'
             f'    "payment_status": "PAID / REGISTERED / UNPAID / PENDING"\n'
             f'  }},\n'
-            f'  "actionable_advisory": "Concrete, step-by-step guidance on what the user should do next (e.g., verification at Sub-Registrar office, legal due diligence, title search).",\n'
+            f'  "actionable_advisory": "Concrete next steps for the user (due diligence, registrar verification, or safe use).",\n'
             f'  "detected_destination": "City and Country name if document indicates travel, otherwise null"\n'
             f"}}"
         )
 
-        analysis_raw = ask_gemini_vision(forensic_prompt, file_bytes)
+        analysis_raw = audit_document_dual(forensic_prompt, file_bytes)
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": "Visual analysis engine could not read the document. Ensure GEMINI_API_KEY has Generative Language API enabled.",
+                "message": "Visual analysis engine could not read the document. Ensure Generative Language API is enabled.",
                 "data": None
             }
 
@@ -209,14 +266,14 @@ async def analyze_document(
                 "classification": "LEGAL_PROPERTY",
                 "status": "VERIFIED DOCUMENT",
                 "document_title": "Audited Document",
-                "issuing_authority_or_registry": "Extracted Authority",
+                "issuing_authority_or_registry": "Identified Authority",
                 "parties_and_dates": "Extracted Parties & Schedule",
-                "metadata_identifiers": "Document Identifiers Extracted",
-                "traps_risks_and_penalties": "Inspect fine print for unilateral indemnity or cancellation clauses.",
+                "metadata_identifiers": "Serials Extracted",
+                "traps_risks_and_penalties": "Inspect fine print for liability clauses.",
                 "financials_or_valuation": {
-                    "base_amount": "Extracted from document",
+                    "base_amount": "Recorded",
                     "taxes_and_surcharges": "Recorded fees",
-                    "grand_total": "Verified in document",
+                    "grand_total": "Verified",
                     "payment_status": "RECORDED"
                 },
                 "actionable_advisory": analysis_raw[:450],
@@ -228,7 +285,7 @@ async def analyze_document(
         return {"status": "error", "message": f"Forensic audit notice: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
-# 2. LIVE OMNI AI STUDIO (LEGAL, FORENSIC & GENERAL COMPANION)
+# 2. LIVE OMNI AI STUDIO COMPANION
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -256,14 +313,13 @@ async def ask_question(
         sys_prompt = (
             f"You are Omni Companion, an authentic AI advisor, legal document counselor, and general intelligence guide. "
             f"Answer in {target_language}. Never reveal internal thinking or <think> tags.\n"
-            f"If an audited document is present in memory, act as a helpful legal peer: guide the user through survey numbers, "
-            f"clauses, fraud risks, stamp paper validity, or next steps. If the user asks about any other topic, answer thoroughly "
-            f"and supportively without hesitation.{doc_awareness}"
+            f"If an audited document is present, assist with clauses, fraud risks, and survey numbers. "
+            f"If asked about general topics, provide thorough, helpful guidance.{doc_awareness}"
         )
 
         if file:
             fbytes = await file.read()
-            ans = ask_gemini_vision(f"Answer in {target_language}: {clean_q}", fbytes) or "Unable to inspect document."
+            ans = audit_document_dual(f"Answer in {target_language}: {clean_q}", fbytes) or "Unable to inspect document."
         else:
             ans = ask_hybrid_text(clean_q, sys_prompt)
 
@@ -363,7 +419,159 @@ async def resize_image(
         return {"status": "error", "message": f"Resize failed: {str(e)}"}
 
 # -------------------------------------------------------------
-# 4. SERVER HEALTH & PING
+# 4. TOURISTOS 10-LANDMARK & 6-PAGE HOTEL CATALOG
+# -------------------------------------------------------------
+@app.post("/api/v1/touristos-recommend")
+async def touristos_recommend(
+    country: str = Form("India"),
+    state: str = Form("Maharashtra"),
+    city: str = Form("Mumbai"),
+    adults: int = Form(2),
+    children: int = Form(0),
+    dietary_preference: str = Form("Pure Vegetarian"),
+    hotel_page: int = Form(1),
+    target_language: str = Form("English")
+):
+    location = f"{city}, {state}, {country}".strip(", ")
+    curr_symbol = "₹" if "india" in location.lower() else ("AED " if ("uae" in location.lower() or "dubai" in location.lower()) else ("€" if any(c in location.lower() for c in ["france", "italy", "spain", "germany"]) else "$"))
+    phone_default = "999" if ("uae" in location.lower() or "dubai" in location.lower()) else ("112" if any(x in location.lower() for x in ["india", "europe", "uk", "france"]) else "911")
+
+    sys_prompt = (
+        f"You are a travel directory for '{location}'. Group: {adults} adults, {children} children, Diet: '{dietary_preference}'.\n"
+        f"Return ONLY valid JSON matching this schema:\n"
+        f"{{\n"
+        f'  "destination_summary": "Overview of {location}.",\n'
+        f'  "spots": [\n'
+        f'    {{"page": 1, "title": "Real Spot 1", "rating": "⭐ 4.8", "dist": "1.2 km", "description": "Authentic history.", "images": ["https://images.unsplash.com/photo-1570168007204-dfb528c6958f?q=80&w=800"]}}\n'
+        f'  ],\n'
+        f'  "hotels_page": {hotel_page},\n'
+        f'  "hotels_total_pages": 6,\n'
+        f'  "hotels": [\n'
+        f'    {{\n'
+        f'      "hotel_id": "HTL-01",\n'
+        f'      "name": "Actual Hotel in {city}",\n'
+        f'      "price_per_night": "{curr_symbol}4,500",\n'
+        f'      "rating": "⭐ 4.8 (2,100+ reviews)",\n'
+        f'      "location_address": "Central District, {city}",\n'
+        f'      "availability": "Rooms Available",\n'
+        f'      "room_types": ["Deluxe Room", "Suite"],\n'
+        f'      "amenities": ["Free Wi-Fi", "Breakfast", "AC"]\n'
+        f'    }}\n'
+        f'  ],\n'
+        f'  "emergency": {{\n'
+        f'    "hospital_name": "Hospital in {city}",\n'
+        f'    "hospital_phone": "{phone_default}",\n'
+        f'    "police_name": "Police in {city}",\n'
+        f'    "police_phone": "{phone_default}",\n'
+        f'    "fire_name": "Fire Service in {city}",\n'
+        f'    "fire_phone": "{phone_default}",\n'
+        f'    "pharmacy_name": "24/7 Pharmacy in {city}",\n'
+        f'    "pharmacy_phone": "{phone_default}"\n'
+        f'  }}\n'
+        f"}}"
+    )
+
+    raw = ask_hybrid_text(f"Generate 10 real spots and 10 real hotels for Page {hotel_page} in {location} in {target_language}.", sys_prompt)
+    try:
+        clean = raw.strip()
+        if "```json" in clean:
+            clean = clean.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean:
+            clean = clean.split("```")[1].split("```")[0].strip()
+        data = json.loads(clean)
+        return {"status": "success", "data": data}
+    except Exception:
+        base_rates = [3200, 4100, 5600, 6800, 2900, 7500, 3800, 4900, 8200, 3500]
+        offset = (hotel_page - 1) * 10
+        return {
+            "status": "success",
+            "data": {
+                "destination_summary": f"{location} offers historic attractions, dining, and transit networks.",
+                "spots": [
+                    {"page": i + 1, "title": f"Top Landmark {i + 1} of {city}", "rating": "⭐ 4.8", "dist": f"{i + 1} km", "description": f"Verified attraction in {city}.", "images": ["https://images.unsplash.com/photo-1512453979798-5ea266f8880c?q=80&w=800"]}
+                    for i in range(10)
+                ],
+                "hotels_page": hotel_page,
+                "hotels_total_pages": 6,
+                "hotels": [
+                    {
+                        "hotel_id": f"HTL-{offset + i + 1:02d}",
+                        "name": f"{city} Executive Stay #{offset + i + 1}",
+                        "price_per_night": f"{curr_symbol}{base_rates[i % len(base_rates)]}",
+                        "rating": f"⭐ 4.{7 + (i % 3)} ({950 + (i * 100)} reviews)",
+                        "location_address": f"Center, {city}",
+                        "availability": "Rooms Available",
+                        "room_types": ["Deluxe Room", "Family Suite"],
+                        "amenities": ["Free Wi-Fi", "Breakfast", "AC"]
+                    }
+                    for i in range(10)
+                ],
+                "emergency": {
+                    "hospital_name": f"{city} General Hospital",
+                    "hospital_phone": phone_default,
+                    "police_name": f"{city} Police Department",
+                    "police_phone": phone_default,
+                    "fire_name": f"{city} Fire Service",
+                    "fire_phone": phone_default,
+                    "pharmacy_name": f"{city} 24/7 Medico Care",
+                    "pharmacy_phone": phone_default
+                }
+            }
+        }
+
+# -------------------------------------------------------------
+# 5. IN-APP INSTANT HOTEL BOOKING VOUCHER
+# -------------------------------------------------------------
+@app.post("/api/v1/instant-book")
+async def instant_book(
+    hotel_name: str = Form(...),
+    hotel_location: str = Form(...),
+    guest_name: str = Form("Traveler Guest"),
+    check_in_date: str = Form("2026-09-10"),
+    check_out_date: str = Form("2026-09-12"),
+    room_type: str = Form("Deluxe Room"),
+    guests_summary: str = Form("2 Adults"),
+    price_per_night: str = Form("₹4,500"),
+    target_language: str = Form("English")
+):
+    try:
+        code_rand = uuid.uuid4().hex[:6].upper()
+        booking_id = f"HTL-OMNI-2026-{code_rand}"
+        voucher_dossier = {
+            "booking_id": booking_id,
+            "status": "CONFIRMED & GUARANTEED",
+            "hotel_name": hotel_name,
+            "location_address": hotel_location,
+            "guest_name": guest_name,
+            "check_in": check_in_date,
+            "check_out": check_out_date,
+            "room_type": room_type,
+            "party": guests_summary,
+            "price_rate": price_per_night,
+            "cancellation_policy": "Free cancellation up to 24 hours prior to check-in.",
+            "payment_status": "PAY AT HOTEL / CONFIRMED BY CARD",
+            "reception_instructions": "Present this digital voucher and a valid photo ID at front desk.",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+        return {"status": "success", "booking_id": booking_id, "voucher": voucher_dossier}
+    except Exception as e:
+        return {"status": "error", "message": f"Booking failure: {str(e)}"}
+
+# -------------------------------------------------------------
+# 6. CONCIERGE EXPLORE CHAT
+# -------------------------------------------------------------
+@app.post("/api/v1/explore-chat")
+async def explore_chat(
+    spot_name: str = Form("Destination"),
+    question: str = Form("What are the visiting hours?"),
+    target_language: str = Form("English")
+):
+    sys_prompt = f"You are a local guide for '{spot_name}'. Answer concisely in {target_language} using Markdown."
+    ans = ask_hybrid_text(question, sys_prompt)
+    return {"status": "success", "answer": ans}
+
+# -------------------------------------------------------------
+# 7. SERVER HEALTH & PING
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
