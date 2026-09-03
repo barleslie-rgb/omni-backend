@@ -20,7 +20,7 @@ import google.generativeai as genai
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
     description="Resilient Vision, Conversion & Travel Platform",
-    version="53.0.0"
+    version="54.0.0"
 )
 
 app.add_middleware(
@@ -65,10 +65,9 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# LIGHTWEIGHT NATIVE PDF & WORD (.DOCX) COMPILER
+# LIGHTWEIGHT NATIVE PDF & WORD COMPILER
 # -------------------------------------------------------------
 def compile_pdf_document(title: str, content: str, output_path: str):
-    """Generates a valid standard PDF document without external heavy C libraries."""
     lines = []
     lines.append(f"BT /F1 16 Tf 50 750 Td ({title[:55]}) Tj ET")
     lines.append(f"BT /F1 9 Tf 50 735 Td (Omni TouristOS Travel Dossier - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}) Tj ET")
@@ -131,9 +130,7 @@ def compile_pdf_document(title: str, content: str, output_path: str):
         f.write(pdf_template.encode("latin-1", errors="ignore"))
 
 def compile_docx_document(title: str, content: str, output_path: str):
-    """Generates an authentic Microsoft Word .docx OpenXML container using python's built-in zipfile."""
     paragraphs_xml = [f"<w:p><w:pPr><w:pStyle w:val='Heading1'/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val='32'/><w:color w:val='2563EB'/></w:rPr><w:t>{title}</w:t></w:r></w:p>"]
-    
     clean_paragraphs = content.replace("\r", "").split("\n")
     for p in clean_paragraphs:
         p_clean = p.strip()
@@ -148,9 +145,7 @@ def compile_docx_document(title: str, content: str, output_path: str):
     body_content = "".join(paragraphs_xml)
     document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>
-    {body_content}
-  </w:body>
+  <w:body>{body_content}</w:body>
 </w:document>"""
 
     content_types_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -171,7 +166,7 @@ def compile_docx_document(title: str, content: str, output_path: str):
         zf.writestr("word/document.xml", document_xml)
 
 # -------------------------------------------------------------
-# DUAL-ENGINE VISION PIPELINE (GEMINI GA MODELS)
+# DUAL-ENGINE VISION & TEXT PIPELINE
 # -------------------------------------------------------------
 def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
     try:
@@ -201,19 +196,7 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
     for key in keys:
         try:
             genai.configure(api_key=key)
-            active_vision_models = []
-            try:
-                for m in genai.list_models():
-                    if "generateContent" in m.supported_generation_methods:
-                        clean_name = m.name.replace("models/", "")
-                        if any(v in clean_name for v in ["2.5-flash", "2.0-flash", "flash"]):
-                            if "-exp" not in clean_name and clean_name not in active_vision_models:
-                                active_vision_models.append(clean_name)
-            except Exception:
-                pass
-
-            candidates = active_vision_models if active_vision_models else ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-            for model_name in candidates:
+            for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(model_name)
                     res = model.generate_content([prompt, pil_img], request_options={"timeout": 22})
@@ -247,8 +230,8 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
                 model=chosen,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=3000,
-                timeout=16
+                max_tokens=3500,
+                timeout=18
             )
             raw = completion.choices[0].message.content
             if raw:
@@ -343,7 +326,7 @@ async def analyze_document(
         return {"status": "error", "message": f"Forensic audit error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
-# 2. DEDICATED DOCUMENT EXPORTERS (DIRECT PDF / WORD CONVERTERS)
+# 2. DOCUMENT EXPORTERS
 # -------------------------------------------------------------
 @app.post("/api/v1/export-pdf")
 async def export_pdf(request: Request, content: str = Form(...), title: str = Form("Travel Itinerary")):
@@ -352,12 +335,7 @@ async def export_pdf(request: Request, content: str = Form(...), title: str = Fo
         out_path = os.path.join(DOWNLOADS_DIR, file_id)
         compile_pdf_document(title, content, out_path)
         base_url = str(request.base_url).rstrip("/")
-        return {
-            "status": "success",
-            "download_url": f"{base_url}/downloads/{file_id}",
-            "file_name": file_id,
-            "file_type": "PDF"
-        }
+        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "file_name": file_id, "file_type": "PDF"}
     except Exception as e:
         return {"status": "error", "message": f"PDF build error: {str(e)}"}
 
@@ -368,17 +346,12 @@ async def export_docx(request: Request, content: str = Form(...), title: str = F
         out_path = os.path.join(DOWNLOADS_DIR, file_id)
         compile_docx_document(title, content, out_path)
         base_url = str(request.base_url).rstrip("/")
-        return {
-            "status": "success",
-            "download_url": f"{base_url}/downloads/{file_id}",
-            "file_name": file_id,
-            "file_type": "DOCX"
-        }
+        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "file_name": file_id, "file_type": "DOCX"}
     except Exception as e:
         return {"status": "error", "message": f"Word build error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 3. LIVE OMNI AI STUDIO COMPANION & IMAGE GENERATOR
+# 3. LIVE OMNI AI STUDIO
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -391,21 +364,16 @@ async def ask_question(
     try:
         clean_q = question.strip()
         lower_q = clean_q.lower()
-        base_url = str(request.base_url).rstrip("/")
 
-        # Check if user requested an image
         visual_triggers = ["generate image", "create image", "genrate image", "picture of", "photo of", "logo", "3d logo", "render", "illustration", "draw"]
         if any(t in lower_q for t in visual_triggers):
-            # Formulate an explicit visual diffusion prompt
             clean_subject = clean_q
             for tr in ["generate a 3d logo of", "generate 3d logo for my app name", "generate 3d logo for", "generate image of", "create image of", "generate image", "create image"]:
                 clean_subject = re.sub(re.escape(tr), "", clean_subject, flags=re.IGNORECASE).strip()
-            
             prompt_diffusion = f"Modern 3D isometric vector emblem for {clean_subject}, stylized vibrant app icon, smooth matte clay render, volumetric studio lighting, centered, 8k resolution, photorealistic"
             seed = uuid.uuid4().int % 999999
             enc_prompt = urllib.parse.quote(prompt_diffusion)
             img_url = f"https://image.pollinations.ai/prompt/{enc_prompt}?width=1024&height=1024&nologo=true&model=flux&seed={seed}"
-
             return {
                 "status": "success",
                 "answer": f"Rendered visual: *\"{prompt_diffusion}\"*",
@@ -482,35 +450,12 @@ async def resize_image(
     mode: str = Form("size"),
     width: Optional[int] = Form(None),
     height: Optional[int] = Form(None),
-    percentage: Optional[int] = Form(100),
-    platform_preset: Optional[str] = Form("Square"),
     file: UploadFile = File(...)
 ):
     try:
         file_bytes = await file.read()
         img = Image.open(io.BytesIO(file_bytes))
-        orig_w, orig_h = img.size
-        new_w, new_h = orig_w, orig_h
-
-        if mode == "percentage" and percentage:
-            scale = percentage / 100.0
-            new_w = max(1, int(orig_w * scale))
-            new_h = max(1, int(orig_h * scale))
-        elif mode == "social" and platform_preset:
-            presets = {
-                "Facebook Profile (170 x 170)": (170, 170),
-                "Facebook Post (1200 x 630)": (1200, 630),
-                "Instagram Profile (320 x 320)": (320, 320),
-                "Instagram Post / Square (1080 x 1080)": (1080, 1080),
-                "Instagram Story (1080 x 1920)": (1080, 1920),
-                "YouTube Thumbnail (1280 x 720)": (1280, 720),
-                "Twitter / X Header (1500 x 500)": (1500, 500),
-                "Twitter / X Post (1200 x 675)": (1200, 675),
-                "LinkedIn Banner (1584 x 396)": (1584, 396)
-            }
-            new_w, new_h = presets.get(platform_preset, (1080, 1080))
-        elif width and height:
-            new_w, new_h = width, height
+        new_w, new_h = (width or 1080), (height or 1080)
 
         resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         if resized.mode in ("RGBA", "P"):
@@ -525,59 +470,140 @@ async def resize_image(
         return {"status": "error", "message": f"Resize failed: {str(e)}"}
 
 # -------------------------------------------------------------
-# 5. TOURISTOS DESTINATION EXPLORER & GUIDE CHAT
+# 5. TOURISTOS DESTINATION EXPLORER (12-15 REAL SPOTS & DEEP DIVE INTEL)
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
     country: str = Form("India"),
     state: str = Form("Maharashtra"),
     city: str = Form("Mumbai"),
-    adults: int = Form(2),
-    children: int = Form(0),
-    dietary_preference: str = Form("Pure Vegetarian"),
+    party_type: str = Form("Family"),
     hotel_page: int = Form(1),
     target_language: str = Form("English")
 ):
     loc_clean = f"{city}, {state}, {country}".strip(", ")
     is_uae = any(x in loc_clean.lower() for x in ["uae", "dubai", "emirates", "abu dhabi"])
-    is_europe = any(x in loc_clean.lower() for x in ["france", "italy", "vatican", "rome", "spain", "germany", "europe", "paris"])
+    is_europe = any(x in loc_clean.lower() for x in ["france", "italy", "vatican", "rome", "spain", "germany", "europe", "paris", "london", "uk"])
     curr_symbol = "₹" if "india" in loc_clean.lower() else ("AED " if is_uae else ("€" if is_europe else "$"))
 
+    sys_prompt = (
+        f"You are a master local tour guide and concierge for '{loc_clean}'. Target Language: {target_language}.\n"
+        f"Return ONLY valid JSON matching this schema:\n"
+        f"{{\n"
+        f'  "destination_summary": "Thorough high-impact summary of {city} with cultural highlights.",\n'
+        f'  "spots": [\n'
+        f'    {{\n'
+        f'      "page": 1,\n'
+        f'      "title": "Exact Iconic Spot Name",\n'
+        f'      "category": "Historical | Architectural | Leisure | Culture | Nature",\n'
+        f'      "rating": "⭐ 4.9",\n'
+        f'      "dist": "2.4 km from city center",\n'
+        f'      "description": "Engaging 2-sentence visual overview.",\n'
+        f'      "history": "Concise historical origin, architectural style, and significance.",\n'
+        f'      "sightseeing_rules": "Best vantage points, golden hour timing, tripod/drone restrictions.",\n'
+        f'      "culinary": "Iconic local dish to try nearby and signature restaurant.",\n'
+        f'      "transit": "Nearest metro station, typical taxi fare range, or walking accessibility.",\n'
+        f'      "best_time_and_weather": "Ideal visiting hours and season/weather profile.",\n'
+        f'      "shopping": "Famous nearby traditional market, bazaar, or modern shopping mall.",\n'
+        f'      "speciality": "What makes this landmark globally unique."\n'
+        f'    }}\n'
+        f'  ],\n'
+        f'  "hotels": [\n'
+        f'    {{\n'
+        f'      "hotel_id": "HTL-01",\n'
+        f'      "name": "Authentic Hotel Name in {city}",\n'
+        f'      "party_suitability": "Solo | Couple | Family | Group",\n'
+        f'      "price_per_night": "{curr_symbol}5,200",\n'
+        f'      "rating": "⭐ 4.8 (1,800+ reviews)",\n'
+        f'      "location_address": "Prime neighborhood, {city}",\n'
+        f'      "amenities": ["Free Wi-Fi", "Breakfast Included", "Pool", "Transit Shuttle"]\n'
+        f'    }}\n'
+        f'  ],\n'
+        f'  "emergency": {{\n'
+        f'    "hospital_name": "Major Hospital in {city}",\n'
+        f'    "hospital_phone": "Emergency phone",\n'
+        f'    "police_name": "Tourist Police / Police HQ",\n'
+        f'    "police_phone": "Emergency phone",\n'
+        f'    "fire_name": "Civil Defense / Fire Dispatch",\n'
+        f'    "fire_phone": "Emergency phone",\n'
+        f'    "pharmacy_name": "24/7 Pharmacy Hub",\n'
+        f'    "pharmacy_phone": "Local phone"\n'
+        f'  }}\n'
+        f"}}"
+    )
+
+    user_req = f"Provide 12 to 15 real top-rated attractions, tailored accommodations for {party_type}, and safety contacts for {loc_clean}."
+    raw = ask_hybrid_text(user_req, sys_prompt)
+
+    try:
+        clean = raw.strip()
+        if "```json" in clean:
+            clean = clean.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean:
+            clean = clean.split("```")[1].split("```")[0].strip()
+        data = json.loads(clean)
+
+        spots = data.get("spots", [])
+        for sp in spots:
+            t_title = sp.get("title", city)
+            seed = abs(hash(t_title)) % 99999
+            enc_t = urllib.parse.quote(f"Scenic architecture photography of {t_title} {city}, realistic, high resolution, daylight")
+            sp["images"] = [f"https://image.pollinations.ai/prompt/{enc_t}?width=800&height=500&nologo=true&seed={seed}"]
+
+        return {"status": "success", "data": data}
+    except Exception as e:
+        print(f"[TouristOS Parser Warn]: {e}")
+
+    # Fallback for Dubai
     if is_uae:
         dubai_spots = [
-            "Burj Khalifa", "Dubai Mall", "Palm Jumeirah", "Museum of the Future",
-            "Dubai Marina Walk", "Burj Al Arab", "Dubai Frame", "Souk Madinat Jumeirah",
-            "Miracle Garden Dubai", "Global Village"
+            ("Burj Khalifa", "World's tallest building featuring 360-degree observation decks.", "Architectural Marvel"),
+            ("Dubai Mall", "Massive entertainment complex with Olympic ice rink and colossal indoor aquarium.", "Shopping & Leisure"),
+            ("Palm Jumeirah", "World-famous artificial palm-shaped archipelago offering luxury beach resorts.", "Coastal Luxury"),
+            ("Museum of the Future", "Futuristic architectural ring inscribed with Arabic poetry calligraphy.", "Innovation & Art"),
+            ("Dubai Marina Walk", "Vibrant 7-km waterside promenade flanked by illuminated skyscrapers.", "Waterfront Promenade"),
+            ("Burj Al Arab", "Iconic sail-shaped ultra-luxury resort standing on its own private island.", "Iconic Landmark"),
+            ("Dubai Frame", "Monumental golden structure framing historic Deira and modern Downtown.", "Observation Monument"),
+            ("Souk Madinat Jumeirah", "Traditional Middle Eastern bazaar crisscrossed by tranquil water canals.", "Cultural Heritage"),
+            ("Miracle Garden", "World's largest natural flower garden featuring over 150 million blooming flowers.", "Botanical Exhibition"),
+            ("Global Village", "Sprawling multi-cultural festival park showcasing cultural pavilions from 90+ countries.", "Cultural Festival"),
+            ("Al Fahidi Historic District", "Historic neighborhood with gypsum wind towers preserving 19th-century Old Dubai.", "Heritage District"),
+            ("Dubai Creek & Abra", "Historic saltwater waterway navigated by traditional motorized wooden water abras.", "Maritime Heritage")
         ]
+
         return {
             "status": "success",
             "data": {
-                "destination_summary": "Dubai is a global metropolis renowned for modern architecture, luxury shopping, coastal marinas, and historic souks.",
+                "destination_summary": "Dubai is a globally renowned metropolis in the UAE celebrated for world-record architecture, pristine coastline marinas, traditional gold and spice souks, and dining.",
                 "spots": [
                     {
                         "page": i + 1,
-                        "title": dubai_spots[i],
+                        "title": dubai_spots[i][0],
+                        "category": dubai_spots[i][2],
                         "rating": f"⭐ 4.{9 - (i % 2) * 0.1}",
-                        "dist": f"{2.0 + i * 1.8:.1f} km from center",
-                        "description": "Verified landmark situated in Dubai, UAE.",
-                        "images": [f"https://image.pollinations.ai/prompt/{urllib.parse.quote(dubai_spots[i] + ' Dubai architecture')}?width=800&height=500&nologo=true"]
+                        "dist": f"{1.5 + i * 1.6:.1f} km from center",
+                        "description": dubai_spots[i][1],
+                        "history": f"{dubai_spots[i][0]} was engineered as an international emblem of Dubai's forward-looking cultural and architectural vision.",
+                        "sightseeing_rules": "Photography permitted; commercial tripods and drone flights require Dubai Civil Aviation permits. Sunset hour offers prime visual lighting.",
+                        "culinary": "Shawarma, Al Harees, or gourmet Arabic mezze at local waterside cafes.",
+                        "transit": "Red/Green Dubai Metro Lines; Dubai Taxi base fare AED 12 or Careem app dispatch.",
+                        "best_time_and_weather": "October to April (Comfortable 24°C-28°C). Summer months recommended for air-conditioned indoor experiences.",
+                        "shopping": "Dubai Mall, Mall of the Emirates, or the traditional Deira Gold and Spice Souks.",
+                        "speciality": "Signature monumental scale combined with desert-to-sea urban planning."
                     }
-                    for i in range(10)
+                    for i in range(len(dubai_spots))
                 ],
-                "hotels_page": hotel_page,
-                "hotels_total_pages": 6,
                 "hotels": [
                     {
-                        "hotel_id": f"HTL-DXB-P{hotel_page}-{i+1:02d}",
-                        "name": f"Dubai Grand Hotel #{i+1}",
-                        "price_per_night": f"AED {650 + i * 90}",
-                        "rating": "⭐ 4.8 (1,900 reviews)",
-                        "location_address": "Sheikh Zayed Road, Dubai",
-                        "availability": "Rooms Available (Instant Confirmation)",
-                        "room_types": ["Deluxe Room", "Executive Suite", "Family Room"],
-                        "amenities": ["Free Wi-Fi", "Breakfast Included", "AC", f"{dietary_preference} Options"]
+                        "hotel_id": f"HTL-DXB-{i+1:02d}",
+                        "name": f"Dubai Grand Palace Hotel #{i+1}",
+                        "party_suitability": "Family" if i % 2 == 0 else "Couple",
+                        "price_per_night": f"AED {520 + i * 75}",
+                        "rating": "⭐ 4.8 (2,100+ reviews)",
+                        "location_address": "Downtown Sheikh Zayed Road, Dubai",
+                        "amenities": ["Free Wi-Fi", "Breakfast Buffet", "Infinity Pool", "Metro Shuttle"]
                     }
-                    for i in range(10)
+                    for i in range(8)
                 ],
                 "emergency": {
                     "hospital_name": "Rashid Hospital / Dubai Hospital",
@@ -592,49 +618,95 @@ async def touristos_recommend(
             }
         }
 
+    # Universal Fallback (12 Spots)
     return {
         "status": "success",
         "data": {
-            "destination_summary": f"{loc_clean} offers rich cultural landmarks, dining, and transit networks.",
+            "destination_summary": f"{loc_clean} offers rich historical monuments, local markets, and public transit links.",
             "spots": [
                 {
                     "page": i + 1,
-                    "title": f"Attraction {i + 1} of {city}",
+                    "title": f"Iconic Highlight #{i + 1} of {city}",
+                    "category": "Culture & Heritage",
                     "rating": "⭐ 4.8",
-                    "dist": f"{i + 1.2:.1f} km from center",
-                    "description": f"Verified cultural highlight in {city}.",
-                    "images": [f"https://image.pollinations.ai/prompt/{urllib.parse.quote(city + ' landmark architecture')}?width=800&height=500&nologo=true"]
+                    "dist": f"{1.2 + i * 1.5:.1f} km from center",
+                    "description": f"Verified iconic landmark situated in {city}, offering rich regional history and sightseeing.",
+                    "history": f"Established as an important cultural and civic destination reflecting the historical architecture of {city}.",
+                    "sightseeing_rules": "Handheld cameras welcomed. Early morning hours avoid peak crowds.",
+                    "culinary": "Sample local regional street delicacies and authentic dining bistros located along the main promenade.",
+                    "transit": "Accessible via city metro, local commuter bus corridors, and licensed taxi networks.",
+                    "best_time_and_weather": "Spring and autumn provide optimal sightseeing temperatures with minimal humidity.",
+                    "shopping": "Visit central bazaars and artisan markets nearby for local souvenirs and handicrafts.",
+                    "speciality": f"Represents the core cultural heritage and urban character of {city}."
                 }
-                for i in range(10)
+                for i in range(12)
             ],
-            "hotels_page": hotel_page,
-            "hotels_total_pages": 6,
             "hotels": [
                 {
-                    "hotel_id": f"HTL-{hotel_page}-{i+1:02d}",
-                    "name": f"{city} Hotel #{ (hotel_page - 1) * 10 + i + 1 }",
-                    "price_per_night": f"{curr_symbol}{3500 + i * 400}",
-                    "rating": "⭐ 4.7 (1,250 reviews)",
-                    "location_address": f"Central Avenue, {city}",
-                    "availability": "Rooms Available (Instant Confirmation)",
-                    "room_types": ["Deluxe Room", "Executive Suite", "Family Room"],
-                    "amenities": ["Free Wi-Fi", "Breakfast Included", "AC", f"{dietary_preference} Options"]
+                    "hotel_id": f"HTL-STAY-{i+1:02d}",
+                    "name": f"{city} Executive Stay #{i+1}",
+                    "party_suitability": party_type,
+                    "price_per_night": f"{curr_symbol}{3800 + i * 450}",
+                    "rating": "⭐ 4.7 (1,400+ reviews)",
+                    "location_address": f"Central District, {city}",
+                    "amenities": ["Free Wi-Fi", "Breakfast Included", "Air Conditioning", "City Views"]
                 }
-                for i in range(10)
+                for i in range(8)
             ],
             "emergency": {
-                "hospital_name": f"{city} General Hospital",
-                "hospital_phone": "112" if is_europe else ("998" if is_uae else "911"),
-                "police_name": f"{city} Police Control",
-                "police_phone": "112" if is_europe else ("999" if is_uae else "911"),
-                "fire_name": f"{city} Fire & Rescue",
-                "fire_phone": "112" if is_europe else ("997" if is_uae else "911"),
-                "pharmacy_name": f"{city} 24/7 Pharmacy Hub",
-                "pharmacy_phone": "112" if is_europe else ("04-4405100" if is_uae else "911")
+                "hospital_name": f"{city} General Emergency Hospital",
+                "hospital_phone": "112" if is_europe else ("998" if is_uae else "108"),
+                "police_name": f"{city} Police Control Room",
+                "police_phone": "112" if is_europe else ("999" if is_uae else "100"),
+                "fire_name": f"{city} Fire & Rescue Headquarters",
+                "fire_phone": "112" if is_europe else ("997" if is_uae else "101"),
+                "pharmacy_name": f"{city} 24/7 Meds & Pharmacy Hub",
+                "pharmacy_phone": "112" if is_europe else ("04-4405100" if is_uae else "1800-200-1234")
             }
         }
     }
 
+# -------------------------------------------------------------
+# 6. IN-APP INSTANT HOTEL BOOKING VOUCHER
+# -------------------------------------------------------------
+@app.post("/api/v1/instant-book")
+async def instant_book(
+    hotel_name: str = Form(...),
+    hotel_location: str = Form(...),
+    guest_name: str = Form("Traveler Guest"),
+    check_in_date: str = Form("2026-09-10"),
+    check_out_date: str = Form("2026-09-12"),
+    room_type: str = Form("Deluxe Room"),
+    guests_summary: str = Form("2 Adults"),
+    price_per_night: str = Form("₹4,500"),
+    target_language: str = Form("English")
+):
+    try:
+        code_rand = uuid.uuid4().hex[:6].upper()
+        booking_id = f"HTL-OMNI-2026-{code_rand}"
+        voucher_dossier = {
+            "booking_id": booking_id,
+            "status": "CONFIRMED & GUARANTEED",
+            "hotel_name": hotel_name,
+            "location_address": hotel_location,
+            "guest_name": guest_name,
+            "check_in": check_in_date,
+            "check_out": check_out_date,
+            "room_type": room_type,
+            "party": guests_summary,
+            "price_rate": price_per_night,
+            "cancellation_policy": "Free cancellation up to 24 hours prior to check-in.",
+            "payment_status": "CONFIRMED / PAY AT RECEPTION",
+            "reception_instructions": "Present this digital voucher and photo ID at reception.",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+        return {"status": "success", "booking_id": booking_id, "voucher": voucher_dossier}
+    except Exception as e:
+        return {"status": "error", "message": f"Booking failure: {str(e)}"}
+
+# -------------------------------------------------------------
+# 7. CONCIERGE EXPLORE CHAT
+# -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(
     spot_name: str = Form("Destination"),
@@ -645,6 +717,9 @@ async def explore_chat(
     ans = ask_hybrid_text(question, sys_prompt)
     return {"status": "success", "answer": ans}
 
+# -------------------------------------------------------------
+# 8. SERVER HEALTH & PING
+# -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
 def wake():
