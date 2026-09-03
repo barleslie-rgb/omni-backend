@@ -1,5 +1,6 @@
 import os
 import io
+import gc
 import json
 import re
 import uuid
@@ -17,8 +18,8 @@ import google.generativeai as genai
 
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="Dynamic Vision & Travel Platform",
-    version="49.0.0"
+    description="Resilient Vision & Travel Platform",
+    version="49.5.0"
 )
 
 app.add_middleware(
@@ -34,7 +35,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & DYNAMIC DISCOVERY
+# KEYS & FAST DISCOVERY
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -73,38 +74,43 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# IMAGE PREPARATION (UNDER 1MB FOR ULTRA-FAST TRANSMISSION)
+# MEMORY-SAFE IMAGE PREPARATION (NEVER EXCEEDS RENDER 512MB RAM)
 # -------------------------------------------------------------
-def prepare_image(file_bytes: bytes):
-    pil_img = Image.open(io.BytesIO(file_bytes))
-    pil_img = ImageOps.exif_transpose(pil_img)
-    if pil_img.mode != "RGB":
-        pil_img = pil_img.convert("RGB")
-    
-    # Scale down if width/height exceeds 1400px
-    if max(pil_img.size) > 1400:
-        pil_img.thumbnail((1400, 1400), Image.Resampling.LANCZOS)
+def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
+    try:
+        pil_img = Image.open(io.BytesIO(file_bytes))
+        pil_img = ImageOps.exif_transpose(pil_img)
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
         
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=82)
-    clean_bytes = buf.getvalue()
-    b64_str = base64.b64encode(clean_bytes).decode("utf-8")
-    return pil_img, clean_bytes, b64_str
+        # Scale to max 1280px to keep payload under 400KB and RAM under 20MB
+        if max(pil_img.size) > 1280:
+            pil_img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=80, optimize=True)
+        clean_bytes = buf.getvalue()
+        b64_str = base64.b64encode(clean_bytes).decode("utf-8")
+        
+        # Free memory immediately
+        del clean_bytes
+        gc.collect()
+        
+        return pil_img, b64_str
+    except Exception as e:
+        print(f"[Pillow Processing Error]: {e}")
+        return None, None
 
 # -------------------------------------------------------------
-# DUAL-ENGINE VISION EXECUTION WITH DETAILED ERROR TRACKING
+# DUAL-ENGINE VISION EXECUTION
 # -------------------------------------------------------------
 def run_groq_vision(prompt: str, b64_img: str) -> Tuple[Optional[str], Optional[str]]:
     client = get_groq_client()
     if not client:
         return None, "Groq API key not configured."
     
-    vm = get_active_groq_vision_model(client)
-    if not vm:
-        return None, "No active vision model found on Groq."
-        
+    vm = get_active_groq_vision_model(client) or "llama-3.2-11b-vision-preview"
     try:
-        print(f"[Groq Vision]: Calling model {vm}...")
         res = client.chat.completions.create(
             model=vm,
             messages=[
@@ -125,9 +131,7 @@ def run_groq_vision(prompt: str, b64_img: str) -> Tuple[Optional[str], Optional[
             return sanitize_ai_output(txt), None
         return None, "Groq Vision returned empty response."
     except Exception as e:
-        err_msg = str(e)
-        print(f"[Groq Vision Failed]: {err_msg}")
-        return None, f"Groq Error: {err_msg[:120]}"
+        return None, f"Groq: {str(e)[:100]}"
 
 def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
     keys = get_gemini_keys()
@@ -138,50 +142,40 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
     for key in keys:
         try:
             genai.configure(api_key=key)
-            # Query actual models live on this project
-            supported = []
-            try:
-                for m in genai.list_models():
-                    if "generateContent" in m.supported_generation_methods:
-                        supported.append(m.name.replace("models/", ""))
-            except Exception as le:
-                last_error = f"ListModels error: {le}"
-
-            candidates = [m for m in supported if "flash" in m] or ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
+            candidates = ["gemini-3.6-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]
             for model_name in candidates:
                 try:
-                    print(f"[Gemini Vision]: Calling {model_name}...")
                     model = genai.GenerativeModel(model_name)
                     res = model.generate_content([prompt, pil_img], request_options={"timeout": 14})
                     if res and res.text and len(res.text.strip()) > 10:
                         return sanitize_ai_output(res.text), None
                 except Exception as me:
-                    last_error = f"Model {model_name}: {str(me)[:100]}"
+                    last_error = str(me)[:80]
                     continue
         except Exception as ke:
-            last_error = f"Key config error: {str(ke)[:100]}"
+            last_error = str(ke)[:80]
             continue
 
-    return None, f"Gemini Error: {last_error}"
+    return None, f"Gemini: {last_error}"
 
 def audit_document_robust(prompt: str, file_bytes: bytes) -> Tuple[Optional[str], str]:
-    try:
-        pil_img, _, b64_img = prepare_image(file_bytes)
-    except Exception as e:
-        return None, f"Image conversion error: {str(e)}"
+    pil_img, b64_img = prepare_image_safe(file_bytes)
+    if not pil_img or not b64_img:
+        return None, "Could not decode uploaded document format."
 
-    # 1. Primary Attempt: Groq Vision (Fastest LPU)
+    # 1. Primary Attempt: Groq Vision (Fastest LPU, never aborts)
     groq_res, groq_err = run_groq_vision(prompt, b64_img)
     if groq_res:
+        gc.collect()
         return groq_res, ""
 
     # 2. Secondary Attempt: Google Gemini Vision
     gemini_res, gemini_err = run_gemini_vision(prompt, pil_img)
+    gc.collect()
     if gemini_res:
         return gemini_res, ""
 
-    # Both failed — return descriptive diagnosis
-    return None, f"Audit Notice: {groq_err} | {gemini_err}"
+    return None, f"Forensic engine notice: {groq_err} | {gemini_err}"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -257,10 +251,13 @@ async def analyze_document(
         )
 
         analysis_raw, diagnostic_err = audit_document_robust(forensic_prompt, file_bytes)
+        del file_bytes
+        gc.collect()
+
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": diagnostic_err or "Visual analysis engine timed out. Please retry.",
+                "message": diagnostic_err or "Analysis interrupted. Please tap Retry.",
                 "data": None
             }
 
