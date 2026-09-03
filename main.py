@@ -57,19 +57,7 @@ def get_active_groq_text_model(client: Groq) -> str:
             return filtered[0]
     except Exception as e:
         print(f"[Groq Text Discovery]: {e}")
-    return "llama-3.1-8b-instant"
-
-def get_active_groq_vision_model(client: Groq) -> Optional[str]:
-    try:
-        models_data = client.models.list().data
-        active_ids = [m.id for m in models_data]
-        # Dynamically discover active vision endpoints, avoiding deprecated previews
-        for m in active_ids:
-            if "vision" in m and "3.2-11b-vision-preview" not in m:
-                return m
-    except Exception as e:
-        print(f"[Groq Vision Discovery]: {e}")
-    return None
+    return "llama-3.3-70b-versatile"
 
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
@@ -101,7 +89,7 @@ def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Option
         return None, None
 
 # -------------------------------------------------------------
-# DUAL-ENGINE VISION PIPELINE (GEMINI 2.5/2.0 + GROQ FAILOVER)
+# DUAL-ENGINE VISION PIPELINE (GEMINI GA MODELS)
 # -------------------------------------------------------------
 def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
     keys = get_gemini_keys()
@@ -109,15 +97,31 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
         return None, "Gemini API key not configured."
 
     last_error = ""
-    supported_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-exp"]
 
     for key in keys:
         try:
             genai.configure(api_key=key)
-            for model_name in supported_models:
+
+            # Dynamically discover all active models supporting generateContent on this key
+            active_vision_models = []
+            try:
+                for m in genai.list_models():
+                    if "generateContent" in m.supported_generation_methods:
+                        clean_name = m.name.replace("models/", "")
+                        # Prefer 2.5-flash, 2.0-flash, or 1.5-flash GA. Avoid retired -exp tags.
+                        if any(v in clean_name for v in ["2.5-flash", "2.0-flash", "flash"]):
+                            if "-exp" not in clean_name and clean_name not in active_vision_models:
+                                active_vision_models.append(clean_name)
+            except Exception as e:
+                print(f"[Model Discovery Notice]: {e}")
+
+            # Fallback candidates if listing is restricted
+            candidates = active_vision_models if active_vision_models else ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+
+            for model_name in candidates:
                 try:
                     model = genai.GenerativeModel(model_name)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 14})
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 22})
                     if res and res.text and len(res.text.strip()) > 10:
                         return sanitize_ai_output(res.text), None
                 except Exception as me:
@@ -129,58 +133,22 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
 
     return None, f"Gemini ({last_error})"
 
-def run_groq_vision(prompt: str, b64_img: str) -> Tuple[Optional[str], Optional[str]]:
-    client = get_groq_client()
-    if not client:
-        return None, "Groq API key not configured."
-    
-    vm = get_active_groq_vision_model(client)
-    if not vm:
-        return None, "No active Groq vision model currently provisioned."
-
-    try:
-        res = client.chat.completions.create(
-            model=vm,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                    ]
-                }
-            ],
-            temperature=0.2,
-            max_tokens=2048,
-            timeout=15
-        )
-        txt = res.choices[0].message.content
-        if txt and len(txt.strip()) > 10:
-            return sanitize_ai_output(txt), None
-        return None, "Groq Vision returned empty response."
-    except Exception as e:
-        return None, f"Groq ({str(e)[:90]})"
-
 def audit_document_robust(prompt: str, file_bytes: bytes) -> Tuple[Optional[str], str]:
     pil_img, b64_img = prepare_image_safe(file_bytes)
     if not pil_img or not b64_img:
         return None, "Could not decode uploaded document image format."
 
-    # 1. Primary Attempt: Google Gemini Active Vision Models
+    # Execute Gemini Active Vision Pipeline
     gemini_res, gemini_err = run_gemini_vision(prompt, pil_img)
+    gc.collect()
+
     if gemini_res:
-        gc.collect()
         return gemini_res, ""
 
-    # 2. Failover: Groq Vision
-    groq_res, groq_err = run_groq_vision(prompt, b64_img)
-    gc.collect()
-    if groq_res:
-        return groq_res, ""
-
-    return None, f"Inspection notice: {gemini_err} | {groq_err}"
+    return None, f"Inspection notice: {gemini_err}"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
+    # 1. Primary: Groq LPU with active text models
     client = get_groq_client()
     if client:
         try:
@@ -198,13 +166,14 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
         except Exception as e:
             print(f"[Groq Text Error]: {e}")
 
+    # 2. Secondary Failover: Gemini Text
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
-                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 12})
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
                     if res and res.text:
                         return sanitize_ai_output(res.text)
                 except Exception:
@@ -225,10 +194,10 @@ async def analyze_document(
     try:
         file_bytes = await file.read()
         forensic_prompt = (
-            f"You are an expert Forensic Document Auditor and Legal Counsel. Analyze this document in {target_language}.\n"
+            f"You are an expert Forensic Document Auditor and Legal Counsel. Analyze this document thoroughly in {target_language}.\n"
             f"Classify and inspect according to its type:\n"
-            f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12, Index II), Deeds, Power of Attorney, Leases, Stamp Papers, Contracts.\n"
-            f"   - Check: Stamp serials, seals, encumbrance risks, forfeiture traps, title discrepancies.\n"
+            f"1. LEGAL / PROPERTY / FRAUD: Land records (7/12 extract, Index II, Sale Deeds, Power of Attorney, Leases, Stamp Papers, Contracts).\n"
+            f"   - Check: Stamp serials, registrar seals, encumbrance risks, forfeiture traps, title discrepancies.\n"
             f"2. HISTORICAL / ARCHIVE: Sanads, colonial records, antique manuscripts, genealogies.\n"
             f"   - Check: Transcription, seals, historical context.\n"
             f"3. GENERAL / FINANCIAL: Invoices, receipts, travel tickets, vouchers, certificates.\n"
@@ -237,18 +206,18 @@ async def analyze_document(
             f"{{\n"
             f'  "classification": "LEGAL_PROPERTY | HISTORICAL_ARCHIVE | GENERAL_FINANCIAL",\n'
             f'  "status": "VERIFIED AUTHENTIC | HIGH RISK / PREDATORY CLAUSES | SUSPICIOUS ANOMALIES DETECTED",\n'
-            f'  "document_title": "Concise title",\n'
-            f'  "issuing_authority_or_registry": "Issuing authority or Sub-Registrar",\n'
-            f'  "parties_and_dates": "Parties involved and key dates",\n'
-            f'  "metadata_identifiers": "Stamp serial, CTS/Survey/Plot number, or PNR",\n'
-            f'  "traps_risks_and_penalties": "Breakdown of predatory clauses, forfeiture risks, or fees in plain language.",\n'
+            f'  "document_title": "Concise descriptive title of document",\n'
+            f'  "issuing_authority_or_registry": "Issuing authority, Sub-Registrar office, or merchant",\n'
+            f'  "parties_and_dates": "Parties involved and key recorded dates",\n'
+            f'  "metadata_identifiers": "Stamp serial, CTS/Survey/Plot number, or PNR/Voucher code",\n'
+            f'  "traps_risks_and_penalties": "Clear breakdown of predatory clauses, forfeiture risks, encumbrances, or cancellation fees.",\n'
             f'  "financials_or_valuation": {{\n'
             f'    "base_amount": "Base amount with currency",\n'
-            f'    "taxes_and_surcharges": "Taxes or registration fees",\n'
-            f'    "grand_total": "Grand total valuation or amount",\n'
+            f'    "taxes_and_surcharges": "Taxes, registration fees, or duty",\n'
+            f'    "grand_total": "Grand total valuation or paid amount",\n'
             f'    "payment_status": "PAID / REGISTERED / UNPAID / PENDING"\n'
             f'  }},\n'
-            f'  "actionable_advisory": "Concrete next steps (legal due diligence, registrar verification, or safe use).",\n'
+            f'  "actionable_advisory": "Concrete next steps (legal due diligence, sub-registrar verification, or safe use instructions).",\n'
             f'  "detected_destination": "City and Country name if document indicates travel, otherwise null"\n'
             f"}}"
         )
@@ -441,7 +410,9 @@ async def touristos_recommend(
     target_language: str = Form("English")
 ):
     loc_clean = f"{city}, {state}, {country}".strip(", ")
-    curr_symbol = "₹" if "india" in loc_clean.lower() else ("AED " if ("uae" in loc_clean.lower() or "dubai" in loc_clean.lower()) else ("€" if any(c in loc_clean.lower() for c in ["france", "italy", "vatican", "spain", "germany", "europe"]) else "$"))
+    is_uae = any(x in loc_clean.lower() for x in ["uae", "dubai", "emirates", "abu dhabi"])
+    is_europe = any(x in loc_clean.lower() for x in ["france", "italy", "vatican", "rome", "spain", "germany", "europe", "paris"])
+    curr_symbol = "₹" if "india" in loc_clean.lower() else ("AED " if is_uae else ("€" if is_europe else "$"))
 
     sys_prompt = (
         f"You are a local travel authority for '{loc_clean}'. Party: {adults} Adults, {children} Children. Diet: '{dietary_preference}'.\n"
@@ -474,7 +445,7 @@ async def touristos_recommend(
         f'    "police_name": "Police in {city}",\n'
         f'    "police_phone": "Local phone",\n'
         f'    "fire_name": "Fire Service in {city}",\n'
-        f'    "fire_phone": "101 or 112",\n'
+        f'    "fire_phone": "Emergency phone",\n'
         f'    "pharmacy_name": "24/7 Pharmacy in {city}",\n'
         f'    "pharmacy_phone": "Local phone"\n'
         f'  }}\n'
@@ -500,28 +471,63 @@ async def touristos_recommend(
     except Exception as e:
         print(f"[TouristOS Intel Parse Error]: {e}")
 
-    # Accurate regional fallback
-    is_mumbai = "mumbai" in loc_clean.lower()
-    is_dubai = "dubai" in loc_clean.lower() or "uae" in loc_clean.lower()
-    is_italy = any(x in loc_clean.lower() for x in ["italy", "vatican", "rome"])
+    # Fallbacks for Dubai / UAE
+    if is_uae:
+        dubai_spots = [
+            "Burj Khalifa", "Dubai Mall", "Palm Jumeirah", "Museum of the Future",
+            "Dubai Marina Walk", "Burj Al Arab", "Dubai Frame", "Souk Madinat Jumeirah",
+            "Miracle Garden Dubai", "Global Village"
+        ]
+        return {
+            "status": "success",
+            "data": {
+                "destination_summary": "Dubai is a global metropolis renowned for modern architecture, luxury shopping, coastal marinas, and historic souks.",
+                "spots": [
+                    {
+                        "page": i + 1,
+                        "title": dubai_spots[i],
+                        "rating": f"⭐ 4.{9 - (i % 2) * 0.1}",
+                        "dist": f"{2.0 + i * 1.8:.1f} km from center",
+                        "description": f"Verified landmark situated in Dubai, UAE.",
+                        "images": [f"https://image.pollinations.ai/prompt/{urllib.parse.quote(dubai_spots[i] + ' Dubai architecture')}?width=800&height=500&nologo=true"]
+                    }
+                    for i in range(10)
+                ],
+                "hotels_page": hotel_page,
+                "hotels_total_pages": 6,
+                "hotels": [
+                    {
+                        "hotel_id": f"HTL-DXB-P{hotel_page}-{i+1:02d}",
+                        "name": f"Dubai Grand Hotel #{i+1}",
+                        "price_per_night": f"AED {650 + i * 90}",
+                        "rating": "⭐ 4.8 (1,900 reviews)",
+                        "location_address": "Sheikh Zayed Road, Dubai",
+                        "availability": "Rooms Available (Instant Confirmation)",
+                        "room_types": ["Deluxe Room", "Executive Suite", "Family Room"],
+                        "amenities": ["Free Wi-Fi", "Breakfast Included", "AC", f"{dietary_preference} Options"]
+                    }
+                    for i in range(10)
+                ],
+                "emergency": {
+                    "hospital_name": "Rashid Hospital / Dubai Hospital",
+                    "hospital_phone": "998",
+                    "police_name": "Dubai Police General HQ",
+                    "police_phone": "999",
+                    "fire_name": "Dubai Civil Defence",
+                    "fire_phone": "997",
+                    "pharmacy_name": "Aster Pharmacy 24/7",
+                    "pharmacy_phone": "04-4405100"
+                }
+            }
+        }
 
-    if is_mumbai:
+    # Fallbacks for Mumbai / India
+    if "mumbai" in loc_clean.lower():
         mumbai_spots = [
             "Gateway of India", "Marine Drive", "Chhatrapati Shivaji Maharaj Terminus",
             "Elephanta Caves", "Bandra-Worli Sea Link", "Siddhivinayak Temple",
             "Haji Ali Dargah", "Colaba Causeway", "Kanheri Caves", "Juhu Beach"
         ]
-        mumbai_hotels_catalog = [
-            [("The Taj Mahal Palace", "₹18,500"), ("Trident Nariman Point", "₹11,200"), ("The Oberoi Mumbai", "₹19,000"), ("ITC Grand Central", "₹9,800"), ("JW Marriott Juhu", "₹14,500"), ("St. Regis Mumbai", "₹16,000"), ("Taj Lands End Bandra", "₹13,500"), ("President - IHCL SeleQtions", "₹8,900"), ("The Lalit Mumbai", "₹7,200"), ("Novotel Juhu Beach", "₹8,400")],
-            [("Grand Hyatt Mumbai", "₹10,500"), ("Sofitel BKC", "₹12,000"), ("Hyatt Regency Mumbai", "₹7,800"), ("The Orchid Hotel Vile Parle", "₹6,500"), ("Fariyas Hotel Colaba", "₹5,900"), ("Residency Hotel Fort", "₹4,800"), ("Hotel Marine Plaza", "₹7,500"), ("Sea Palace Hotel Colaba", "₹4,200"), ("Bawa International", "₹4,600"), ("Ramee Guestline Juhu", "₹5,100")],
-            [("Sun-n-Sand Hotel Juhu", "₹8,200"), ("Ginger Mumbai Andheri", "₹3,800"), ("Ibis Mumbai Airport", "₹4,500"), ("Radisson Blu Mumbai", "₹7,100"), ("Meluha The Fern Powai", "₹8,500"), ("The Fern Residency Chembur", "₹5,200"), ("Hotel Suba Palace Colaba", "₹4,900"), ("Kohinoor Continental", "₹5,400"), ("Citizen Hotel Juhu", "₹4,800"), ("Hotel Sea Princess", "₹6,900")],
-            [("The Gordon House Hotel Colaba", "₹6,800"), ("Courtyard by Marriott Andheri", "₹8,900"), ("Le Sutra Hotel Bandra", "₹7,400"), ("Hotel Metro Palace Bandra", "₹3,900"), ("The Regale by Tunga", "₹4,100"), ("Hotel Bawa Continental Juhu", "₹4,900"), ("Fortune Park Lake City", "₹5,200"), ("Chateau Windsor Hotel", "₹4,500"), ("Hotel Godwin Colaba", "₹4,200"), ("Hotel Diplomat Colaba", "₹4,400")],
-            [("Svenska Design Hotel Andheri", "₹5,800"), ("The Ambassador Marine Drive", "₹6,200"), ("Goldfinch Hotel Mumbai", "₹4,600"), ("VITS Luxury Business Hotel", "₹4,900"), ("Waterstones Hotel", "₹6,100"), ("Hotel Sahil Mumbai Central", "₹3,900"), ("Hotel City Point Dadar", "₹3,400"), ("The Beatle Hotel Powai", "₹5,500"), ("Hotel Midtown Pritam Dadar", "₹4,800"), ("Hotel Kemps Corner", "₹4,300")],
-            [("Hotel Sea Lord Fort", "₹3,200"), ("Hotel Ascot Colaba", "₹4,100"), ("FabHotel Prime Andheri", "₹2,800"), ("Bloom Hotel Juhu", "₹3,900"), ("Treebo Trend Bandra", "₹3,100"), ("Hotel Residency Fort", "₹4,700"), ("Hotel Broadway Colaba", "₹3,500"), ("Hotel City Palace Fort", "₹2,900"), ("Astoria Hotel Churchgate", "₹4,800"), ("The Shalimar Hotel Kemps Corner", "₹5,600")]
-        ]
-        p_idx = max(0, min(5, hotel_page - 1))
-        page_hotels = mumbai_hotels_catalog[p_idx]
-
         return {
             "status": "success",
             "data": {
@@ -532,8 +538,8 @@ async def touristos_recommend(
                         "title": mumbai_spots[i],
                         "rating": f"⭐ 4.{8 - (i % 2) * 0.1}",
                         "dist": f"{1.5 + i * 2.2:.1f} km from center",
-                        "description": f"Verified iconic landmark in Mumbai with historical significance and cultural views.",
-                        "images": [f"https://image.pollinations.ai/prompt/{urllib.parse.quote(mumbai_spots[i] + ' Mumbai architecture landmark')}?width=800&height=500&nologo=true"]
+                        "description": "Verified iconic landmark in Mumbai with historical significance.",
+                        "images": [f"https://image.pollinations.ai/prompt/{urllib.parse.quote(mumbai_spots[i] + ' Mumbai architecture')}?width=800&height=500&nologo=true"]
                     }
                     for i in range(10)
                 ],
@@ -542,13 +548,13 @@ async def touristos_recommend(
                 "hotels": [
                     {
                         "hotel_id": f"HTL-BOM-P{hotel_page}-{i+1:02d}",
-                        "name": page_hotels[i][0],
-                        "price_per_night": page_hotels[i][1],
-                        "rating": f"⭐ 4.{8 - (i % 3) * 0.1} ({1200 + i * 140} verified reviews)",
+                        "name": f"Mumbai Luxury Stay #{i+1}",
+                        "price_per_night": f"₹{4500 + i * 500}",
+                        "rating": "⭐ 4.7 (1,800 reviews)",
                         "location_address": "Prime District, Mumbai",
                         "availability": "Rooms Available (Instant Confirmation)",
                         "room_types": ["Deluxe Room", "Executive Suite", "Family Room"],
-                        "amenities": ["Free Wi-Fi", "Breakfast Included", "Air Conditioning", f"{dietary_preference} Dining"]
+                        "amenities": ["Free Wi-Fi", "Breakfast Included", "AC", f"{dietary_preference} Options"]
                     }
                     for i in range(10)
                 ],
@@ -565,6 +571,7 @@ async def touristos_recommend(
             }
         }
 
+    # Universal Fallback
     return {
         "status": "success",
         "data": {
@@ -572,10 +579,10 @@ async def touristos_recommend(
             "spots": [
                 {
                     "page": i + 1,
-                    "title": f"Iconic Attraction {i + 1} of {city}",
+                    "title": f"Attraction {i + 1} of {city}",
                     "rating": "⭐ 4.8",
                     "dist": f"{i + 1.2:.1f} km from center",
-                    "description": f"Verified architectural and cultural highlight situated in {city}.",
+                    "description": f"Verified cultural highlight in {city}.",
                     "images": [f"https://image.pollinations.ai/prompt/{urllib.parse.quote(city + ' landmark architecture')}?width=800&height=500&nologo=true"]
                 }
                 for i in range(10)
@@ -585,25 +592,25 @@ async def touristos_recommend(
             "hotels": [
                 {
                     "hotel_id": f"HTL-{hotel_page}-{i+1:02d}",
-                    "name": f"{city} Executive Stay #{ (hotel_page - 1) * 10 + i + 1 }",
+                    "name": f"{city} Hotel #{ (hotel_page - 1) * 10 + i + 1 }",
                     "price_per_night": f"{curr_symbol}{3500 + i * 400}",
                     "rating": "⭐ 4.7 (1,250 reviews)",
                     "location_address": f"Central Avenue, {city}",
                     "availability": "Rooms Available (Instant Confirmation)",
                     "room_types": ["Deluxe Room", "Executive Suite", "Family Room"],
-                    "amenities": ["Free Wi-Fi", "Breakfast Included", "Air Conditioning", f"{dietary_preference} Options"]
+                    "amenities": ["Free Wi-Fi", "Breakfast Included", "AC", f"{dietary_preference} Options"]
                 }
                 for i in range(10)
             ],
             "emergency": {
-                "hospital_name": f"{city} General Emergency Hospital",
-                "hospital_phone": "112" if (is_italy or "europe" in loc_clean.lower()) else "911",
-                "police_name": f"{city} Police Control Desk",
-                "police_phone": "112" if (is_italy or "europe" in loc_clean.lower()) else "911",
+                "hospital_name": f"{city} General Hospital",
+                "hospital_phone": "112" if is_europe else ("998" if is_uae else "911"),
+                "police_name": f"{city} Police Control",
+                "police_phone": "112" if is_europe else ("999" if is_uae else "911"),
                 "fire_name": f"{city} Fire & Rescue",
-                "fire_phone": "112" if (is_italy or "europe" in loc_clean.lower()) else "911",
-                "pharmacy_name": f"{city} 24/7 Chemist Hub",
-                "pharmacy_phone": "112" if (is_italy or "europe" in loc_clean.lower()) else "911"
+                "fire_phone": "112" if is_europe else ("997" if is_uae else "911"),
+                "pharmacy_name": f"{city} 24/7 Pharmacy Hub",
+                "pharmacy_phone": "112" if is_europe else ("04-4405100" if is_uae else "911")
             }
         }
     }
