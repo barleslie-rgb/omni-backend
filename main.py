@@ -20,7 +20,7 @@ import google.generativeai as genai
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
     description="Resilient Vision, Conversion & Travel Platform",
-    version="57.0.0"
+    version="58.0.0"
 )
 
 app.add_middleware(
@@ -65,7 +65,7 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# LIGHTWEIGHT NATIVE PDF & WORD COMPILER
+# LIGHTWEIGHT NATIVE PDF & WORD COMPILERS
 # -------------------------------------------------------------
 def compile_pdf_document(title: str, content: str, output_path: str):
     lines = []
@@ -166,7 +166,7 @@ def compile_docx_document(title: str, content: str, output_path: str):
         zf.writestr("word/document.xml", document_xml)
 
 # -------------------------------------------------------------
-# DUAL-ENGINE VISION & TEXT
+# DUAL-ENGINE VISION & TEXT PIPELINE
 # -------------------------------------------------------------
 def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
     try:
@@ -274,14 +274,29 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=2500,
-                timeout=18
+                timeout=20
             )
             raw = completion.choices[0].message.content
             if raw:
                 return sanitize_ai_output(raw)
         except Exception as e:
             print(f"[Groq Text Error]: {e}")
-    return "Service is momentarily busy. Please try again shortly."
+            
+    for key in get_gemini_keys():
+        try:
+            genai.configure(api_key=key)
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+                try:
+                    model = genai.GenerativeModel(m)
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 16})
+                    if res and res.text:
+                        return sanitize_ai_output(res.text)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return "I am right here with you! Let me know which landmark, food spot, or itinerary you would like to explore."
 
 # -------------------------------------------------------------
 # 1. PAPERPILOT FORENSIC AUDITOR
@@ -359,7 +374,7 @@ async def analyze_document(
 @app.post("/api/v1/export-pdf")
 async def export_pdf(request: Request, content: str = Form(...), title: str = Form("Travel Itinerary")):
     try:
-        file_id = f"Omni_Itinerary_{uuid.uuid4().hex[:5]}.pdf"
+        file_id = f"Omni_Itinerary_{uuid.uuid4().hex[:6]}.pdf"
         out_path = os.path.join(DOWNLOADS_DIR, file_id)
         compile_pdf_document(title, content, out_path)
         base_url = str(request.base_url).rstrip("/")
@@ -370,7 +385,7 @@ async def export_pdf(request: Request, content: str = Form(...), title: str = Fo
 @app.post("/api/v1/export-docx")
 async def export_docx(request: Request, content: str = Form(...), title: str = Form("Travel Itinerary")):
     try:
-        file_id = f"Omni_Itinerary_{uuid.uuid4().hex[:5]}.docx"
+        file_id = f"Omni_Itinerary_{uuid.uuid4().hex[:6]}.docx"
         out_path = os.path.join(DOWNLOADS_DIR, file_id)
         compile_docx_document(title, content, out_path)
         base_url = str(request.base_url).rstrip("/")
@@ -498,7 +513,7 @@ async def resize_image(
         return {"status": "error", "message": f"Resize failed: {str(e)}"}
 
 # -------------------------------------------------------------
-# 5. TOURISTOS DESTINATION EXPLORER (STRICT LIVE ACCURACY)
+# 5. TOURISTOS DESTINATION EXPLORER
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -612,7 +627,7 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
-    # HIGH-FIDELITY REAL FALLBACK FOR DUBAI (REAL NAMES, REAL HOTELS, REAL IMAGES)
+    # High-fidelity fallback for Dubai
     if "dubai" in lower_loc:
         dubai_spots = [
             ("Burj Khalifa", "World's tallest skyscraper with outdoor observation decks and panoramic vistas.", "Architectural Marvel"),
@@ -647,7 +662,7 @@ async def touristos_recommend(
                         "dist": f"{1.5 + i * 1.5:.1f} km from center",
                         "description": dubai_spots[i][1],
                         "history": f"{dubai_spots[i][0]} was engineered as an international emblem of Dubai's forward-looking cultural and architectural vision.",
-                        "sightseeing_rules": "Photography permitted; commercial tripods and drone flights require Dubai Civil Aviation permits. Sunset hour offers prime visual lighting.",
+                        "sightseeing_rules": "Photography permitted; commercial tripods and drone flights require permits. Sunset hour offers prime visual lighting.",
                         "culinary": f"Shawarma, Al Harees, or gourmet Arabic mezze adhering to {dietary_preference}.",
                         "transit": "Dubai Metro Red Line; Dubai Taxi base fare AED 12 or Careem app dispatch.",
                         "best_time_and_weather": "October to April (Comfortable 24°C-28°C). Summer months recommended for indoor attractions.",
@@ -682,141 +697,71 @@ async def touristos_recommend(
             }
         }
 
-    # HIGH-FIDELITY REAL FALLBACK FOR VASAI (REAL RESORTS, NO #1, #2)
-    if "vasai" in lower_loc or "virar" in lower_loc:
-        vasai_spots = [
-            ("Vasai Fort (Fort Bassein)", "Massive 16th-century Portuguese coastal fortress with ancient chapel ruins.", "Historical Architecture"),
-            ("Suruchi Beach", "Pristine sandy coastline shaded by dense suru (casuarina) trees, ideal for sunsets.", "Coastal Nature"),
-            ("Bhuigaon Beach", "Serene and clean palm-lined coastal stretch offering tranquil beach walks.", "Coastal Nature"),
-            ("Tungareshwar Wildlife Sanctuary", "Lush forested mountain sanctuary with waterfalls and an ancient Shiva temple.", "Nature & Pilgrimage"),
-            ("Vajreshwari Hot Springs & Temple", "Famous natural mineral hot sulphur springs and historic Goddess temple.", "Heritage & Wellness"),
-            ("St. Gonsalo Garcia Memorial Church", "Magnificent historic Catholic church dedicated to India's first canonized saint.", "Religious Heritage"),
-            ("Kalamb Beach", "Tranquil long shoreline with black sand and waterside coconut groves.", "Coastal Leisure"),
-            ("Panju Island", "Historic vehicle-free estuarine island in Vasai Creek with traditional heritage.", "Cultural Heritage"),
-            ("Chinchoti Waterfalls", "Popular monsoon trekking destination through forested Western Ghats terrain.", "Adventure & Nature"),
-            ("Rangaon Beach", "Secluded coastal haven near Giriz known for panoramic sunset views.", "Coastal Nature")
-        ]
-        real_vasai_hotels = [
-            ("Farm Regency Resort", "Gorai-Uttan Road / Vasai Belt", "₹2,800"),
-            ("Westpalm Beach Resort", "Rangaon Beach Road, Vasai West", "₹3,400"),
-            ("Golden Chariot Vasai Hotel", "Near NH48 Highway, Vasai East", "₹3,100"),
-            ("Royal Garden Resort", "Mumbai-Ahmedabad Highway, Vasai", "₹3,900"),
-            ("Viva Superb Hotel", "Near Vasai Railway Station, West", "₹2,500"),
-            ("Silverador Resort Club", "Uttan Coastal Ridge, Vasai region", "₹4,200")
-        ]
-        return {
-            "status": "success",
-            "data": {
-                "destination_summary": "Vasai is a historic coastal municipal region in the Palghar district of Maharashtra, celebrated for Portuguese fort ruins, Arabian Sea beaches, and cultural architecture.",
-                "spots": [
-                    {
-                        "page": i + 1,
-                        "title": vasai_spots[i][0],
-                        "category": vasai_spots[i][2],
-                        "rating": f"⭐ 4.{8 - (i % 2) * 0.1}",
-                        "dist": f"{2.0 + i * 1.8:.1f} km from center",
-                        "description": vasai_spots[i][1],
-                        "history": f"{vasai_spots[i][0]} is a cornerstone of Vasai's rich historical and maritime heritage.",
-                        "sightseeing_rules": "Photography permitted; early morning and sunset hours offer optimal lighting and pleasant coastal breeze.",
-                        "culinary": f"Traditional Maharashtrian, East Indian delicacies, or fresh dining adhering to {dietary_preference}.",
-                        "transit": "Vasai Road Railway Station (Western Line), VVMT local city buses, and auto-rickshaws.",
-                        "best_time_and_weather": "October to March (Pleasant 22°C-30°C); monsoon season brings scenic greenery.",
-                        "shopping": "Vasai Station Market, Bhabola Naka shopping arcade, and Anand Nagar bazaars.",
-                        "speciality": "Rare blend of Portuguese maritime history, palm-lined shores, and pilgrimage shrines.",
-                        "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20architecture%20photography%20of%20{urllib.parse.quote(vasai_spots[i][0])}%20Vasai%20Maharashtra?width=800&height=500&nologo=true&seed={abs(hash(vasai_spots[i][0])) % 99999}&model=flux"]
-                    }
-                    for i in range(len(vasai_spots))
-                ],
-                "hotels": [
-                    {
-                        "hotel_id": f"HTL-VSI-{i+1:02d}",
-                        "name": real_vasai_hotels[i][0],
-                        "party_suitability": f"{adults} Adults & {children} Kids",
-                        "price_per_night": real_vasai_hotels[i][2],
-                        "rating": "⭐ 4.6 (850+ reviews)",
-                        "location_address": real_vasai_hotels[i][1],
-                        "amenities": ["Free Wi-Fi", "Breakfast Included", f"{dietary_preference} Options", "Pool"]
-                    }
-                    for i in range(len(real_vasai_hotels))
-                ],
-                "emergency": {
-                    "hospital_name": "Cardinal Gracias Memorial Hospital / D.M. Petit Hospital",
-                    "hospital_phone": "0250-2324220 / 108",
-                    "police_name": "Manikpur Police Station / Vasai Police Station",
-                    "police_phone": "0250-2332110 / 112",
-                    "fire_name": "Vasai-Virar Municipal Fire Station",
-                    "fire_phone": "0250-2334258 / 101",
-                    "pharmacy_name": "Wellness Forever 24/7 / Apollo Chemist Vasai",
-                    "pharmacy_phone": "0250-2330055"
-                }
-            }
-        }
-
-    # GENERAL DESTINATION FALLBACK WITH REAL IMAGES
-    gen_landmarks = [
-        f"{city} Historic Square & Cathedral",
-        f"{city} Royal Gardens & Promenade",
-        f"{city} Central Heritage Museum",
-        f"{city} Old Town Artisan Quarter",
-        f"{city} Waterfront Marina & Bay",
-        f"{city} Memorial Arch & Observation Point",
-        f"{city} Botanical Conservatory",
-        f"{city} Cultural Arts Center",
-        f"{city} Grand Bazaar & Market Street",
-        f"{city} Scenic Valley & Hill View"
+    # High-fidelity fallback for Vasai
+    vasai_spots = [
+        ("Vasai Fort (Fort Bassein)", "Massive 16th-century Portuguese coastal fortress with ancient chapel ruins.", "Historical Architecture"),
+        ("Suruchi Beach", "Pristine sandy coastline shaded by dense suru (casuarina) trees, ideal for sunsets.", "Coastal Nature"),
+        ("Bhuigaon Beach", "Serene and clean palm-lined coastal stretch offering tranquil beach walks.", "Coastal Nature"),
+        ("Tungareshwar Wildlife Sanctuary", "Lush forested mountain sanctuary with waterfalls and an ancient Shiva temple.", "Nature & Pilgrimage"),
+        ("Vajreshwari Hot Springs & Temple", "Famous natural mineral hot sulphur springs and historic Goddess temple.", "Heritage & Wellness"),
+        ("St. Gonsalo Garcia Memorial Church", "Magnificent historic Catholic church dedicated to India's first canonized saint.", "Religious Heritage"),
+        ("Kalamb Beach", "Tranquil long shoreline with black sand and waterside coconut groves.", "Coastal Leisure"),
+        ("Panju Island", "Historic vehicle-free estuarine island in Vasai Creek with traditional heritage.", "Cultural Heritage"),
+        ("Chinchoti Waterfalls", "Popular monsoon trekking destination through forested Western Ghats terrain.", "Adventure & Nature"),
+        ("Rangaon Beach", "Secluded coastal haven near Giriz known for panoramic sunset views.", "Coastal Nature")
     ]
-    gen_hotels = [
-        (f"Grand Heritage Hotel {city}", "Central City District", f"{curr_sym}2,900" if curr_sym == "₹" else f"{curr_sym}185"),
-        (f"The Royal Park Hotel {city}", "Near Waterfront Boulevard", f"{curr_sym}3,400" if curr_sym == "₹" else f"{curr_sym}220"),
-        (f"Courtyard Executive Suites {city}", "Commercial Hub, Central", f"{curr_sym}2,600" if curr_sym == "₹" else f"{curr_sym}160"),
-        (f"Boutique Haven Resort {city}", "Historic District Promenade", f"{curr_sym}3,800" if curr_sym == "₹" else f"{curr_sym}250"),
-        (f"Metropolitan Premier Hotel {city}", "Near Main Transit Terminal", f"{curr_sym}2,400" if curr_sym == "₹" else f"{curr_sym}150"),
-        (f"Resort Vista {city}", "Green Belt Outskirts", f"{curr_sym}4,100" if curr_sym == "₹" else f"{curr_sym}270")
+    real_vasai_hotels = [
+        ("Farm Regency Resort", "Gorai-Uttan Road / Vasai Belt", "₹2,800"),
+        ("Westpalm Beach Resort", "Rangaon Beach Road, Vasai West", "₹3,400"),
+        ("Golden Chariot Vasai Hotel", "Near NH48 Highway, Vasai East", "₹3,100"),
+        ("Royal Garden Resort", "Mumbai-Ahmedabad Highway, Vasai", "₹3,900"),
+        ("Viva Superb Hotel", "Near Vasai Railway Station, West", "₹2,500"),
+        ("Silverador Resort Club", "Uttan Coastal Ridge, Vasai region", "₹4,200")
     ]
     return {
         "status": "success",
         "data": {
-            "destination_summary": f"{loc_clean} features world-class cultural attractions, local transport links, and historic districts.",
+            "destination_summary": "Vasai is a historic coastal municipal region in the Palghar district of Maharashtra, celebrated for Portuguese fort ruins, Arabian Sea beaches, and cultural architecture.",
             "spots": [
                 {
                     "page": i + 1,
-                    "title": gen_landmarks[i],
-                    "category": "Historic & Cultural",
-                    "rating": "⭐ 4.8",
-                    "dist": f"{1.0 + i * 1.5:.1f} km from center",
-                    "description": f"Verified iconic attraction situated in {city}, offering rich regional history and sightseeing.",
-                    "history": f"Established as an important cultural destination reflecting the heritage of {city}.",
-                    "sightseeing_rules": "Handheld photography permitted. Early morning hours recommended.",
-                    "culinary": f"Regional delicacies and dining accommodating {dietary_preference}.",
-                    "transit": "Connected via city transit stations, commuter rail, and licensed cabs.",
-                    "best_time_and_weather": "Spring and autumn provide optimal sightseeing temperatures.",
-                    "shopping": "Central bazaars, traditional artisan streets, and retail centers.",
-                    "speciality": f"Core landmark defining the landscape of {city}.",
-                    "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20architecture%20photography%20of%20{urllib.parse.quote(gen_landmarks[i])}%20{urllib.parse.quote(city)}?width=800&height=500&nologo=true&seed={abs(hash(gen_landmarks[i])) % 99999}&model=flux"]
+                    "title": vasai_spots[i][0],
+                    "category": vasai_spots[i][2],
+                    "rating": f"⭐ 4.{8 - (i % 2) * 0.1}",
+                    "dist": f"{2.0 + i * 1.8:.1f} km from center",
+                    "description": vasai_spots[i][1],
+                    "history": f"{vasai_spots[i][0]} is a cornerstone of Vasai's rich historical and maritime heritage.",
+                    "sightseeing_rules": "Photography permitted; early morning and sunset hours offer optimal lighting and pleasant coastal breeze.",
+                    "culinary": f"Traditional Maharashtrian, East Indian delicacies, or fresh dining adhering to {dietary_preference}.",
+                    "transit": "Vasai Road Railway Station (Western Line), VVMT local city buses, and auto-rickshaws.",
+                    "best_time_and_weather": "October to March (Pleasant 22°C-30°C); monsoon season brings scenic greenery.",
+                    "shopping": "Vasai Station Market, Bhabola Naka shopping arcade, and Anand Nagar bazaars.",
+                    "speciality": "Rare blend of Portuguese maritime history, palm-lined shores, and pilgrimage shrines.",
+                    "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20architecture%20photography%20of%20{urllib.parse.quote(vasai_spots[i][0])}%20Vasai%20Maharashtra?width=800&height=500&nologo=true&seed={abs(hash(vasai_spots[i][0])) % 99999}&model=flux"]
                 }
-                for i in range(len(gen_landmarks))
+                for i in range(len(vasai_spots))
             ],
             "hotels": [
                 {
-                    "hotel_id": f"HTL-GEN-{i+1:02d}",
-                    "name": gen_hotels[i][0],
+                    "hotel_id": f"HTL-VSI-{i+1:02d}",
+                    "name": real_vasai_hotels[i][0],
                     "party_suitability": f"{adults} Adults & {children} Kids",
-                    "price_per_night": gen_hotels[i][2],
-                    "rating": "⭐ 4.7 (1,100+ reviews)",
-                    "location_address": gen_hotels[i][1],
-                    "amenities": ["Free Wi-Fi", "Breakfast", f"{dietary_preference} Options", "AC"]
+                    "price_per_night": real_vasai_hotels[i][2],
+                    "rating": "⭐ 4.6 (850+ reviews)",
+                    "location_address": real_vasai_hotels[i][1],
+                    "amenities": ["Free Wi-Fi", "Breakfast Included", f"{dietary_preference} Options", "Pool"]
                 }
-                for i in range(len(gen_hotels))
+                for i in range(len(real_vasai_hotels))
             ],
             "emergency": {
-                "hospital_name": f"{city} General Emergency Hospital",
-                "hospital_phone": nat_hosp,
-                "police_name": f"{city} Police Control Division",
-                "police_phone": nat_police,
-                "fire_name": f"{city} Fire & Rescue Headquarters",
-                "fire_phone": nat_fire,
-                "pharmacy_name": f"{city} 24/7 Central Pharmacy Hub",
-                "pharmacy_phone": nat_pharm
+                "hospital_name": "Cardinal Gracias Memorial Hospital / D.M. Petit Hospital",
+                "hospital_phone": "0250-2324220 / 108",
+                "police_name": "Manikpur Police Station / Vasai Police Station",
+                "police_phone": "0250-2332110 / 112",
+                "fire_name": "Vasai-Virar Municipal Fire Station",
+                "fire_phone": "0250-2334258 / 101",
+                "pharmacy_name": "Wellness Forever 24/7 / Apollo Chemist Vasai",
+                "pharmacy_phone": "0250-2330055"
             }
         }
     }
@@ -860,17 +805,82 @@ async def instant_book(
         return {"status": "error", "message": f"Booking failure: {str(e)}"}
 
 # -------------------------------------------------------------
-# 7. CONCIERGE EXPLORE CHAT
+# 7. FEATURE 5: CONCIERGE GUIDE CHAT & AUTO DOCUMENT CONVERTER
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(
-    spot_name: str = Form("Destination"),
-    question: str = Form("What are the visiting hours?"),
+    request: Request,
+    city: str = Form("Vasai"),
+    country: str = Form("India"),
+    party_summary: str = Form("2 Adults"),
+    dietary_preference: str = Form("All / Any"),
+    question: str = Form("Can you plan a 3-day itinerary?"),
     target_language: str = Form("English")
 ):
-    sys_prompt = f"You are a local guide for '{spot_name}'. Answer concisely in {target_language} using Markdown."
-    ans = ask_hybrid_text(question, sys_prompt)
-    return {"status": "success", "answer": ans}
+    try:
+        clean_q = question.strip()
+        loc_label = f"{city}, {country}".strip(", ")
+        
+        # System persona: Warm, highly knowledgeable, and welcoming
+        sys_prompt = (
+            f"You are Omni Guide, a warm, polite, and exceptionally knowledgeable local travel concierge for '{loc_label}'.\n"
+            f"Travelers: {party_summary}. Dietary Preference: '{dietary_preference}'. Language: {target_language}.\n"
+            f"CRITICAL BEHAVIOR RULES:\n"
+            f"1. NEVER say 'I cannot generate files in this chat' or 'I am only an AI'.\n"
+            f"2. You are warm, hospitable, helpful, and enthusiastic about showing travelers the best of {city}.\n"
+            f"3. When answering itineraries, break them down clearly: Day 1, Day 2, Day 3 with Morning, Afternoon, and Evening activities.\n"
+            f"4. Respect the dietary preference '{dietary_preference}' strictly when suggesting culinary spots.\n"
+            f"5. Answer in clean, easy-to-read Markdown with bullet points and bold headers."
+        )
+
+        response_text = ask_hybrid_text(clean_q, sys_prompt)
+
+        # Check if the user is asking for an itinerary, guide, or downloadable plan
+        is_itinerary_trigger = any(
+            t in clean_q.lower()
+            for t in ["itinerary", "plan", "download", "pdf", "word", "docx", "schedule", "guide", "days", "tour"]
+        )
+
+        pdf_url = ""
+        docx_url = ""
+        pdf_name = ""
+        docx_name = ""
+
+        if is_itinerary_trigger or len(response_text) > 400:
+            doc_id = uuid.uuid4().hex[:6].upper()
+            title_clean = f"Omni Guide - {city} Travel Dossier"
+            base_url = str(request.base_url).rstrip("/")
+
+            # 1. Compile PDF
+            pdf_file_id = f"Omni_Itinerary_{city.replace(' ', '_')}_{doc_id}.pdf"
+            pdf_path = os.path.join(DOWNLOADS_DIR, pdf_file_id)
+            compile_pdf_document(title_clean, response_text, pdf_path)
+            pdf_url = f"{base_url}/downloads/{pdf_file_id}"
+            pdf_name = pdf_file_id
+
+            # 2. Compile Word (.docx)
+            docx_file_id = f"Omni_Itinerary_{city.replace(' ', '_')}_{doc_id}.docx"
+            docx_path = os.path.join(DOWNLOADS_DIR, docx_file_id)
+            compile_docx_document(title_clean, response_text, docx_path)
+            docx_url = f"{base_url}/downloads/{docx_file_id}"
+            docx_name = docx_file_id
+
+        return {
+            "status": "success",
+            "answer": response_text,
+            "has_document": bool(pdf_url),
+            "pdf_url": pdf_url,
+            "pdf_name": pdf_name,
+            "docx_url": docx_url,
+            "docx_name": docx_name,
+            "destination": city
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "answer": f"I am delighted to guide you through {city}! Could you please repeat that question?",
+            "has_document": False
+        }
 
 # -------------------------------------------------------------
 # 8. SERVER HEALTH & PING
