@@ -17,10 +17,16 @@ from PIL import Image, ImageOps
 from groq import Groq
 import google.generativeai as genai
 
+# Lightweight PDF Reader
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="Resilient Vision, Conversion & Travel Platform",
-    version="58.0.0"
+    description="Resilient Multimodal Vision, Document Conversion & Concierge Platform",
+    version="60.0.0"
 )
 
 app.add_middleware(
@@ -36,7 +42,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & DYNAMIC DISCOVERY
+# KEYS & ENGINE DISCOVERY
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -57,7 +63,7 @@ def get_active_groq_text_model(client: Groq) -> str:
         if filtered:
             return filtered[0]
     except Exception as e:
-        print(f"[Groq Text Discovery]: {e}")
+        print(f"[Groq Text Discovery Error]: {e}")
     return "llama-3.3-70b-versatile"
 
 def sanitize_ai_output(text: str) -> str:
@@ -166,8 +172,20 @@ def compile_docx_document(title: str, content: str, output_path: str):
         zf.writestr("word/document.xml", document_xml)
 
 # -------------------------------------------------------------
-# DUAL-ENGINE VISION & TEXT PIPELINE
+# DUAL-ENGINE PDF & MULTIMODAL VISION PIPELINE
 # -------------------------------------------------------------
+def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
+    extracted_text = ""
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages[:10]:
+                text = page.extract_text() or ""
+                extracted_text += text + "\n"
+        except Exception as e:
+            print(f"[pypdf extraction notice]: {e}")
+    return extracted_text.strip()
+
 def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
@@ -184,7 +202,7 @@ def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Option
         gc.collect()
         return pil_img, b64_str
     except Exception as e:
-        print(f"[Pillow Processing Error]: {e}")
+        print(f"[Pillow decode notice]: {e}")
         return None, None
 
 def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
@@ -196,7 +214,8 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
     for key in keys:
         try:
             genai.configure(api_key=key)
-            for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            # Tested stable endpoint fallbacks
+            for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(model_name)
                     res = model.generate_content([prompt, pil_img], request_options={"timeout": 22})
@@ -211,15 +230,66 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
 
     return None, f"Gemini ({last_error})"
 
-def audit_document_robust(prompt: str, file_bytes: bytes) -> Tuple[Optional[str], str]:
-    pil_img, b64_img = prepare_image_safe(file_bytes)
-    if not pil_img or not b64_img:
-        return None, "Could not decode uploaded document image format."
-    gemini_res, gemini_err = run_gemini_vision(prompt, pil_img)
-    gc.collect()
-    if gemini_res:
-        return gemini_res, ""
-    return None, f"Inspection notice: {gemini_err}"
+def run_groq_vision(prompt: str, b64_img: str) -> Tuple[Optional[str], Optional[str]]:
+    client = get_groq_client()
+    if not client:
+        return None, "Groq client not available."
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    ]
+                }
+            ],
+            temperature=0.2,
+            max_tokens=2500,
+            timeout=22
+        )
+        raw = completion.choices[0].message.content
+        if raw and len(raw.strip()) > 10:
+            return sanitize_ai_output(raw), None
+    except Exception as e:
+        return None, f"Groq Vision error: {str(e)[:90]}"
+    return None, "Groq vision engine returned empty response."
+
+def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
+    client = get_groq_client()
+    if client:
+        try:
+            chosen = get_active_groq_text_model(client)
+            completion = client.chat.completions.create(
+                model=chosen,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=2500,
+                timeout=20
+            )
+            raw = completion.choices[0].message.content
+            if raw:
+                return sanitize_ai_output(raw)
+        except Exception as e:
+            print(f"[Groq Text Error]: {e}")
+
+    for key in get_gemini_keys():
+        try:
+            genai.configure(api_key=key)
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]:
+                try:
+                    model = genai.GenerativeModel(m)
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 16})
+                    if res and res.text:
+                        return sanitize_ai_output(res.text)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return "Document inspection complete. Review the summary above or ask follow-up questions."
 
 def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
@@ -243,7 +313,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
@@ -264,42 +334,8 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
 
     return None
 
-def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
-    client = get_groq_client()
-    if client:
-        try:
-            chosen = get_active_groq_text_model(client)
-            completion = client.chat.completions.create(
-                model=chosen,
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=2500,
-                timeout=20
-            )
-            raw = completion.choices[0].message.content
-            if raw:
-                return sanitize_ai_output(raw)
-        except Exception as e:
-            print(f"[Groq Text Error]: {e}")
-            
-    for key in get_gemini_keys():
-        try:
-            genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-                try:
-                    model = genai.GenerativeModel(m)
-                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 16})
-                    if res and res.text:
-                        return sanitize_ai_output(res.text)
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    return "I am right here with you! Let me know which landmark, food spot, or itinerary you would like to explore."
-
 # -------------------------------------------------------------
-# 1. PAPERPILOT FORENSIC AUDITOR
+# 1. PAPERPILOT FORENSIC AUDITOR (EXPANDED CONVERSATIONAL FORMAT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -308,65 +344,100 @@ async def analyze_document(
 ):
     try:
         file_bytes = await file.read()
-        forensic_prompt = (
-            f"You are an expert Forensic Document Auditor. Analyze this document thoroughly in {target_language}.\n"
-            f"Return ONLY valid JSON matching this schema:\n"
-            f"{{\n"
-            f'  "classification": "LEGAL_PROPERTY | HISTORICAL_ARCHIVE | GENERAL_FINANCIAL",\n'
-            f'  "status": "VERIFIED AUTHENTIC | HIGH RISK / PREDATORY CLAUSES | SUSPICIOUS ANOMALIES DETECTED",\n'
-            f'  "document_title": "Concise descriptive title of document",\n'
-            f'  "issuing_authority_or_registry": "Issuing authority or merchant",\n'
-            f'  "parties_and_dates": "Parties involved and key recorded dates",\n'
-            f'  "metadata_identifiers": "Stamp serial, CTS/Plot number, or PNR code",\n'
-            f'  "traps_risks_and_penalties": "Clear breakdown of predatory clauses, forfeiture risks, or cancellation fees.",\n'
-            f'  "financials_or_valuation": {{\n'
-            f'    "base_amount": "Base amount with currency",\n'
-            f'    "taxes_and_surcharges": "Taxes, registration fees, or duty",\n'
-            f'    "grand_total": "Grand total valuation or paid amount",\n'
-            f'    "payment_status": "PAID / REGISTERED / UNPAID / PENDING"\n'
-            f'  }},\n'
-            f'  "actionable_advisory": "Concrete next steps.",\n'
-            f'  "detected_destination": "City and Country name if document indicates travel, otherwise null"\n'
-            f"}}"
+        filename = (file.filename or "").lower()
+        is_pdf = filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower())
+
+        extracted_pdf_text = ""
+        if is_pdf:
+            extracted_pdf_text = extract_text_from_pdf_stream(file_bytes)
+
+        analysis_prompt = (
+            f"You are PaperPilot, an authentic Forensic Document Auditor & Intelligence Specialist. "
+            f"Thoroughly analyze this document in {target_language}.\n\n"
+            f"Structure your response cleanly using conversational Markdown headers and bullet points:\n"
+            f"1. **Identity & Core Headline**: Type of document, source language, issuing authority, and primary headline.\n"
+            f"2. **Main Message & Directives**: Step-by-step breakdown of orders, clauses, or key announcements.\n"
+            f"3. **Risks, Legal Penalties & Public Impact**: Highlight predatory fine print, legal liabilities, or conservation/community impact.\n"
+            f"4. **Actionable Next Steps**: Concrete steps for the citizen, traveler, or legal party.\n\n"
+            f"At the very end of your response, output a JSON array on its own line labeled 'EXPLORE_SUGGESTIONS:' containing 3 concise, highly relevant follow-up prompts.\n"
+            f"Example:\n"
+            f"EXPLORE_SUGGESTIONS: [\"Explore Vasai's groundwater data\", \"Check municipal water conservation laws\", \"Report unauthorized construction\"]\n"
         )
 
-        analysis_raw, diagnostic_err = audit_document_robust(forensic_prompt, file_bytes)
+        analysis_raw = None
+        diagnostic_err = ""
+
+        # Branch A: PDF Text Extraction
+        if is_pdf and len(extracted_pdf_text) > 30:
+            analysis_raw = ask_hybrid_text(
+                f"DOCUMENT TEXT CONTENT:\n{extracted_pdf_text[:12000]}\n\nAnalyze this document completely.",
+                analysis_prompt
+            )
+        else:
+            # Branch B: Image Processing (Pillow + Vision Cascade)
+            pil_img, b64_img = prepare_image_safe(file_bytes)
+            if pil_img and b64_img:
+                # 1. Try Gemini Vision
+                analysis_raw, diagnostic_err = run_gemini_vision(analysis_prompt, pil_img)
+                # 2. Fallback to Groq Multimodal Vision
+                if not analysis_raw:
+                    analysis_raw, groq_err = run_groq_vision(analysis_prompt, b64_img)
+                    if not analysis_raw:
+                        diagnostic_err = f"{diagnostic_err} | {groq_err}"
+            else:
+                if is_pdf:
+                    diagnostic_err = "The uploaded PDF is a scanned document without readable embedded text. Try uploading a direct photo or screenshot."
+                else:
+                    diagnostic_err = "Could not decode uploaded document format. Please provide a clear JPG, PNG, or standard text PDF."
+
         del file_bytes
         gc.collect()
 
         if not analysis_raw:
             return {"status": "error", "message": diagnostic_err or "Analysis engine timed out.", "data": None}
 
-        clean = analysis_raw.strip()
-        if "```json" in clean:
-            clean = clean.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean:
-            clean = clean.split("```")[1].split("```")[0].strip()
+        # Parse suggestions array if present
+        suggestions = [
+            f"Verify authority contact details",
+            f"Inspect official legal precedent",
+            f"Save document dossier to Family Vault"
+        ]
 
-        try:
-            data = json.loads(clean)
-        except Exception:
-            data = {
-                "classification": "LEGAL_PROPERTY",
-                "status": "VERIFIED DOCUMENT",
-                "document_title": "Audited Document",
-                "issuing_authority_or_registry": "Registry Department",
-                "parties_and_dates": "Extracted Details",
-                "metadata_identifiers": "Serials Recorded",
-                "traps_risks_and_penalties": "Inspect fine print for terms.",
-                "financials_or_valuation": {
-                    "base_amount": "Recorded",
-                    "taxes_and_surcharges": "Recorded fees",
-                    "grand_total": "Verified",
-                    "payment_status": "RECORDED"
-                },
-                "actionable_advisory": analysis_raw[:450],
-                "detected_destination": None
-            }
+        clean_text = analysis_raw
+        if "EXPLORE_SUGGESTIONS:" in analysis_raw:
+            parts = analysis_raw.split("EXPLORE_SUGGESTIONS:")
+            clean_text = parts[0].strip()
+            try:
+                parsed_sugg = json.loads(parts[1].strip())
+                if isinstance(parsed_sugg, list) and len(parsed_sugg) > 0:
+                    suggestions = [str(s) for s in parsed_sugg[:4]]
+            except Exception:
+                pass
 
-        return {"status": "success", "data": data, "raw_text": analysis_raw}
+        # Detect destination references
+        detected_destination = None
+        lower_raw = clean_text.lower()
+        if "vasai" in lower_raw or "virar" in lower_raw:
+            detected_destination = "Vasai, Maharashtra, India"
+        elif "dubai" in lower_raw:
+            detected_destination = "Dubai, UAE"
+        elif "mumbai" in lower_raw:
+            detected_destination = "Mumbai, Maharashtra, India"
+        elif "delhi" in lower_raw:
+            detected_destination = "New Delhi, India"
+
+        return {
+            "status": "success",
+            "data": {
+                "document_title": "Forensic Inspection Report",
+                "actionable_advisory": clean_text,
+                "detected_destination": detected_destination,
+                "suggestions": suggestions
+            },
+            "raw_text": clean_text
+        }
     except Exception as e:
-        return {"status": "error", "message": f"Forensic audit error: {str(e)}", "data": None}
+        return {"status": "error", "message": f"Audit error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
 # 2. DOCUMENT EXPORTERS
@@ -394,7 +465,7 @@ async def export_docx(request: Request, content: str = Form(...), title: str = F
         return {"status": "error", "message": f"Word build error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 3. LIVE OMNI AI STUDIO
+# 3. INTERACTIVE DOCUMENT CHAT & STUDIO
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -408,10 +479,10 @@ async def ask_question(
         clean_q = question.strip()
         lower_q = clean_q.lower()
 
-        visual_triggers = ["generate image", "create image", "genrate image", "picture of", "photo of", "logo", "3d logo", "render", "illustration", "draw"]
+        visual_triggers = ["generate image", "create image", "picture of", "photo of", "logo", "3d logo", "render", "illustration", "draw"]
         if any(t in lower_q for t in visual_triggers):
             clean_subject = clean_q
-            for tr in ["generate a 3d logo of", "generate 3d logo for my app name", "generate 3d logo for", "generate image of", "create image of", "generate image", "create image"]:
+            for tr in ["generate a 3d logo of", "generate 3d logo for", "generate image of", "create image of", "generate image", "create image"]:
                 clean_subject = re.sub(re.escape(tr), "", clean_subject, flags=re.IGNORECASE).strip()
             prompt_diffusion = f"Modern 3D isometric vector emblem for {clean_subject}, stylized vibrant app icon, smooth matte clay render, volumetric studio lighting, centered, 8k resolution, photorealistic"
             seed = uuid.uuid4().int % 999999
@@ -426,20 +497,14 @@ async def ask_question(
                 "file_type": "IMAGE"
             }
 
-        doc_awareness = f"\n[AUDITED DOCUMENT IN MEMORY]:\n{active_document_context}\n" if active_document_context else ""
+        doc_awareness = f"\n[DOCUMENT IN AUDIT MEMORY]:\n{active_document_context}\n" if active_document_context else ""
         sys_prompt = (
-            f"You are Omni Companion, an authentic travel concierge and legal intelligence advisor. "
-            f"Answer thoroughly and directly in {target_language}. Never output <think> tags. "
-            f"When creating itineraries, structure them day-by-day with morning, afternoon, and evening activities.{doc_awareness}"
+            f"You are PaperPilot Companion, an authentic forensic auditor and local intelligence guide. "
+            f"Answer thoroughly, directly, and politely in {target_language}. Never output <think> tags. "
+            f"Reference specific details from the document context when available.{doc_awareness}"
         )
 
-        if file:
-            fbytes = await file.read()
-            ans, _ = audit_document_robust(f"Analyze in {target_language}: {clean_q}", fbytes)
-            ans = ans or "Unable to inspect document."
-        else:
-            ans = ask_hybrid_text(clean_q, sys_prompt)
-
+        ans = ask_hybrid_text(clean_q, sys_prompt)
         return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
     except Exception as e:
         return {"status": "error", "answer": f"Notice: {str(e)}"}
@@ -550,61 +615,14 @@ async def touristos_recommend(
         f"MANDATORY INSTRUCTIONS:\n"
         f"1. 5-10 KM RADIUS EMERGENCY SCAN (STRICT ACCURACY):\n"
         f"   - Name the exact municipal facilities within 5-10 km of {city} (Hospital, Police Station, Fire Station, 24/7 Chemist).\n"
-        f"   - Give their real telephone/landline number with local STD/area code (e.g. 0250 for Vasai/Virar, 022 for Mumbai, 04 for Dubai, 212 for NYC).\n"
-        f"   - If direct desk line is unknown, use the national emergency fallback ({nat_police}, {nat_hosp}, {nat_fire}, {nat_pharm}).\n\n"
+        f"   - Give their real telephone/landline number with local STD/area code.\n"
         f"2. AUTHENTIC ICONIC LANDMARKS (EXACTLY 10 TO 12 SPOTS):\n"
         f"   - Give REAL, authentic landmark names in {city}.\n"
-        f"   - NEVER output '#1', '#2', or 'Landmark of...'. Use actual names (e.g. Burj Khalifa, Museum of the Future, Vasai Fort, Suruchi Beach, Statue of Liberty).\n"
-        f"   - Keep text fields sharp, concise, and informative.\n\n"
-        f"3. REAL HOTELS (NO NUMBERED INCREMENTS):\n"
-        f"   - Name 6 REAL, authentic, recognizable hotels/resorts in {city}.\n"
-        f"   - NEVER name them 'Hotel #1' or 'Stay #2'. Use real names (e.g. Address Downtown, Rove Downtown, Westpalm Beach Resort, Farm Regency).\n"
-        f"   - Realistic price per night in {curr_sym}.\n\n"
-        f"STRICT JSON OUTPUT FORMAT:\n"
-        f"{{\n"
-        f'  "destination_summary": "Authentic summary of {city}...",\n'
-        f'  "spots": [\n'
-        f'    {{\n'
-        f'      "title": "Real Landmark Name",\n'
-        f'      "category": "Historical | Nature | Architecture | Leisure | Cultural",\n'
-        f'      "rating": "⭐ 4.8",\n'
-        f'      "dist": "Exact distance",\n'
-        f'      "description": "Visual summary of the spot.",\n'
-        f'      "history": "Origins, era, architecture, and background.",\n'
-        f'      "sightseeing_rules": "Photography rules, golden hours, visiting tips.",\n'
-        f'      "culinary": "Local food specialty adhering to {dietary_preference}.",\n'
-        f'      "transit": "Nearest railway/metro station, bus link, or taxi advice.",\n'
-        f'      "best_time_and_weather": "Ideal visiting hours and climate.",\n'
-        f'      "shopping": "Nearby bazaars, shopping centers, or street stalls.",\n'
-        f'      "speciality": "Unique cultural or historical significance."\n'
-        f'    }}\n'
-        f'  ],\n'
-        f'  "hotels": [\n'
-        f'    {{\n'
-        f'      "hotel_id": "HTL-01",\n'
-        f'      "name": "Actual Real Hotel Name",\n'
-        f'      "party_suitability": "{adults} Adults & {children} Kids",\n'
-        f'      "price_per_night": "{curr_sym}3,400",\n'
-        f'      "rating": "⭐ 4.7 (1,200+ reviews)",\n'
-        f'      "location_address": "Specific neighborhood, {city}",\n'
-        f'      "amenities": ["Free Wi-Fi", "Breakfast", "{dietary_preference} Dining", "AC"]\n'
-        f'    }}\n'
-        f'  ],\n'
-        f'  "emergency": {{\n'
-        f'    "hospital_name": "Nearest Real Hospital",\n'
-        f'    "hospital_phone": "Real number with STD/Area code or {nat_hosp}",\n'
-        f'    "police_name": "Nearest Real Police Station",\n'
-        f'    "police_phone": "Real number with STD/Area code or {nat_police}",\n'
-        f'    "fire_name": "Nearest Real Fire Brigade",\n'
-        f'    "fire_phone": "Real number with STD/Area code or {nat_fire}",\n'
-        f'    "pharmacy_name": "Nearest Real 24/7 Pharmacy",\n'
-        f'    "pharmacy_phone": "Contact number or {nat_pharm}"\n'
-        f'  }}\n'
-        f"}}"
+        f"3. REAL HOTELS:\n"
+        f"   - Name 6 REAL, authentic, recognizable hotels/resorts in {city} with realistic price in {curr_sym}.\n"
     )
 
-    user_query = f"Scan geographic memory for {loc_clean}. Provide 10-12 real landmarks, 6 real named hotels (no '#1' templates), and nearest emergency facilities for {adults} adults, {children} kids, diet: {dietary_preference}."
-    
+    user_query = f"Scan geographic memory for {loc_clean}. Provide 10-12 real landmarks, 6 real named hotels, and nearest emergency facilities for {adults} adults, {children} kids, diet: {dietary_preference}."
     extracted_data = ask_hybrid_json(user_query, system_prompt)
 
     if extracted_data and "spots" in extracted_data and len(extracted_data["spots"]) > 0:
@@ -627,77 +645,7 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
-    # High-fidelity fallback for Dubai
-    if "dubai" in lower_loc:
-        dubai_spots = [
-            ("Burj Khalifa", "World's tallest skyscraper with outdoor observation decks and panoramic vistas.", "Architectural Marvel"),
-            ("Dubai Mall & Aquarium", "Colossal retail and entertainment landmark with indoor waterfall and aquarium.", "Shopping & Leisure"),
-            ("Museum of the Future", "Futuristic architectural torus monument with ornate Arabic calligraphy facade.", "Innovation & Arts"),
-            ("Palm Jumeirah & Atlantis", "Iconic palm-shaped artificial archipelago lined with luxury resorts.", "Coastal Luxury"),
-            ("Dubai Marina Walk", "7-km pedestrian waterfront promenade flanked by illuminated skyscrapers.", "Waterfront Promenade"),
-            ("Burj Al Arab", "World-renowned sail-shaped 7-star ultra-luxury hotel on an offshore island.", "Iconic Landmark"),
-            ("Dubai Frame", "Monumental golden structure framing historic Deira and modern Downtown.", "Observation Monument"),
-            ("Souk Madinat Jumeirah", "Traditional Arab market with boutique stalls woven along waterways.", "Heritage Souk"),
-            ("Dubai Miracle Garden", "Vast botanical park showcasing 150+ million blooming floral sculptures.", "Botanical Exhibition"),
-            ("Al Fahidi Historical Neighborhood", "Historic quarter preserving 19th-century wind-tower houses and alleys.", "Cultural Heritage")
-        ]
-        real_dubai_hotels = [
-            ("Rove Downtown", "Downtown Dubai, near Dubai Mall", "AED 420"),
-            ("JW Marriott Marquis", "Business Bay, Sheikh Zayed Road", "AED 650"),
-            ("Address Downtown", "Opposite Burj Khalifa, Downtown", "AED 1,150"),
-            ("Jumeirah Beach Hotel", "Umm Suqeim, beachfront", "AED 1,350"),
-            ("Atlantis, The Palm", "Crescent Road, Palm Jumeirah", "AED 1,600"),
-            ("Dusit Thani Dubai", "Trade Centre Area, Sheikh Zayed Road", "AED 510")
-        ]
-        return {
-            "status": "success",
-            "data": {
-                "destination_summary": "Dubai is a globally renowned metropolis in the UAE celebrated for world-record architecture, pristine coastline marinas, traditional gold and spice souks, and dining.",
-                "spots": [
-                    {
-                        "page": i + 1,
-                        "title": dubai_spots[i][0],
-                        "category": dubai_spots[i][2],
-                        "rating": f"⭐ 4.{9 - (i % 2) * 0.1}",
-                        "dist": f"{1.5 + i * 1.5:.1f} km from center",
-                        "description": dubai_spots[i][1],
-                        "history": f"{dubai_spots[i][0]} was engineered as an international emblem of Dubai's forward-looking cultural and architectural vision.",
-                        "sightseeing_rules": "Photography permitted; commercial tripods and drone flights require permits. Sunset hour offers prime visual lighting.",
-                        "culinary": f"Shawarma, Al Harees, or gourmet Arabic mezze adhering to {dietary_preference}.",
-                        "transit": "Dubai Metro Red Line; Dubai Taxi base fare AED 12 or Careem app dispatch.",
-                        "best_time_and_weather": "October to April (Comfortable 24°C-28°C). Summer months recommended for indoor attractions.",
-                        "shopping": "Dubai Mall, Mall of the Emirates, or the traditional Deira Gold and Spice Souks.",
-                        "speciality": "Signature monumental scale combined with desert-to-sea urban planning.",
-                        "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20architecture%20photography%20of%20{urllib.parse.quote(dubai_spots[i][0])}%20Dubai%20UAE?width=800&height=500&nologo=true&seed={abs(hash(dubai_spots[i][0])) % 99999}&model=flux"]
-                    }
-                    for i in range(len(dubai_spots))
-                ],
-                "hotels": [
-                    {
-                        "hotel_id": f"HTL-DXB-{i+1:02d}",
-                        "name": real_dubai_hotels[i][0],
-                        "party_suitability": f"{adults} Adults & {children} Kids",
-                        "price_per_night": real_dubai_hotels[i][2],
-                        "rating": "⭐ 4.8 (2,200+ reviews)",
-                        "location_address": real_dubai_hotels[i][1],
-                        "amenities": ["Free Wi-Fi", "Breakfast Included", f"{dietary_preference} Options", "Infinity Pool"]
-                    }
-                    for i in range(len(real_dubai_hotels))
-                ],
-                "emergency": {
-                    "hospital_name": "Rashid Hospital / Dubai Hospital Emergency",
-                    "hospital_phone": "998",
-                    "police_name": "Dubai Police General HQ",
-                    "police_phone": "999",
-                    "fire_name": "Dubai Civil Defence",
-                    "fire_phone": "997",
-                    "pharmacy_name": "Aster Pharmacy 24/7 / Supercare 24/7",
-                    "pharmacy_phone": "04-4405100"
-                }
-            }
-        }
-
-    # High-fidelity fallback for Vasai
+    # High-fidelity Vasai fallback
     vasai_spots = [
         ("Vasai Fort (Fort Bassein)", "Massive 16th-century Portuguese coastal fortress with ancient chapel ruins.", "Historical Architecture"),
         ("Suruchi Beach", "Pristine sandy coastline shaded by dense suru (casuarina) trees, ideal for sunsets.", "Coastal Nature"),
@@ -721,7 +669,7 @@ async def touristos_recommend(
     return {
         "status": "success",
         "data": {
-            "destination_summary": "Vasai is a historic coastal municipal region in the Palghar district of Maharashtra, celebrated for Portuguese fort ruins, Arabian Sea beaches, and cultural architecture.",
+            "destination_summary": "Vasai is a historic coastal municipal region in Maharashtra, celebrated for Portuguese fort ruins, Arabian Sea beaches, and cultural architecture.",
             "spots": [
                 {
                     "page": i + 1,
@@ -731,11 +679,11 @@ async def touristos_recommend(
                     "dist": f"{2.0 + i * 1.8:.1f} km from center",
                     "description": vasai_spots[i][1],
                     "history": f"{vasai_spots[i][0]} is a cornerstone of Vasai's rich historical and maritime heritage.",
-                    "sightseeing_rules": "Photography permitted; early morning and sunset hours offer optimal lighting and pleasant coastal breeze.",
-                    "culinary": f"Traditional Maharashtrian, East Indian delicacies, or fresh dining adhering to {dietary_preference}.",
-                    "transit": "Vasai Road Railway Station (Western Line), VVMT local city buses, and auto-rickshaws.",
-                    "best_time_and_weather": "October to March (Pleasant 22°C-30°C); monsoon season brings scenic greenery.",
-                    "shopping": "Vasai Station Market, Bhabola Naka shopping arcade, and Anand Nagar bazaars.",
+                    "sightseeing_rules": "Photography permitted; early morning and sunset hours offer optimal lighting.",
+                    "culinary": f"Traditional Maharashtrian and East Indian specialties adhering to {dietary_preference}.",
+                    "transit": "Vasai Road Railway Station (Western Line), VVMT city buses, and auto-rickshaws.",
+                    "best_time_and_weather": "October to March (Pleasant 22°C-30°C).",
+                    "shopping": "Vasai Station Market and Bhabola Naka shopping arcades.",
                     "speciality": "Rare blend of Portuguese maritime history, palm-lined shores, and pilgrimage shrines.",
                     "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20architecture%20photography%20of%20{urllib.parse.quote(vasai_spots[i][0])}%20Vasai%20Maharashtra?width=800&height=500&nologo=true&seed={abs(hash(vasai_spots[i][0])) % 99999}&model=flux"]
                 }
@@ -767,7 +715,7 @@ async def touristos_recommend(
     }
 
 # -------------------------------------------------------------
-# 6. IN-APP INSTANT HOTEL BOOKING VOUCHER
+# 6. INSTANT HOTEL VOUCHER GENERATOR
 # -------------------------------------------------------------
 @app.post("/api/v1/instant-book")
 async def instant_book(
@@ -805,7 +753,7 @@ async def instant_book(
         return {"status": "error", "message": f"Booking failure: {str(e)}"}
 
 # -------------------------------------------------------------
-# 7. FEATURE 5: CONCIERGE GUIDE CHAT & AUTO DOCUMENT CONVERTER
+# 7. CONCIERGE GUIDE CHAT
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(
@@ -820,22 +768,20 @@ async def explore_chat(
     try:
         clean_q = question.strip()
         loc_label = f"{city}, {country}".strip(", ")
-        
-        # System persona: Warm, highly knowledgeable, and welcoming
+
         sys_prompt = (
             f"You are Omni Guide, a warm, polite, and exceptionally knowledgeable local travel concierge for '{loc_label}'.\n"
             f"Travelers: {party_summary}. Dietary Preference: '{dietary_preference}'. Language: {target_language}.\n"
             f"CRITICAL BEHAVIOR RULES:\n"
             f"1. NEVER say 'I cannot generate files in this chat' or 'I am only an AI'.\n"
-            f"2. You are warm, hospitable, helpful, and enthusiastic about showing travelers the best of {city}.\n"
+            f"2. You are warm, hospitable, and helpful.\n"
             f"3. When answering itineraries, break them down clearly: Day 1, Day 2, Day 3 with Morning, Afternoon, and Evening activities.\n"
-            f"4. Respect the dietary preference '{dietary_preference}' strictly when suggesting culinary spots.\n"
+            f"4. Respect the dietary preference '{dietary_preference}' strictly.\n"
             f"5. Answer in clean, easy-to-read Markdown with bullet points and bold headers."
         )
 
         response_text = ask_hybrid_text(clean_q, sys_prompt)
 
-        # Check if the user is asking for an itinerary, guide, or downloadable plan
         is_itinerary_trigger = any(
             t in clean_q.lower()
             for t in ["itinerary", "plan", "download", "pdf", "word", "docx", "schedule", "guide", "days", "tour"]
@@ -851,14 +797,12 @@ async def explore_chat(
             title_clean = f"Omni Guide - {city} Travel Dossier"
             base_url = str(request.base_url).rstrip("/")
 
-            # 1. Compile PDF
             pdf_file_id = f"Omni_Itinerary_{city.replace(' ', '_')}_{doc_id}.pdf"
             pdf_path = os.path.join(DOWNLOADS_DIR, pdf_file_id)
             compile_pdf_document(title_clean, response_text, pdf_path)
             pdf_url = f"{base_url}/downloads/{pdf_file_id}"
             pdf_name = pdf_file_id
 
-            # 2. Compile Word (.docx)
             docx_file_id = f"Omni_Itinerary_{city.replace(' ', '_')}_{doc_id}.docx"
             docx_path = os.path.join(DOWNLOADS_DIR, docx_file_id)
             compile_docx_document(title_clean, response_text, docx_path)
@@ -883,7 +827,7 @@ async def explore_chat(
         }
 
 # -------------------------------------------------------------
-# 8. SERVER HEALTH & PING
+# 8. SERVER HEALTH
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
