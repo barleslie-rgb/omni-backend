@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & TouristOS Engine",
     description="Universal Multi-Format Document Intelligence, Historical Verification & Multimodal Vision",
-    version="64.0.0"
+    version="65.0.0"
 )
 
 app.add_middleware(
@@ -178,13 +178,11 @@ def convert_pdf_first_page_to_image(file_bytes: bytes) -> Tuple[Optional[Image.I
         return None, None
 
 def prepare_image_optimized(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
-    """Quickly resizes and compresses phone/WhatsApp images for fast API delivery."""
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        # Scale down to 1024 max dimension to speed up upload & inference
         if max(pil_img.size) > 1024:
             pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
         buf = io.BytesIO()
@@ -197,13 +195,13 @@ def prepare_image_optimized(file_bytes: bytes) -> Tuple[Optional[Image.Image], O
         return None, None
 
 # -------------------------------------------------------------
-# HIGH-SPEED DUAL-ENGINE MULTIMODAL VISION
+# HIGH-SPEED MULTIMODAL VISION CALL
 # -------------------------------------------------------------
 def run_vision_inspection(prompt: str, pil_img: Image.Image, b64_img: Optional[str] = None) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
     last_err = ""
 
-    # 1. First attempt: Direct fast Gemini Flash call (12-second ceiling)
+    # 1. Primary fast Gemini Flash call (12-second ceiling)
     if keys:
         for key in keys:
             try:
@@ -221,7 +219,7 @@ def run_vision_inspection(prompt: str, pil_img: Image.Image, b64_img: Optional[s
                 last_err = f"Key config: {str(ke)[:95]}"
                 continue
 
-    # 2. Ultra-Fast Fallback: Groq Multimodal Vision (Sub-2-second OCR)
+    # 2. Fast Fallback: Groq Multimodal Vision
     client = get_groq_client()
     if client and b64_img:
         try:
@@ -464,18 +462,20 @@ async def analyze_document(
         dual_role_prompt = (
             f"You are Paper Pilot, an authentic Forensic Document Auditor and Historical Facts Examiner. "
             f"Thoroughly analyze and deconstruct this document/image in {target_language}.\n\n"
-            f"DETERMINE THE NATURE OF THIS MATERIAL:\n"
-            f"• If this is a MODERN ADMINISTRATIVE / LEGAL DOCUMENT (e.g. Gram Sevak Notice, Municipal Circular, 7/12 Land Record, Court Order, Rental Deed, Official Gazette):\n"
-            f"  1. **Document Identity & Issuing Authority**: Name of body, department, official seals, dates, reference numbers.\n"
-            f"  2. **Core Announcement & Translation**: Unpack what is being ordered or declared in plain conversational terms.\n"
-            f"  3. **Predatory Fine Print, Legal Penalties & Public Liabilities**: Highlight hidden deadlines, penalty clauses, forfeiture risks, or compliance mandates.\n"
-            f"  4. **Actionable Roadmap**: Clear, concrete instructions on what steps the citizen/traveler must take next.\n\n"
-            f"• If this is an HISTORICAL, ARCHIVAL, EPIGRAPHIC OR HERITAGE MATERIAL (e.g. Fort Plaque, Ancient Inscription, British Gazette, Stone Tablet, Portuguese Era Memorial, Historic Treaty):\n"
-            f"  1. **Historical Identity & Era Context**: Date/era, dynasty, ruler/authority, script/language.\n"
-            f"  2. **Epigraphic Breakdown & Terminology**: Decode archaic terminology (e.g., Inamdar, Watandar, Sanad, Firman, Mohtarafa) into modern vocabulary.\n"
-            f"  3. **Historical Fact-Check**: Verify whether the claims match authentic historical scholarship. Flag popular folklore vs. recorded historiography.\n"
-            f"  4. **Heritage Significance & Location Link**: Explain why this site or record matters to history.\n\n"
-            f"Format cleanly in Markdown with bold headers and bullet points. "
+            f"PRESENTATION & STYLE RULES:\n"
+            f"1. Make ONLY the headlines and key labels bold (e.g. **Document Type:**, **Date:**, **Issuing Authority:**). Keep all explanation and description text in clean, normal regular weight.\n"
+            f"2. Any rates, dimensions, or numerical comparisons MUST be rendered in a clean Markdown Table (like | Item | Details |).\n"
+            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, hidden risk, forgery, or statutory trap, prefix that specific line with '🚨 **[SUSPICIOUS / RISK]:**'. This will render in bright red for the user.\n\n"
+            f"STRUCTURE:\n"
+            f"• If MODERN LEGAL / ADMINISTRATIVE (Notice, 7/12, Circular, Rate Sheet, Deed, Summons):\n"
+            f"  - **Document Identity:** Type, Issuing Body, Date, Official Seals, and Primary Headline.\n"
+            f"  - **Key Details & Rates:** Provide structured bullets and tables of figures, clauses, or directives.\n"
+            f"  - **Liabilities & Traps:** Use '🚨 **[SUSPICIOUS / RISK]:**' on every risky item, fine print clause, or penalty.\n"
+            f"  - **Actionable Roadmap:** Concrete next steps for the citizen or trader.\n\n"
+            f"• If HISTORICAL / ARCHIVAL / INSCRIPTION (Plaque, Sanad, Memorial, Ancient Record):\n"
+            f"  - **Historical Identity & Era:** Date, Dynasty, Ruler, and Script.\n"
+            f"  - **Epigraphic Breakdown:** Decode archaic terminology (e.g. Inamdar, Watandar, Sanad, Firman) into plain words.\n"
+            f"  - **Historical Fact-Check:** Fact-check against recorded historiography (flag folklore vs verified fact).\n\n"
             f"At the very end of your response, output a single line:\n"
             f"EXPLORE_SUGGESTIONS: [\"Suggestion 1\", \"Suggestion 2\", \"Suggestion 3\"]"
         )
@@ -490,7 +490,7 @@ async def analyze_document(
                 dual_role_prompt
             )
         else:
-            # Route B: Image / Scanned PDF (Quick Optimization & Multimodal Vision)
+            # Route B: Scanned PDF or Image File
             pil_img = None
             b64_img = None
 
@@ -529,7 +529,7 @@ async def analyze_document(
             except Exception:
                 pass
 
-        # Regional destination link
+        # Regional destination detection
         detected_destination = None
         lower_raw = clean_text.lower()
         if "vasai" in lower_raw or "virar" in lower_raw:
@@ -538,6 +538,8 @@ async def analyze_document(
             detected_destination = "Dubai, UAE"
         elif "mumbai" in lower_raw:
             detected_destination = "Mumbai, Maharashtra, India"
+        elif "nashik" in lower_raw:
+            detected_destination = "Nashik, Maharashtra, India"
         elif "delhi" in lower_raw:
             detected_destination = "New Delhi, India"
         elif "jerusalem" in lower_raw or "israel" in lower_raw:
@@ -557,7 +559,26 @@ async def analyze_document(
         return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
-# 2. DOCUMENT EXPORTERS
+# 2. INSTANT REPORT RE-TRANSLATION (NO RE-UPLOAD NEEDED)
+# -------------------------------------------------------------
+@app.post("/api/v1/translate-report")
+async def translate_report(
+    report_text: str = Form(...),
+    target_language: str = Form("Marathi")
+):
+    try:
+        sys_prompt = (
+            f"You are a professional multilingual forensic translator. "
+            f"Translate the following forensic/historical report accurately into {target_language}.\n"
+            f"Keep all bold headline styling, tables, and '🚨 **[SUSPICIOUS / RISK]:**' red warning tags completely intact."
+        )
+        translated = ask_hybrid_text(report_text, sys_prompt)
+        return {"status": "success", "translated_report": translated}
+    except Exception as e:
+        return {"status": "error", "message": f"Translation failed: {str(e)}"}
+
+# -------------------------------------------------------------
+# 3. DOCUMENT EXPORTERS
 # -------------------------------------------------------------
 @app.post("/api/v1/export-pdf")
 async def export_pdf(request: Request, content: str = Form(...), title: str = Form("Travel Itinerary")):
@@ -582,7 +603,7 @@ async def export_docx(request: Request, content: str = Form(...), title: str = F
         return {"status": "error", "message": f"Word build error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 3. INTERACTIVE DOCUMENT CHAT & AUDIO COMPANION
+# 4. INTERACTIVE DOCUMENT CHAT & AUDIO COMPANION
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -627,7 +648,7 @@ async def ask_question(
         return {"status": "error", "answer": f"Notice: {str(e)}"}
 
 # -------------------------------------------------------------
-# 4. CONVERTER & RESIZER STUDIO
+# 5. CONVERTER & RESIZER STUDIO
 # -------------------------------------------------------------
 @app.post("/api/v1/convert-file")
 async def convert_file(request: Request, target_format: str = Form(...), file: UploadFile = File(...)):
@@ -695,7 +716,7 @@ async def resize_image(
         return {"status": "error", "message": f"Resize failed: {str(e)}"}
 
 # -------------------------------------------------------------
-# 5. TOURISTOS DESTINATION EXPLORER
+# 6. TOURISTOS DESTINATION EXPLORER
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -811,7 +832,7 @@ async def touristos_recommend(
     }
 
 # -------------------------------------------------------------
-# 6. INSTANT HOTEL VOUCHER GENERATOR
+# 7. INSTANT HOTEL VOUCHER GENERATOR
 # -------------------------------------------------------------
 @app.post("/api/v1/instant-book")
 async def instant_book(
@@ -849,7 +870,7 @@ async def instant_book(
         return {"status": "error", "message": f"Booking failure: {str(e)}"}
 
 # -------------------------------------------------------------
-# 7. CONCIERGE GUIDE CHAT
+# 8. CONCIERGE GUIDE CHAT
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(
@@ -923,7 +944,7 @@ async def explore_chat(
         }
 
 # -------------------------------------------------------------
-# 8. SERVER HEALTH
+# 9. SERVER HEALTH
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
