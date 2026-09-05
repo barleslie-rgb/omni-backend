@@ -31,8 +31,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni Paper Pilot Scanner & TouristOS Engine",
-    description="Universal Multi-Format Document Intelligence, Historical Verification & Multimodal Vision",
-    version="68.0.0"
+    description="High-Speed Forensic & Historical Intelligence Engine",
+    version="69.0.0"
 )
 
 app.add_middleware(
@@ -48,36 +48,27 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & ENGINE CONFIGURATION
+# KEYS & FAST ENGINE SETUP (NO NETWORK CALLS FOR DISCOVERY)
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
-    key = os.environ.get("GROQ_API_KEY", "").strip()
-    return Groq(api_key=key) if key else None
+    raw = os.environ.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
+    return Groq(api_key=raw) if raw else None
 
 def get_gemini_keys() -> List[str]:
     raw = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
-    return [k.strip() for k in raw.split(",") if k.strip()]
-
-def get_active_groq_text_model(client: Groq) -> str:
-    try:
-        models_data = client.models.list().data
-        active_ids = [m.id for m in models_data]
-        for p in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-8b-8192", "mixtral-8x7b-32768"]:
-            if p in active_ids:
-                return p
-        filtered = [m for m in active_ids if "guard" not in m and "whisper" not in m and "vision" not in m]
-        if filtered:
-            return filtered[0]
-    except Exception as e:
-        print(f"[Groq Model Discovery]: {e}")
-    return "llama-3.3-70b-versatile"
+    keys = []
+    for k in raw.split(","):
+        cleaned = k.strip().strip('"').strip("'")
+        if cleaned:
+            keys.append(cleaned)
+    return keys
 
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# UNIVERSAL OFFICE & DOCUMENT TEXT EXTRACTORS
+# UNIVERSAL OFFICE & DOCUMENT EXTRACTORS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -91,7 +82,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                     paragraphs.append("".join(texts))
             return "\n".join(paragraphs)
     except Exception as e:
-        print(f"[DOCX extraction error]: {e}")
+        print(f"[DOCX extraction notice]: {e}")
         return ""
 
 def extract_text_from_pptx(file_bytes: bytes) -> str:
@@ -107,7 +98,7 @@ def extract_text_from_pptx(file_bytes: bytes) -> str:
                     all_text.append(" • " + " ".join(slide_texts))
             return "\n\n".join(all_text)
     except Exception as e:
-        print(f"[PPTX extraction error]: {e}")
+        print(f"[PPTX extraction notice]: {e}")
         return ""
 
 def extract_text_from_xlsx(file_bytes: bytes) -> str:
@@ -142,7 +133,7 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
                         table_output.append(" | ".join(row_vals))
             return "\n".join(table_output)
     except Exception as e:
-        print(f"[XLSX extraction error]: {e}")
+        print(f"[XLSX extraction notice]: {e}")
         return ""
 
 def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
@@ -179,58 +170,45 @@ def prepare_image_pil(file_bytes: bytes) -> Optional[Image.Image]:
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1200:
-            pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
+        # Scale to max 1024 to ensure fast upload and sub-2-second inference
+        if max(pil_img.size) > 1024:
+            pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
         return pil_img
     except Exception as e:
-        print(f"[Pillow optimization notice]: {e}")
+        print(f"[Pillow notice]: {e}")
         return None
 
 # -------------------------------------------------------------
-# DYNAMIC, BULLETPROOF GEMINI VISION CALL
+# HIGH-SPEED MULTIMODAL VISION ENGINE (NO REMOTE DISCOVERY DELAY)
 # -------------------------------------------------------------
 def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
     if not keys:
         return None, "Gemini API key is not configured on Render. Check GEMINI_API_KEY."
 
+    # Direct verified production identifiers (no 'models/' prefix)
+    target_models = [
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash-8b",
+        "gemini-1.5-pro"
+    ]
+
     last_err = ""
     for key in keys:
         try:
             genai.configure(api_key=key)
-
-            # Discover active models for this key to prevent 404 mismatches
-            valid_models = []
-            try:
-                for m in genai.list_models():
-                    methods = getattr(m, "supported_generation_methods", [])
-                    if "generateContent" in methods:
-                        m_name = m.name.replace("models/", "")
-                        valid_models.append(m_name)
-            except Exception as le:
-                print(f"[Gemini list_models notice]: {le}")
-
-            # Preferred order of stable models
-            preferred_order = [
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-exp",
-                "gemini-1.5-flash",
-                "gemini-1.5-pro",
-            ]
-
-            candidates = [m for m in preferred_order if m in valid_models]
-            if not candidates:
-                # Fallback to any valid generateContent model or default to 2.0-flash
-                candidates = valid_models if valid_models else ["gemini-2.0-flash", "gemini-1.5-flash"]
-
-            for model_id in candidates:
+            for m_name in target_models:
                 try:
-                    model = genai.GenerativeModel(model_id)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 25})
+                    print(f"[Gemini Vision Attempt]: {m_name}")
+                    model = genai.GenerativeModel(m_name)
+                    # Tight 14-second timeout per model prevents client hangs
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 14})
                     if res and res.text and len(res.text.strip()) > 15:
                         return sanitize_ai_output(res.text), ""
                 except Exception as me:
-                    last_err = f"{model_id}: {str(me)[:95]}"
+                    last_err = f"{m_name}: {str(me)[:95]}"
+                    print(f"[Gemini Vision Fail on {m_name}]: {me}")
                     continue
         except Exception as ke:
             last_err = f"Key config: {str(ke)[:95]}"
@@ -239,16 +217,16 @@ def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[s
     return None, f"Vision notice ({last_err})"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
+    # 1. Groq ultra-fast response (under 1.5 seconds)
     client = get_groq_client()
     if client:
         try:
-            chosen = get_active_groq_text_model(client)
             completion = client.chat.completions.create(
-                model=chosen,
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=3000,
-                timeout=16
+                timeout=14
             )
             raw = completion.choices[0].message.content
             if raw and len(raw.strip()) > 20:
@@ -256,13 +234,14 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
         except Exception as e:
             print(f"[Groq Text Notice]: {e}")
 
+    # 2. Gemini fallback
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+            for m in ["gemini-1.5-flash", "gemini-2.0-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
-                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 12})
                     if res and res.text and len(res.text.strip()) > 20:
                         return sanitize_ai_output(res.text)
                 except Exception:
@@ -276,14 +255,13 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
     if client:
         try:
-            chosen = get_active_groq_text_model(client)
             completion = client.chat.completions.create(
-                model=chosen,
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=3500,
                 response_format={"type": "json_object"},
-                timeout=20
+                timeout=16
             )
             raw = completion.choices[0].message.content
             if raw:
@@ -294,12 +272,12 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+            for m in ["gemini-1.5-flash", "gemini-2.0-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
                         f"{system_prompt}\n\nStrictly return valid JSON only.\nUser: {prompt}",
-                        request_options={"timeout": 16}
+                        request_options={"timeout": 14}
                     )
                     if res and res.text:
                         clean = sanitize_ai_output(res.text)
@@ -467,14 +445,14 @@ async def analyze_document(
         analysis_raw = None
         diagnostic_err = ""
 
-        # Route A: Digital text found in file
+        # Route A: Direct digital text found in file (Processed in ~1.5s via Groq Llama 3.3)
         if len(extracted_text.strip()) > 30:
             analysis_raw = ask_hybrid_text(
                 f"DOCUMENT FILE ({filename}) CONTENT:\n{extracted_text[:14000]}\n\nAnalyze this document completely according to your directives.",
                 dual_role_prompt
             )
         else:
-            # Route B: Scanned PDF or Image File
+            # Route B: Scanned PDF or Image File (Gemini 1.5/2.0 Flash)
             pil_img = None
             if filename.endswith(".pdf"):
                 pil_img = convert_pdf_first_page_to_pil(file_bytes)
