@@ -6,7 +6,6 @@ import re
 import uuid
 import base64
 import zipfile
-import csv
 import urllib.parse
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
@@ -33,7 +32,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & TouristOS Engine",
     description="Universal Multi-Format Document Intelligence, Historical Verification & Multimodal Vision",
-    version="66.0.0"
+    version="67.0.0"
 )
 
 app.add_middleware(
@@ -158,7 +157,7 @@ def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
             print(f"[pypdf notice]: {e}")
     return extracted.strip()
 
-def convert_pdf_first_page_to_bytes(file_bytes: bytes) -> Optional[bytes]:
+def convert_pdf_first_page_to_pil(file_bytes: bytes) -> Optional[Image.Image]:
     if pdfium is None:
         return None
     try:
@@ -169,15 +168,12 @@ def convert_pdf_first_page_to_bytes(file_bytes: bytes) -> Optional[bytes]:
         pil_img = page.render(scale=1.5).to_pil()
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=82)
-        return buf.getvalue()
+        return pil_img
     except Exception as e:
         print(f"[pdfium render notice]: {e}")
         return None
 
-def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
-    """Compresses phone photos to an optimal byte stream under 500KB for rapid vision inference."""
+def prepare_image_pil(file_bytes: bytes) -> Optional[Image.Image]:
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
@@ -185,45 +181,35 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
             pil_img = pil_img.convert("RGB")
         if max(pil_img.size) > 1200:
             pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=82, optimize=True)
-        return buf.getvalue()
+        return pil_img
     except Exception as e:
         print(f"[Pillow optimization notice]: {e}")
         return None
 
 # -------------------------------------------------------------
-# ROBUST MULTIMODAL VISION CALL (UNIVERSAL GEMINI FLASH)
+# STABLE GEMINI MULTIMODAL VISION CALL
 # -------------------------------------------------------------
-def run_vision_inspection(prompt: str, image_bytes: bytes) -> Tuple[Optional[str], str]:
+def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
     if not keys:
         return None, "Gemini API key is not configured on Render. Please verify GEMINI_API_KEY environment variable."
 
-    # Active vision models supported across all Google AI Studio tiers
+    # Verified production models across Google Cloud and Google AI Studio
     models_to_try = [
         "gemini-2.0-flash",
-        "gemini-1.5-flash",
+        "gemini-2.5-flash",
         "gemini-2.0-flash-exp",
-        "gemini-1.5-pro",
-        "models/gemini-2.0-flash",
-        "models/gemini-1.5-flash"
+        "gemini-2.5-pro"
     ]
 
     last_err = ""
-    # Standard raw image payload structure
-    image_part = {
-        "mime_type": "image/jpeg",
-        "data": image_bytes
-    }
-
     for key in keys:
         try:
             genai.configure(api_key=key)
             for m_name in models_to_try:
                 try:
                     model = genai.GenerativeModel(m_name)
-                    res = model.generate_content([prompt, image_part], request_options={"timeout": 22})
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 25})
                     if res and res.text and len(res.text.strip()) > 15:
                         return sanitize_ai_output(res.text), ""
                 except Exception as me:
@@ -233,7 +219,7 @@ def run_vision_inspection(prompt: str, image_bytes: bytes) -> Tuple[Optional[str
             last_err = f"Key config: {str(ke)[:95]}"
             continue
 
-    return None, f"Vision notice: {last_err}"
+    return None, f"Vision notice ({last_err})"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -256,7 +242,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+            for m in ["gemini-2.0-flash", "gemini-2.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
@@ -291,7 +277,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+            for m in ["gemini-2.0-flash", "gemini-2.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
@@ -471,16 +457,16 @@ async def analyze_document(
                 dual_role_prompt
             )
         else:
-            # Route B: Scanned PDF or Image File
-            img_bytes = None
+            # Route B: Scanned PDF or Image File (Native PIL directly to Gemini 2.0 Flash)
+            pil_img = None
             if filename.endswith(".pdf"):
-                img_bytes = convert_pdf_first_page_to_bytes(file_bytes)
+                pil_img = convert_pdf_first_page_to_pil(file_bytes)
 
-            if img_bytes is None:
-                img_bytes = prepare_image_bytes(file_bytes)
+            if pil_img is None:
+                pil_img = prepare_image_pil(file_bytes)
 
-            if img_bytes:
-                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, img_bytes)
+            if pil_img:
+                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, pil_img)
             else:
                 diagnostic_err = "Could not decode this document. Please ensure it is a valid image, PDF, or Office file."
 
@@ -582,7 +568,7 @@ async def export_docx(request: Request, content: str = Form(...), title: str = F
         return {"status": "error", "message": f"Word build error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 4. INTERACTIVE DOCUMENT CHAT & AUDIO COMPANION
+# 4. INTERACTIVE DOCUMENT CHAT (NO UNSOLICITED ITINERARIES)
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -614,11 +600,15 @@ async def ask_question(
                 "file_type": "IMAGE"
             }
 
-        doc_awareness = f"\n[DOCUMENT AUDIT & HISTORICAL CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
+        doc_awareness = f"\n[ACTIVE DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
         sys_prompt = (
             f"You are Paper Pilot Companion, an authentic forensic auditor and historical facts expert. "
-            f"Answer thoroughly, politely, and directly in {target_language}. Never output <think> tags. "
-            f"Directly quote and deconstruct information from the document memory whenever relevant.{doc_awareness}"
+            f"The user is asking a specific question about the document currently being audited.\n"
+            f"CRITICAL DIRECTIVES:\n"
+            f"1. Answer strictly and directly about the user's question regarding this document in {target_language}.\n"
+            f"2. Format cleanly like Grok: make ONLY headlines bold, keep regular text normal weight, and use clean Markdown tables if presenting numbers or rates.\n"
+            f"3. Highlight any new risks with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
+            f"4. NEVER randomly generate a travel itinerary or tourist schedule unless the user explicitly requested a travel itinerary.{doc_awareness}"
         )
 
         ans = ask_hybrid_text(clean_q, sys_prompt)
