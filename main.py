@@ -17,16 +17,21 @@ from PIL import Image, ImageOps
 from groq import Groq
 import google.generativeai as genai
 
-# Lightweight PDF Reader
+# Digital and Scanned PDF Renderers
 try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
 
+try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
+
 app = FastAPI(
     title="Omni Forensic PaperPilot & TouristOS Engine",
     description="Resilient Multimodal Vision, Document Conversion & Concierge Platform",
-    version="60.0.0"
+    version="61.0.0"
 )
 
 app.add_middleware(
@@ -186,6 +191,27 @@ def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
             print(f"[pypdf extraction notice]: {e}")
     return extracted_text.strip()
 
+def convert_pdf_first_page_to_image(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
+    """Renders page 1 of a scanned PDF into a standard PIL image."""
+    if pdfium is None:
+        return None, None
+    try:
+        pdf = pdfium.PdfDocument(file_bytes)
+        if len(pdf) == 0:
+            return None, None
+        page = pdf[0]
+        pil_img = page.render(scale=2.0).to_pil()
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=85)
+        clean_bytes = buf.getvalue()
+        b64_str = base64.b64encode(clean_bytes).decode("utf-8")
+        return pil_img, b64_str
+    except Exception as e:
+        print(f"[pypdfium2 render notice]: {e}")
+        return None, None
+
 def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
@@ -214,48 +240,47 @@ def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str],
     for key in keys:
         try:
             genai.configure(api_key=key)
-            # Tested stable endpoint fallbacks
-            for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
+            # Dynamically discover active models supporting vision/generateContent
+            available_models = []
+            try:
+                for m in genai.list_models():
+                    if "generateContent" in getattr(m, "supported_generation_methods", []):
+                        available_models.append(m.name)
+            except Exception as le:
+                print(f"[Gemini list_models notice]: {le}")
+
+            # Prioritize latest fast vision endpoints
+            priority_candidates = [
+                "models/gemini-2.0-flash",
+                "models/gemini-2.0-flash-exp",
+                "models/gemini-1.5-flash-latest",
+                "models/gemini-1.5-flash",
+                "models/gemini-1.5-flash-8b",
+                "models/gemini-1.5-pro-latest",
+                "models/gemini-1.5-pro",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash-latest",
+                "gemini-1.5-flash"
+            ]
+            
+            target_models = [m for m in priority_candidates if m in available_models]
+            if not target_models:
+                target_models = available_models if available_models else priority_candidates
+
+            for model_id in target_models:
                 try:
-                    model = genai.GenerativeModel(model_name)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 22})
+                    model = genai.GenerativeModel(model_id)
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 25})
                     if res and res.text and len(res.text.strip()) > 10:
                         return sanitize_ai_output(res.text), None
                 except Exception as me:
-                    last_error = f"{model_name}: {str(me)[:90]}"
+                    last_error = f"{model_id}: {str(me)[:90]}"
                     continue
         except Exception as ke:
             last_error = f"Key config: {str(ke)[:90]}"
             continue
 
     return None, f"Gemini ({last_error})"
-
-def run_groq_vision(prompt: str, b64_img: str) -> Tuple[Optional[str], Optional[str]]:
-    client = get_groq_client()
-    if not client:
-        return None, "Groq client not available."
-    try:
-        completion = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                    ]
-                }
-            ],
-            temperature=0.2,
-            max_tokens=2500,
-            timeout=22
-        )
-        raw = completion.choices[0].message.content
-        if raw and len(raw.strip()) > 10:
-            return sanitize_ai_output(raw), None
-    except Exception as e:
-        return None, f"Groq Vision error: {str(e)[:90]}"
-    return None, "Groq vision engine returned empty response."
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -278,7 +303,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]:
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 16})
@@ -313,7 +338,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-latest"]:
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
@@ -374,21 +399,21 @@ async def analyze_document(
                 analysis_prompt
             )
         else:
-            # Branch B: Image Processing (Pillow + Vision Cascade)
-            pil_img, b64_img = prepare_image_safe(file_bytes)
+            # Branch B: Scanned PDF or Image Processing (Pillow + pypdfium2 + Vision Cascade)
+            pil_img = None
+            b64_img = None
+            if is_pdf:
+                # Render scanned PDF page 1 to an image
+                pil_img, b64_img = convert_pdf_first_page_to_image(file_bytes)
+
+            if pil_img is None:
+                # Direct image upload (JPG, PNG, WebP)
+                pil_img, b64_img = prepare_image_safe(file_bytes)
+
             if pil_img and b64_img:
-                # 1. Try Gemini Vision
                 analysis_raw, diagnostic_err = run_gemini_vision(analysis_prompt, pil_img)
-                # 2. Fallback to Groq Multimodal Vision
-                if not analysis_raw:
-                    analysis_raw, groq_err = run_groq_vision(analysis_prompt, b64_img)
-                    if not analysis_raw:
-                        diagnostic_err = f"{diagnostic_err} | {groq_err}"
             else:
-                if is_pdf:
-                    diagnostic_err = "The uploaded PDF is a scanned document without readable embedded text. Try uploading a direct photo or screenshot."
-                else:
-                    diagnostic_err = "Could not decode uploaded document format. Please provide a clear JPG, PNG, or standard text PDF."
+                diagnostic_err = "Could not decode or render document. Ensure it is a valid image or PDF."
 
         del file_bytes
         gc.collect()
@@ -578,7 +603,7 @@ async def resize_image(
         return {"status": "error", "message": f"Resize failed: {str(e)}"}
 
 # -------------------------------------------------------------
-# 5. TOURISTOS DESTINATION EXPLORER
+# 5. TOURISTOS DESTINATION EXPLORER (CLEAN INTERNATIONAL AI SCAN)
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -593,7 +618,10 @@ async def touristos_recommend(
     loc_clean = f"{city}, {state}, {country}".strip(", ")
     lower_loc = loc_clean.lower()
 
-    if any(x in lower_loc for x in ["united states", "usa", "us", "new york", "california", "florida", "texas"]):
+    if any(x in lower_loc for x in ["israel", "jerusalem", "tel aviv"]):
+        curr_sym = "₪"
+        nat_police, nat_hosp, nat_fire, nat_pharm = "100", "101 (Magen David Adom)", "102", "Super-Pharm 24/7"
+    elif any(x in lower_loc for x in ["united states", "usa", "us", "new york", "california", "florida", "texas"]):
         curr_sym = "$"
         nat_police, nat_hosp, nat_fire, nat_pharm = "911", "911", "911", "311 / 1-800-222-1222"
     elif any(x in lower_loc for x in ["united kingdom", "uk", "england", "london"]):
@@ -613,16 +641,14 @@ async def touristos_recommend(
         f"You are the senior local tourism, geographic, and municipal intelligence officer for '{loc_clean}'.\n"
         f"Party: {adults} Adults, {children} Kids. Diet: '{dietary_preference}'. Language: {target_language}.\n\n"
         f"MANDATORY INSTRUCTIONS:\n"
-        f"1. 5-10 KM RADIUS EMERGENCY SCAN (STRICT ACCURACY):\n"
-        f"   - Name the exact municipal facilities within 5-10 km of {city} (Hospital, Police Station, Fire Station, 24/7 Chemist).\n"
-        f"   - Give their real telephone/landline number with local STD/area code.\n"
-        f"2. AUTHENTIC ICONIC LANDMARKS (EXACTLY 10 TO 12 SPOTS):\n"
-        f"   - Give REAL, authentic landmark names in {city}.\n"
-        f"3. REAL HOTELS:\n"
-        f"   - Name 6 REAL, authentic, recognizable hotels/resorts in {city} with realistic price in {curr_sym}.\n"
+        f"1. STRICT GEOGRAPHIC ACCURACY: Give ONLY real data for '{loc_clean}'. NEVER return Vasai or Mumbai data for international locations.\n"
+        f"2. 5-10 KM RADIUS EMERGENCY SCAN: Name real local hospital, police, fire station, and 24/7 pharmacy in '{city}'.\n"
+        f"3. AUTHENTIC ICONIC LANDMARKS: Return 8-10 real, famous landmarks in '{city}'.\n"
+        f"4. REAL HOTELS: Return 6 real hotels in '{city}' with rates in '{curr_sym}'.\n"
+        f"Return strict JSON matching the schema."
     )
 
-    user_query = f"Scan geographic memory for {loc_clean}. Provide 10-12 real landmarks, 6 real named hotels, and nearest emergency facilities for {adults} adults, {children} kids, diet: {dietary_preference}."
+    user_query = f"Scan geographic database for {loc_clean}. Provide 8-10 real landmarks, 6 real hotels, and nearest emergency facilities for {adults} adults, {children} kids, diet: {dietary_preference}."
     extracted_data = ask_hybrid_json(user_query, system_prompt)
 
     if extracted_data and "spots" in extracted_data and len(extracted_data["spots"]) > 0:
@@ -630,7 +656,7 @@ async def touristos_recommend(
         for sp in spots:
             t_title = sp.get("title", city)
             seed = abs(hash(t_title + city)) % 999999
-            enc_t = urllib.parse.quote(f"Scenic daylight architecture photography of {t_title} {city} {state}, photorealistic, 8k, majestic")
+            enc_t = urllib.parse.quote(f"Scenic daylight photography of {t_title} {city} {country}, photorealistic, 8k")
             sp["images"] = [f"https://image.pollinations.ai/prompt/{enc_t}?width=800&height=500&nologo=true&seed={seed}&model=flux"]
 
         emg = extracted_data.get("emergency", {})
@@ -645,71 +671,49 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
-    # High-fidelity Vasai fallback
-    vasai_spots = [
-        ("Vasai Fort (Fort Bassein)", "Massive 16th-century Portuguese coastal fortress with ancient chapel ruins.", "Historical Architecture"),
-        ("Suruchi Beach", "Pristine sandy coastline shaded by dense suru (casuarina) trees, ideal for sunsets.", "Coastal Nature"),
-        ("Bhuigaon Beach", "Serene and clean palm-lined coastal stretch offering tranquil beach walks.", "Coastal Nature"),
-        ("Tungareshwar Wildlife Sanctuary", "Lush forested mountain sanctuary with waterfalls and an ancient Shiva temple.", "Nature & Pilgrimage"),
-        ("Vajreshwari Hot Springs & Temple", "Famous natural mineral hot sulphur springs and historic Goddess temple.", "Heritage & Wellness"),
-        ("St. Gonsalo Garcia Memorial Church", "Magnificent historic Catholic church dedicated to India's first canonized saint.", "Religious Heritage"),
-        ("Kalamb Beach", "Tranquil long shoreline with black sand and waterside coconut groves.", "Coastal Leisure"),
-        ("Panju Island", "Historic vehicle-free estuarine island in Vasai Creek with traditional heritage.", "Cultural Heritage"),
-        ("Chinchoti Waterfalls", "Popular monsoon trekking destination through forested Western Ghats terrain.", "Adventure & Nature"),
-        ("Rangaon Beach", "Secluded coastal haven near Giriz known for panoramic sunset views.", "Coastal Nature")
-    ]
-    real_vasai_hotels = [
-        ("Farm Regency Resort", "Gorai-Uttan Road / Vasai Belt", "₹2,800"),
-        ("Westpalm Beach Resort", "Rangaon Beach Road, Vasai West", "₹3,400"),
-        ("Golden Chariot Vasai Hotel", "Near NH48 Highway, Vasai East", "₹3,100"),
-        ("Royal Garden Resort", "Mumbai-Ahmedabad Highway, Vasai", "₹3,900"),
-        ("Viva Superb Hotel", "Near Vasai Railway Station, West", "₹2,500"),
-        ("Silverador Resort Club", "Uttan Coastal Ridge, Vasai region", "₹4,200")
-    ]
+    # Dynamic fallback scoped specifically to requested destination
     return {
         "status": "success",
         "data": {
-            "destination_summary": "Vasai is a historic coastal municipal region in Maharashtra, celebrated for Portuguese fort ruins, Arabian Sea beaches, and cultural architecture.",
+            "destination_summary": f"{city} ({country}) travel dossier and cultural exploration guide.",
             "spots": [
                 {
-                    "page": i + 1,
-                    "title": vasai_spots[i][0],
-                    "category": vasai_spots[i][2],
-                    "rating": f"⭐ 4.{8 - (i % 2) * 0.1}",
-                    "dist": f"{2.0 + i * 1.8:.1f} km from center",
-                    "description": vasai_spots[i][1],
-                    "history": f"{vasai_spots[i][0]} is a cornerstone of Vasai's rich historical and maritime heritage.",
-                    "sightseeing_rules": "Photography permitted; early morning and sunset hours offer optimal lighting.",
-                    "culinary": f"Traditional Maharashtrian and East Indian specialties adhering to {dietary_preference}.",
-                    "transit": "Vasai Road Railway Station (Western Line), VVMT city buses, and auto-rickshaws.",
-                    "best_time_and_weather": "October to March (Pleasant 22°C-30°C).",
-                    "shopping": "Vasai Station Market and Bhabola Naka shopping arcades.",
-                    "speciality": "Rare blend of Portuguese maritime history, palm-lined shores, and pilgrimage shrines.",
-                    "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20architecture%20photography%20of%20{urllib.parse.quote(vasai_spots[i][0])}%20Vasai%20Maharashtra?width=800&height=500&nologo=true&seed={abs(hash(vasai_spots[i][0])) % 99999}&model=flux"]
+                    "page": 1,
+                    "title": f"Historic Center of {city}",
+                    "category": "Cultural Heritage",
+                    "rating": "⭐ 4.9",
+                    "dist": "Central District",
+                    "description": f"The central historic and architectural quarter of {city}, celebrated for landmarks and heritage.",
+                    "history": f"Recorded extensively in historical chronicles of {country}.",
+                    "sightseeing_rules": "Respect local customs, attire etiquette, and photography guidelines.",
+                    "culinary": f"Traditional culinary specialties adhering to {dietary_preference}.",
+                    "transit": f"Accessible via {city} municipal public transit and taxis.",
+                    "best_time_and_weather": "Spring and Autumn months offer pleasant sightseeing conditions.",
+                    "shopping": f"Local artisan markets and central shopping boulevards in {city}.",
+                    "speciality": f"Iconic cultural and historical significance in {country}.",
+                    "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20photography%20of%20historic%20{urllib.parse.quote(city)}%20{urllib.parse.quote(country)}?width=800&height=500&nologo=true&seed=101&model=flux"]
                 }
-                for i in range(len(vasai_spots))
             ],
             "hotels": [
                 {
-                    "hotel_id": f"HTL-VSI-{i+1:02d}",
-                    "name": real_vasai_hotels[i][0],
+                    "hotel_id": f"HTL-{city[:3].upper()}-01",
+                    "name": f"Grand Central Hotel {city}",
                     "party_suitability": f"{adults} Adults & {children} Kids",
-                    "price_per_night": real_vasai_hotels[i][2],
-                    "rating": "⭐ 4.6 (850+ reviews)",
-                    "location_address": real_vasai_hotels[i][1],
-                    "amenities": ["Free Wi-Fi", "Breakfast Included", f"{dietary_preference} Options", "Pool"]
+                    "price_per_night": f"{curr_sym}120",
+                    "rating": "⭐ 4.7 (500+ reviews)",
+                    "location_address": f"City Center, {city}",
+                    "amenities": ["Free Wi-Fi", "Breakfast Included", f"{dietary_preference} Options"]
                 }
-                for i in range(len(real_vasai_hotels))
             ],
             "emergency": {
-                "hospital_name": "Cardinal Gracias Memorial Hospital / D.M. Petit Hospital",
-                "hospital_phone": "0250-2324220 / 108",
-                "police_name": "Manikpur Police Station / Vasai Police Station",
-                "police_phone": "0250-2332110 / 112",
-                "fire_name": "Vasai-Virar Municipal Fire Station",
-                "fire_phone": "0250-2334258 / 101",
-                "pharmacy_name": "Wellness Forever 24/7 / Apollo Chemist Vasai",
-                "pharmacy_phone": "0250-2330055"
+                "hospital_name": f"{city} Central Hospital",
+                "hospital_phone": nat_hosp,
+                "police_name": f"{city} Metropolitan Police",
+                "police_phone": nat_police,
+                "fire_name": f"{city} Emergency Fire Service",
+                "fire_phone": nat_fire,
+                "pharmacy_name": f"{city} 24/7 Central Chemist",
+                "pharmacy_phone": nat_pharm
             }
         }
     }
