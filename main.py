@@ -32,7 +32,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
     description="Direct REST Vision, Multi-Page Legal Document Engine & Forensic Auditor",
-    version="76.0.0"
+    version="77.0.0"
 )
 
 app.add_middleware(
@@ -68,7 +68,7 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# DIRECT REST CALL FOR ACTIVE GEMINI FLASH PRODUCTION MODELS
+# DIRECT REST CALL FOR ACTIVE GEMINI FLASH MODELS
 # -------------------------------------------------------------
 async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
@@ -98,7 +98,6 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
         }
     }
 
-    # Active production models on Google AI Studio
     models_to_try = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -337,7 +336,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 1. UNIVERSAL DOCUMENT SCANNER & FORENSIC / LEGAL AUDITOR
+# 1. UNIVERSAL DOCUMENT SCANNER (STRICT LOCALIZATION PROMPT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -365,18 +364,35 @@ async def analyze_document(
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
             extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
 
+        # Build language enforcement
+        lang_lower = target_language.lower()
+        if "marathi" in lang_lower or "मराठी" in lang_lower:
+            lang_instruction = (
+                "CRITICAL LANGUAGE RULE: You MUST produce the entire analysis, headings, and explanations "
+                "STRICTLY IN MARATHI (मराठी - Devanagari script). Use standard Marathi legal terms (e.g. "
+                "**दस्तऐवजाचा प्रकार:**, **जारी करणारी संस्था:**, **दिनांक:**, **महत्त्वाच्या अटी व दर:**, "
+                "**संभाव्य धोके व कायदेशीर जबाबदाऱ्या:**, **पुढील कृती योजना:**). Do NOT output English in the body."
+            )
+        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+            lang_instruction = (
+                "CRITICAL LANGUAGE RULE: You MUST produce the entire analysis, headings, and explanations "
+                "STRICTLY IN HINDI (हिंदी - Devanagari script). Do NOT output English in the body."
+            )
+        else:
+            lang_instruction = f"Output the entire analysis clearly in {target_language}."
+
         dual_role_prompt = (
-            f"You are Paper Pilot, an authentic Forensic Legal Auditor and Historical Facts Examiner. "
-            f"Thoroughly analyze and deconstruct this document in {target_language}.\n\n"
+            f"You are Paper Pilot, an authentic Forensic Legal Auditor and Historical Facts Examiner.\n"
+            f"{lang_instruction}\n\n"
             f"PRESENTATION & STYLE RULES:\n"
-            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Issuing Authority:**, **Effective Date:**). Descriptions must be in regular weight.\n"
-            f"2. Any rates, dimensions, schedules, penalties, or numerical comparisons MUST be rendered in a clean Markdown Table (like | Clause / Section | Detail | Liability |).\n"
-            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, arbitration trap, or statutory catch, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'. This renders in bright red for the user.\n\n"
+            f"1. Make ONLY headlines and key labels bold. Descriptions must be in regular weight.\n"
+            f"2. Any rates, dimensions, schedules, penalties, or numerical comparisons MUST be rendered in a clean Markdown Table.\n"
+            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, arbitration trap, or statutory catch, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**' (or '🚨 **[धोका / कायदेशीर जोखीम]:**' in Marathi).\n\n"
             f"STRUCTURE:\n"
             f"• **Document Identity:** Type, Issuing Body, Document Date, Parties Involved, Official Seals, and Primary Headline.\n"
-            f"• **Scope & Multi-Page Summary:** Outline the overall legal covenants across sections.\n"
+            f"• **Scope & Multi-Page Summary:** Outline overall legal covenants across sections.\n"
             f"• **Key Clauses, Tables & Directives:** Provide structured bullets and tables of terms, dates, and covenants.\n"
-            f"• **Liabilities, Traps & Fine Print:** List every risky item prefixed with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
+            f"• **Liabilities, Traps & Fine Print:** List every risky item with red warning prefixes.\n"
             f"• **Actionable Roadmap:** Concrete next steps for the citizen, advocate, or signatory.\n\n"
             f"At the very end of your response, output a single line:\n"
             f"EXPLORE_SUGGESTIONS: [\"Verify issuing authority credentials\", \"Examine legal precedents\", \"Save document voucher to Family Travel Vault\"]"
@@ -390,7 +406,7 @@ async def analyze_document(
             doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages: {total_pages_detected})\n\n"
             truncated_content = extracted_text[:80000]
             analysis_raw = await ask_fast_text(
-                f"{doc_context_header}{truncated_content}\n\nConduct full forensic legal audit according to your directives.",
+                f"{doc_context_header}{truncated_content}\n\nConduct full forensic audit according to your directives.",
                 dual_role_prompt
             )
         else:
@@ -420,6 +436,7 @@ async def analyze_document(
                 "data": None
             }
 
+        # Parse suggestions
         suggestions = [
             "Verify official authority contact numbers",
             "Examine legal precedent and historical records",
@@ -439,14 +456,14 @@ async def analyze_document(
 
         detected_destination = None
         lower_raw = clean_text.lower()
-        if "vasai" in lower_raw or "virar" in lower_raw:
+        if "vasai" in lower_raw or "virar" in lower_raw or "वसई" in lower_raw or "विरार" in lower_raw:
             detected_destination = "Vasai, Maharashtra, India"
-        elif "pune" in lower_raw:
+        elif "pune" in lower_raw or "पुणे" in lower_raw:
             detected_destination = "Pune, Maharashtra, India"
-        elif "mumbai" in lower_raw:
+        elif "mumbai" in lower_raw or "मुंबई" in lower_raw:
             detected_destination = "Mumbai, Maharashtra, India"
-        elif "dubai" in lower_raw:
-            detected_destination = "Dubai, UAE"
+        elif "palghar" in lower_raw or "पालघर" in lower_raw:
+            detected_destination = "Palghar, Maharashtra, India"
 
         return {
             "status": "success",
@@ -462,7 +479,62 @@ async def analyze_document(
         return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
-# 2. STANDALONE INDIAN RAILWAYS TRANSIT API
+# 2. INSTANT REPORT TRANSLATOR
+# -------------------------------------------------------------
+@app.post("/api/v1/translate-report")
+async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
+    try:
+        lang_lower = target_language.lower()
+        if "marathi" in lang_lower or "मराठी" in lang_lower:
+            sys_prompt = (
+                "You are an expert legal and administrative Marathi translator. "
+                "Translate this forensic audit report COMPLETELY into pure, natural Marathi (Devanagari script). "
+                "Keep all markdown tables, bold styling, and warning tags (🚨 **[धोका / कायदेशीर जोखीम]:**) intact. "
+                "Do NOT retain English sentences."
+            )
+        else:
+            sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
+
+        translated = await ask_fast_text(report_text, sys_prompt)
+        return {"status": "success", "translated_report": translated}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -------------------------------------------------------------
+# 3. INTERACTIVE CHAT & INQUIRY
+# -------------------------------------------------------------
+@app.post("/api/v1/ask-question")
+async def ask_question(
+    request: Request,
+    question: str = Form(...),
+    target_language: str = Form("English"),
+    active_document_context: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None)
+):
+    try:
+        clean_q = question.strip()
+        doc_awareness = f"\n[AUDITED DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
+        lang_lower = target_language.lower()
+
+        if "marathi" in lang_lower or "मराठी" in lang_lower:
+            lang_rule = "Answer strictly in pure Marathi (मराठी - Devanagari script)."
+        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+            lang_rule = "Answer strictly in Hindi (हिंदी - Devanagari script)."
+        else:
+            lang_rule = f"Answer in {target_language}."
+
+        sys_prompt = (
+            f"You are Paper Pilot Companion, an authentic forensic legal auditor. "
+            f"{lang_rule} "
+            f"Maintain Grok presentation: bold headers only, normal body text, clean Markdown tables for numbers or clauses.{doc_awareness}"
+        )
+        ans = await ask_fast_text(clean_q, sys_prompt)
+        return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
+    except Exception as e:
+        return {"status": "error", "answer": f"Notice: {str(e)}"}
+
+# -------------------------------------------------------------
+# 4. STANDALONE RAILWAYS TRANSIT API
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(
@@ -498,43 +570,7 @@ async def railway_inquiry(
         return {"status": "error", "answer": f"Transit error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 3. INTERACTIVE CHAT & INQUIRY
-# -------------------------------------------------------------
-@app.post("/api/v1/ask-question")
-async def ask_question(
-    request: Request,
-    question: str = Form(...),
-    target_language: str = Form("English"),
-    active_document_context: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
-):
-    try:
-        clean_q = question.strip()
-        doc_awareness = f"\n[AUDITED DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
-        sys_prompt = (
-            f"You are Paper Pilot Companion, an authentic forensic legal auditor and document expert. "
-            f"Answer the user's specific inquiry directly in {target_language}. "
-            f"Maintain Grok presentation: bold headers only, normal body text, clean Markdown tables for numbers or clauses.{doc_awareness}"
-        )
-        ans = await ask_fast_text(clean_q, sys_prompt)
-        return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
-    except Exception as e:
-        return {"status": "error", "answer": f"Notice: {str(e)}"}
-
-# -------------------------------------------------------------
-# 4. INSTANT MULTILINGUAL REPORT TRANSLATOR
-# -------------------------------------------------------------
-@app.post("/api/v1/translate-report")
-async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
-    try:
-        sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
-        translated = await ask_fast_text(report_text, sys_prompt)
-        return {"status": "success", "translated_report": translated}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# -------------------------------------------------------------
-# 5. PURE TOURISTOS DESTINATION EXPLORER (NO RAILWAY ADS)
+# 5. PURE TOURISTOS DESTINATION EXPLORER
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -558,9 +594,6 @@ async def touristos_recommend(
     elif any(x in lower_loc for x in ["united states", "usa", "us", "new york"]):
         curr_sym = "$"
         nat_police, nat_hosp, nat_fire, nat_pharm = "911", "911", "911", "311 / 1-800-222-1222"
-    elif any(x in lower_loc for x in ["france", "italy", "germany", "spain", "europe"]):
-        curr_sym = "€"
-        nat_police, nat_hosp, nat_fire, nat_pharm = "112", "112", "112", "112 / 24/7 Chemist"
     else:
         curr_sym = "₹"
         nat_police, nat_hosp, nat_fire, nat_pharm = "112 / 100", "108 / 102", "101", "1800-200-1234"
@@ -653,7 +686,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
-        "version": "76.0.0",
+        "version": "77.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
