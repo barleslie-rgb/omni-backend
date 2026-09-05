@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & TouristOS Engine",
     description="Universal Multi-Format Document Intelligence, Historical Verification & Multimodal Vision",
-    version="63.0.0"
+    version="64.0.0"
 )
 
 app.add_middleware(
@@ -78,7 +78,7 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# UNIVERSAL OFFICE & DOCUMENT TEXT EXTRACTORS (NO DEPENDENCIES)
+# UNIVERSAL OFFICE & DOCUMENT TEXT EXTRACTORS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -158,67 +158,101 @@ def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
             print(f"[pypdf notice]: {e}")
     return extracted.strip()
 
-def convert_pdf_first_page_to_image(file_bytes: bytes) -> Optional[Image.Image]:
+def convert_pdf_first_page_to_image(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
     if pdfium is None:
-        return None
+        return None, None
     try:
         pdf = pdfium.PdfDocument(file_bytes)
         if len(pdf) == 0:
-            return None
+            return None, None
         page = pdf[0]
-        pil_img = page.render(scale=2.0).to_pil()
+        pil_img = page.render(scale=1.5).to_pil()
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        return pil_img
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return pil_img, b64
     except Exception as e:
         print(f"[pdfium render notice]: {e}")
-        return None
+        return None, None
 
-def prepare_image_fast(file_bytes: bytes) -> Optional[Image.Image]:
+def prepare_image_optimized(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
+    """Quickly resizes and compresses phone/WhatsApp images for fast API delivery."""
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1280:
-            pil_img.thumbnail((1280, 1280), Image.Resampling.BILINEAR)
-        return pil_img
+        # Scale down to 1024 max dimension to speed up upload & inference
+        if max(pil_img.size) > 1024:
+            pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
+        buf = io.BytesIO()
+        pil_img.save(buf, format="JPEG", quality=82, optimize=True)
+        raw_clean = buf.getvalue()
+        b64 = base64.b64encode(raw_clean).decode("utf-8")
+        return pil_img, b64
     except Exception as e:
-        print(f"[Pillow notice]: {e}")
-        return None
+        print(f"[Pillow optimization notice]: {e}")
+        return None, None
 
 # -------------------------------------------------------------
-# MULTIMODAL VISION CALL (ACTIVE 2026 ENDPOINTS)
+# HIGH-SPEED DUAL-ENGINE MULTIMODAL VISION
 # -------------------------------------------------------------
-def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
+def run_vision_inspection(prompt: str, pil_img: Image.Image, b64_img: Optional[str] = None) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
-    if not keys:
-        return None, "Gemini API key is not configured on Render."
-
-    # Production models in order of latency and visual accuracy
-    models_to_try = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-flash-latest",
-        "gemini-2.5-pro"
-    ]
-
     last_err = ""
-    for key in keys:
+
+    # 1. First attempt: Direct fast Gemini Flash call (12-second ceiling)
+    if keys:
+        for key in keys:
+            try:
+                genai.configure(api_key=key)
+                for m_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
+                    try:
+                        model = genai.GenerativeModel(m_name)
+                        res = model.generate_content([prompt, pil_img], request_options={"timeout": 12})
+                        if res and res.text and len(res.text.strip()) > 15:
+                            return sanitize_ai_output(res.text), ""
+                    except Exception as me:
+                        last_err = f"{m_name}: {str(me)[:95]}"
+                        continue
+            except Exception as ke:
+                last_err = f"Key config: {str(ke)[:95]}"
+                continue
+
+    # 2. Ultra-Fast Fallback: Groq Multimodal Vision (Sub-2-second OCR)
+    client = get_groq_client()
+    if client and b64_img:
         try:
-            genai.configure(api_key=key)
-            for m_name in models_to_try:
+            for g_vision_model in ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]:
                 try:
-                    model = genai.GenerativeModel(m_name)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 18})
-                    if res and res.text and len(res.text.strip()) > 15:
-                        return sanitize_ai_output(res.text), ""
-                except Exception as me:
-                    last_err = f"{m_name}: {str(me)[:95]}"
+                    completion = client.chat.completions.create(
+                        model=g_vision_model,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
+                                    }
+                                ]
+                            }
+                        ],
+                        temperature=0.2,
+                        max_tokens=2500,
+                        timeout=12
+                    )
+                    raw_out = completion.choices[0].message.content
+                    if raw_out and len(raw_out.strip()) > 15:
+                        return sanitize_ai_output(raw_out), ""
+                except Exception as ge:
+                    last_err = f"Groq vision: {str(ge)[:95]}"
                     continue
-        except Exception as ke:
-            last_err = f"Key config: {str(ke)[:95]}"
-            continue
+        except Exception as oe:
+            last_err = f"Groq vision outer: {str(oe)[:95]}"
 
     return None, f"Vision notice ({last_err})"
 
@@ -413,21 +447,15 @@ async def analyze_document(
         filename = (file.filename or "").lower()
 
         extracted_text = ""
-        is_office_doc = False
-
         if filename.endswith(".docx"):
             extracted_text = extract_text_from_docx(file_bytes)
-            is_office_doc = True
         elif filename.endswith(".pptx"):
             extracted_text = extract_text_from_pptx(file_bytes)
-            is_office_doc = True
         elif filename.endswith(".xlsx"):
             extracted_text = extract_text_from_xlsx(file_bytes)
-            is_office_doc = True
         elif filename.endswith(".csv") or filename.endswith(".txt") or filename.endswith(".json") or filename.endswith(".md"):
             try:
                 extracted_text = file_bytes.decode("utf-8", errors="ignore")
-                is_office_doc = True
             except Exception:
                 pass
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
@@ -455,23 +483,25 @@ async def analyze_document(
         analysis_raw = None
         diagnostic_err = ""
 
-        # Route A: Digital text extracted from Word, Excel, PPT, or Text PDF
+        # Route A: Digital text found
         if len(extracted_text.strip()) > 30:
             analysis_raw = ask_hybrid_text(
                 f"DOCUMENT FILE ({filename}) CONTENT:\n{extracted_text[:14000]}\n\nAnalyze this document completely according to your directives.",
                 dual_role_prompt
             )
         else:
-            # Route B: Scanned PDF or Image File (Deep Multimodal Vision)
+            # Route B: Image / Scanned PDF (Quick Optimization & Multimodal Vision)
             pil_img = None
+            b64_img = None
+
             if filename.endswith(".pdf"):
-                pil_img = convert_pdf_first_page_to_image(file_bytes)
+                pil_img, b64_img = convert_pdf_first_page_to_image(file_bytes)
 
             if pil_img is None:
-                pil_img = prepare_image_fast(file_bytes)
+                pil_img, b64_img = prepare_image_optimized(file_bytes)
 
             if pil_img:
-                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, pil_img)
+                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, pil_img, b64_img)
             else:
                 diagnostic_err = "Could not decode this document. Please ensure it is a valid image, PDF, or Office file."
 
@@ -499,7 +529,7 @@ async def analyze_document(
             except Exception:
                 pass
 
-        # Detect regional destination link
+        # Regional destination link
         detected_destination = None
         lower_raw = clean_text.lower()
         if "vasai" in lower_raw or "virar" in lower_raw:
