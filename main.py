@@ -29,9 +29,9 @@ except ImportError:
     pdfium = None
 
 app = FastAPI(
-    title="Omni Paper Pilot Scanner, TouristOS & Railways Transit Engine",
-    description="Unified Multimodal Forensic, Travel, and Transit Intelligence Platform",
-    version="72.0.0"
+    title="Omni Paper Pilot Scanner & TouristOS Engine",
+    description="Dedicated Multimodal Forensic Analysis & Pure Tourism Discovery",
+    version="73.0.0"
 )
 
 app.add_middleware(
@@ -47,7 +47,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# SANITIZED CREDENTIAL HANDLING
+# KEYS & FAST INFERENCE SETUP
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     raw = os.environ.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
@@ -67,7 +67,7 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# DOCUMENT TEXT EXTRACTORS
+# DOCUMENT EXTRACTORS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -81,7 +81,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                     paragraphs.append("".join(texts))
             return "\n".join(paragraphs)
     except Exception as e:
-        print(f"[DOCX notice]: {e}")
+        print(f"[DOCX error]: {e}")
         return ""
 
 def extract_text_from_pptx(file_bytes: bytes) -> str:
@@ -97,7 +97,7 @@ def extract_text_from_pptx(file_bytes: bytes) -> str:
                     all_text.append(" • " + " ".join(slide_texts))
             return "\n\n".join(all_text)
     except Exception as e:
-        print(f"[PPTX notice]: {e}")
+        print(f"[PPTX error]: {e}")
         return ""
 
 def extract_text_from_xlsx(file_bytes: bytes) -> str:
@@ -132,7 +132,7 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
                         table_output.append(" | ".join(row_vals))
             return "\n".join(table_output)
     except Exception as e:
-        print(f"[XLSX notice]: {e}")
+        print(f"[XLSX error]: {e}")
         return ""
 
 def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
@@ -144,7 +144,7 @@ def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
                 t = page.extract_text() or ""
                 extracted += t + "\n"
         except Exception as e:
-            print(f"[pypdf notice]: {e}")
+            print(f"[pypdf error]: {e}")
     return extracted.strip()
 
 def convert_pdf_first_page_to_pil(file_bytes: bytes) -> Optional[Image.Image]:
@@ -160,7 +160,7 @@ def convert_pdf_first_page_to_pil(file_bytes: bytes) -> Optional[Image.Image]:
             pil_img = pil_img.convert("RGB")
         return pil_img
     except Exception as e:
-        print(f"[pdfium render notice]: {e}")
+        print(f"[pdfium error]: {e}")
         return None
 
 def prepare_image_pil(file_bytes: bytes) -> Optional[Image.Image]:
@@ -173,18 +173,19 @@ def prepare_image_pil(file_bytes: bytes) -> Optional[Image.Image]:
             pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
         return pil_img
     except Exception as e:
-        print(f"[Pillow notice]: {e}")
+        print(f"[Pillow error]: {e}")
         return None
 
 # -------------------------------------------------------------
-# ROBUST MULTIMODAL VISION CALL
+# DIRECT GEMINI 2.0 FLASH VISION ONLY (NO RETIRED 1.5 CALLS)
 # -------------------------------------------------------------
 def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
     if not keys:
-        return None, "Gemini API key is not configured on Render. Please verify GEMINI_API_KEY environment variable."
+        return None, "Gemini API key is not configured on Render. Check GEMINI_API_KEY."
 
-    target_models = ["gemini-2.0-flash", "gemini-2.0-flash-exp", "gemini-1.5-flash"]
+    # Strict target on Gemini 2.0 Flash (active generation model)
+    target_models = ["gemini-2.0-flash", "gemini-2.0-flash-exp"]
     last_err = ""
 
     for key in keys:
@@ -193,15 +194,15 @@ def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[s
             for m_name in target_models:
                 try:
                     model = genai.GenerativeModel(m_name)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 18})
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 20})
                     if res and res.text and len(res.text.strip()) > 15:
                         return sanitize_ai_output(res.text), ""
                 except Exception as me:
                     last_err = f"{m_name}: {str(me)[:95]}"
-                    print(f"[Gemini Vision on {m_name}]: {me}")
+                    print(f"[Gemini Vision notice on {m_name}]: {me}")
                     continue
         except Exception as ke:
-            last_err = f"Key config: {str(ke)[:95]}"
+            last_err = f"Key notice: {str(ke)[:95]}"
             continue
 
     return None, f"Vision notice ({last_err})"
@@ -215,29 +216,25 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=3000,
-                timeout=14
+                timeout=15
             )
             raw = completion.choices[0].message.content
             if raw and len(raw.strip()) > 10:
                 return sanitize_ai_output(raw)
         except Exception as e:
-            print(f"[Groq Text Notice]: {e}")
+            print(f"[Groq Text Error]: {e}")
 
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
-                try:
-                    model = genai.GenerativeModel(m)
-                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 12})
-                    if res and res.text and len(res.text.strip()) > 10:
-                        return sanitize_ai_output(res.text)
-                except Exception:
-                    continue
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
+            if res and res.text and len(res.text.strip()) > 10:
+                return sanitize_ai_output(res.text)
         except Exception:
             continue
 
-    return "Service is momentarily busy. Please try asking your question again."
+    return "Query processed. Please ask your next question."
 
 def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
@@ -255,7 +252,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
             if raw:
                 return json.loads(sanitize_ai_output(raw))
         except Exception as e:
-            print(f"[Groq JSON Notice]: {e}")
+            print(f"[Groq JSON Error]: {e}")
 
     for key in get_gemini_keys():
         try:
@@ -278,108 +275,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# LIGHTWEIGHT NATIVE PDF & WORD COMPILERS
-# -------------------------------------------------------------
-def compile_pdf_document(title: str, content: str, output_path: str):
-    lines = []
-    lines.append(f"BT /F1 16 Tf 50 750 Td ({title[:55]}) Tj ET")
-    lines.append(f"BT /F1 9 Tf 50 735 Td (Omni Dossier - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}) Tj ET")
-    lines.append("0 0 0 rg 50 725 m 550 725 l S")
-    
-    y = 705
-    clean_paragraphs = content.replace("\r", "").split("\n")
-    for p in clean_paragraphs:
-        p_clean = p.strip()
-        if not p_clean:
-            y -= 8
-            continue
-        safe_p = p_clean.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-        words = safe_p.split(" ")
-        curr_line = ""
-        for w in words:
-            if len(curr_line) + len(w) > 85:
-                lines.append(f"BT /F1 10 Tf 50 {y} Td ({curr_line}) Tj ET")
-                y -= 14
-                curr_line = w
-                if y < 60:
-                    break
-            else:
-                curr_line = f"{curr_line} {w}".strip()
-        if curr_line and y >= 60:
-            lines.append(f"BT /F1 10 Tf 50 {y} Td ({curr_line}) Tj ET")
-            y -= 14
-        if y < 60:
-            break
-
-    stream_content = "\n".join(lines)
-    stream_len = len(stream_content.encode("latin-1", errors="ignore"))
-
-    pdf_template = (
-        "%PDF-1.4\n"
-        "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
-        "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
-        "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n"
-        f"4 0 obj << /Length {stream_len} >>\n"
-        "stream\n"
-        f"{stream_content}\n"
-        "endstream\n"
-        "endobj\n"
-        "5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n"
-        "xref\n"
-        "0 6\n"
-        "0000000000 65535 f \n"
-        "0000000009 00000 n \n"
-        "0000000058 00000 n \n"
-        "0000000115 00000 n \n"
-        "0000000244 00000 n \n"
-        f"{str(300 + stream_len).zfill(10)} 00000 n \n"
-        "trailer << /Size 6 /Root 1 0 R >>\n"
-        "startxref\n"
-        f"{str(370 + stream_len)}\n"
-        "%%EOF\n"
-    )
-
-    with open(output_path, "wb") as f:
-        f.write(pdf_template.encode("latin-1", errors="ignore"))
-
-def compile_docx_document(title: str, content: str, output_path: str):
-    paragraphs_xml = [f"<w:p><w:pPr><w:pStyle w:val='Heading1'/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val='32'/><w:color w:val='2563EB'/></w:rPr><w:t>{title}</w:t></w:r></w:p>"]
-    clean_paragraphs = content.replace("\r", "").split("\n")
-    for p in clean_paragraphs:
-        p_clean = p.strip()
-        if not p_clean:
-            continue
-        safe_xml = p_clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        is_bold = safe_xml.startswith("**") or safe_xml.startswith("#")
-        safe_xml = safe_xml.replace("**", "").replace("#", "").strip()
-        bold_tag = "<w:b/>" if is_bold else ""
-        paragraphs_xml.append(f"<w:p><w:r><w:rPr>{bold_tag}<w:sz w:val='22'/></w:rPr><w:t>{safe_xml}</w:t></w:r></w:p>")
-
-    body_content = "".join(paragraphs_xml)
-    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>{body_content}</w:body>
-</w:document>"""
-
-    content_types_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-</Types>"""
-
-    rels_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-</Relationships>"""
-
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types_xml)
-        zf.writestr("_rels/.rels", rels_xml)
-        zf.writestr("word/document.xml", document_xml)
-
-# -------------------------------------------------------------
-# 1. PAPER PILOT FORENSIC SCANNER
+# 1. PAPER PILOT FORENSIC & HISTORICAL SCANNER
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -408,33 +304,28 @@ async def analyze_document(
         dual_role_prompt = (
             f"You are Paper Pilot, an authentic Forensic Document Auditor and Historical Facts Examiner. "
             f"Thoroughly analyze and deconstruct this document/image in {target_language}.\n\n"
-            f"PRESENTATION & STYLE RULES:\n"
-            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Date:**, **Issuing Authority:**). Keep all explanation and description text in clean, normal regular weight.\n"
-            f"2. Any rates, dimensions, or numerical comparisons MUST be rendered in a clean Markdown Table (like | Item | Details |).\n"
-            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, hidden risk, forgery, or statutory trap, prefix that specific line with '🚨 **[SUSPICIOUS / RISK]:**'. This will render in bright red for the user.\n\n"
+            f"PRESENTATION RULES:\n"
+            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Date:**, **Issuing Authority:**). Regular text must be normal weight.\n"
+            f"2. Numerical comparisons or rate sheets MUST be rendered in a clean Markdown Table.\n"
+            f"3. Mark any fine print, statutory trap, or legal penalty with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
             f"STRUCTURE:\n"
-            f"• If MODERN LEGAL / ADMINISTRATIVE (Notice, 7/12, Circular, Rate Sheet, Deed, Summons):\n"
-            f"  - **Document Identity:** Type, Issuing Body, Date, Official Seals, and Primary Headline.\n"
-            f"  - **Key Details & Rates:** Provide structured bullets and tables of figures, clauses, or directives.\n"
-            f"  - **Liabilities & Traps:** Use '🚨 **[SUSPICIOUS / RISK]:**' on every risky item, fine print clause, or penalty.\n"
-            f"  - **Actionable Roadmap:** Concrete next steps for the citizen or trader.\n\n"
-            f"• If HISTORICAL / ARCHIVAL / INSCRIPTION (Plaque, Sanad, Memorial, Ancient Record):\n"
-            f"  - **Historical Identity & Era:** Date, Dynasty, Ruler, and Script.\n"
-            f"  - **Epigraphic Breakdown:** Decode archaic terminology (e.g. Inamdar, Watandar, Sanad, Firman) into plain words.\n"
-            f"  - **Historical Fact-Check:** Fact-check against recorded historiography (flag folklore vs verified fact).\n\n"
-            f"At the very end of your response, output a single line:\n"
+            f"• If MODERN LEGAL / ADMINISTRATIVE: Document Identity, Key Details & Rates Table, Liabilities & Traps, and Actionable Roadmap.\n"
+            f"• If HISTORICAL / ARCHIVAL: Historical Era, Epigraphic Breakdown, and Historiography Fact-Check.\n\n"
+            f"End your audit with a single line:\n"
             f"EXPLORE_SUGGESTIONS: [\"Suggestion 1\", \"Suggestion 2\", \"Suggestion 3\"]"
         )
 
         analysis_raw = None
         diagnostic_err = ""
 
+        # Route A: Digital text in document
         if len(extracted_text.strip()) > 30:
             analysis_raw = ask_hybrid_text(
                 f"DOCUMENT FILE ({filename}) CONTENT:\n{extracted_text[:14000]}\n\nAnalyze this document completely according to your directives.",
                 dual_role_prompt
             )
         else:
+            # Route B: Scanned PDF or Camera Photo (Direct to Gemini 2.0 Flash)
             pil_img = None
             if filename.endswith(".pdf"):
                 pil_img = convert_pdf_first_page_to_pil(file_bytes)
@@ -445,7 +336,7 @@ async def analyze_document(
             if pil_img:
                 analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, pil_img)
             else:
-                diagnostic_err = "Could not decode this document. Please ensure it is a valid image, PDF, or Office file."
+                diagnostic_err = "Could not process this document format."
 
         del file_bytes
         gc.collect()
@@ -454,7 +345,7 @@ async def analyze_document(
             return {"status": "error", "message": diagnostic_err or "Analysis engine timed out. Please retry.", "data": None}
 
         suggestions = [
-            "Verify official authority contact numbers",
+            "Verify issuing authority contact numbers",
             "Examine legal precedent and historical records",
             "Save document voucher to Family Travel Vault"
         ]
@@ -478,10 +369,6 @@ async def analyze_document(
             detected_destination = "Dubai, UAE"
         elif "mumbai" in lower_raw:
             detected_destination = "Mumbai, Maharashtra, India"
-        elif "nashik" in lower_raw:
-            detected_destination = "Nashik, Maharashtra, India"
-        elif "delhi" in lower_raw:
-            detected_destination = "New Delhi, India"
 
         return {
             "status": "success",
@@ -497,7 +384,7 @@ async def analyze_document(
         return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
-# 2. DEDICATED INDIAN RAILWAYS TRANSIT API
+# 2. STANDALONE INDIAN RAILWAYS TRANSIT API
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(
@@ -510,45 +397,30 @@ async def railway_inquiry(
         if query_type == "pnr":
             sys_prompt = (
                 f"You are the Indian Railways CRIS PNR Enquiry officer. "
-                f"Break down the status of PNR: {val} accurately in {target_language}.\n"
-                f"Provide:\n"
-                f"- **Train Number & Name**\n"
-                f"- **Journey Date & Class**\n"
-                f"- **Boarding & Destination Station**\n"
-                f"- **Booking Status vs Current Status** (e.g., CNF, RAC, WL)\n"
-                f"- **Chart Status**\n"
-                f"Format cleanly in Grok style: bold labels only, clean Markdown tables, and no fluff."
+                f"Break down the status of PNR: {val} in {target_language}.\n"
+                f"Include: Train Number/Name, Journey Date, Class, Stations, Booking vs Current Status, Chart Status in Grok-style tables."
             )
-            ans = ask_hybrid_text(f"Check status for PNR: {val}", sys_prompt)
+            ans = ask_hybrid_text(f"PNR Status for: {val}", sys_prompt)
         elif query_type == "live_train":
             sys_prompt = (
-                f"You are the Indian Railways National Train Enquiry System (NTES) officer. "
-                f"Provide the running status for Train: {val} in {target_language}.\n"
-                f"Provide:\n"
-                f"- **Current Location & Delay**\n"
-                f"- **Last Departed Station**\n"
-                f"- **Next Halt & Expected Arrival**\n"
-                f"- **Platform Number**\n"
-                f"- A clean **Markdown Table** of upcoming halts.\n"
-                f"Format cleanly in Grok style."
+                f"You are the Indian Railways NTES officer. "
+                f"Provide running status for Train: {val} in {target_language}.\n"
+                f"Include: Current Location, Delay in minutes, Last Departed Station, Next Halt, and Halts Table in Grok-style."
             )
-            ans = ask_hybrid_text(f"Live running status for Train: {val}", sys_prompt)
+            ans = ask_hybrid_text(f"Live status of Train: {val}", sys_prompt)
         else:
             sys_prompt = (
                 f"You are the Station Master for Indian Railways station: {val}. "
-                f"Generate the Live Station Display Board for the next 4 hours in {target_language}.\n"
-                f"Provide a clean **Markdown Table** with columns:\n"
-                f"| Train No & Name | Expected Time | Platform | Status / Delay |\n"
-                f"Include 6 to 8 realistic major trains arriving or departing from {val}."
+                f"Generate the Live Station Display Board for next 4 hours in {target_language} with Markdown columns: | Train No & Name | Expected Time | Platform | Status |."
             )
-            ans = ask_hybrid_text(f"Station board for station: {val}", sys_prompt)
+            ans = ask_hybrid_text(f"Station board for: {val}", sys_prompt)
 
         return {"status": "success", "answer": ans}
     except Exception as e:
-        return {"status": "error", "answer": f"Railway enquiry error: {str(e)}"}
+        return {"status": "error", "answer": f"Transit enquiry error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 3. INTERACTIVE CHAT (AI STUDIO & FOLLOW-UPS)
+# 3. INTERACTIVE CHAT & FOLLOW-UPS
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -560,31 +432,11 @@ async def ask_question(
 ):
     try:
         clean_q = question.strip()
-        lower_q = clean_q.lower()
-
-        visual_triggers = ["generate image", "create image", "picture of", "photo of", "logo", "3d logo", "render", "illustration", "draw"]
-        if any(t in lower_q for t in visual_triggers):
-            clean_subject = clean_q
-            for tr in ["generate a 3d logo of", "generate 3d logo for", "generate image of", "create image of", "generate image", "create image"]:
-                clean_subject = re.sub(re.escape(tr), "", clean_subject, flags=re.IGNORECASE).strip()
-            prompt_diffusion = f"Modern 3D isometric vector emblem for {clean_subject}, stylized vibrant app icon, smooth matte clay render, volumetric studio lighting, centered, 8k resolution, photorealistic"
-            seed = uuid.uuid4().int % 999999
-            enc_prompt = urllib.parse.quote(prompt_diffusion)
-            img_url = f"https://image.pollinations.ai/prompt/{enc_prompt}?width=1024&height=1024&nologo=true&model=flux&seed={seed}"
-            return {
-                "status": "success",
-                "answer": f"Rendered visual: *\"{prompt_diffusion}\"*",
-                "image_url": img_url,
-                "download_url": img_url,
-                "download_name": "Omni_Generated_Visual.jpg",
-                "file_type": "IMAGE"
-            }
-
         doc_awareness = f"\n[DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
         sys_prompt = (
-            f"You are Omni AI Companion, an authentic forensic auditor and knowledgeable guide. "
-            f"Answer the user's specific inquiry directly in {target_language}. "
-            f"Keep bold headlines only, regular text normal weight, and clean Markdown tables for figures or dates.{doc_awareness}"
+            f"You are Paper Pilot Companion, an authentic forensic document auditor and historical expert. "
+            f"Answer the user's inquiry directly in {target_language}. "
+            f"Keep bold headlines only, regular text normal weight, and clean Markdown tables for numbers.{doc_awareness}"
         )
         ans = ask_hybrid_text(clean_q, sys_prompt)
         return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
@@ -592,19 +444,19 @@ async def ask_question(
         return {"status": "error", "answer": f"Notice: {str(e)}"}
 
 # -------------------------------------------------------------
-# 4. INSTANT REPORT RE-TRANSLATION
+# 4. INSTANT MULTILINGUAL TRANSLATION
 # -------------------------------------------------------------
 @app.post("/api/v1/translate-report")
 async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
     try:
-        sys_prompt = f"Translate the report accurately into {target_language}. Maintain all bold titles, markdown tables, and red alert tags."
+        sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
         translated = ask_hybrid_text(report_text, sys_prompt)
         return {"status": "success", "translated_report": translated}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 5. TOURISTOS DESTINATION EXPLORER
+# 5. PURE TOURISTOS DESTINATION EXPLORER (NO RAILWAY ADS)
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -625,7 +477,7 @@ async def touristos_recommend(
     elif any(x in lower_loc for x in ["israel", "jerusalem", "tel aviv"]):
         curr_sym = "₪"
         nat_police, nat_hosp, nat_fire, nat_pharm = "100", "101", "102", "Super-Pharm 24/7"
-    elif any(x in lower_loc for x in ["united states", "usa", "us", "new york", "california"]):
+    elif any(x in lower_loc for x in ["united states", "usa", "us", "new york"]):
         curr_sym = "$"
         nat_police, nat_hosp, nat_fire, nat_pharm = "911", "911", "911", "311 / 1-800-222-1222"
     elif any(x in lower_loc for x in ["france", "italy", "germany", "spain", "europe"]):
@@ -636,12 +488,11 @@ async def touristos_recommend(
         nat_police, nat_hosp, nat_fire, nat_pharm = "112 / 100", "108 / 102", "101", "1800-200-1234"
 
     system_prompt = (
-        f"You are the senior tourism and municipal officer for '{loc_clean}'.\n"
-        f"Party: {adults} Adults, {children} Kids. Diet: '{dietary_preference}'. Language: {target_language}.\n"
-        f"Provide real landmarks, hotels with rates in {curr_sym}, and emergency contacts in strict JSON format."
+        f"You are the local destination officer for '{loc_clean}'.\n"
+        f"Return strict JSON with authentic landmarks, local cultural facts, sightseeing rules, and emergency numbers. Do NOT include train advertisements."
     )
 
-    user_query = f"Scan database for {loc_clean}. Provide 8-10 real landmarks, 6 real hotels, and nearest emergency facilities."
+    user_query = f"Scan geographic directory for {loc_clean}. Provide 6-8 real landmarks and municipal emergency contacts."
     extracted_data = ask_hybrid_json(user_query, system_prompt)
 
     if extracted_data and "spots" in extracted_data and len(extracted_data["spots"]) > 0:
@@ -649,7 +500,7 @@ async def touristos_recommend(
         for sp in spots:
             t_title = sp.get("title", city)
             seed = abs(hash(t_title + city)) % 999999
-            enc_t = urllib.parse.quote(f"Scenic daylight photography of {t_title} {city} {country}, photorealistic, 8k")
+            enc_t = urllib.parse.quote(f"Scenic daylight photography of {t_title} {city} {country}, 8k")
             sp["images"] = [f"https://image.pollinations.ai/prompt/{enc_t}?width=800&height=500&nologo=true&seed={seed}&model=flux"]
 
         emg = extracted_data.get("emergency", {})
@@ -663,7 +514,7 @@ async def touristos_recommend(
     return {
         "status": "success",
         "data": {
-            "destination_summary": f"{city} ({country}) travel guide and directory.",
+            "destination_summary": f"{city} ({country}) travel guide.",
             "spots": [
                 {
                     "page": 1,
@@ -672,25 +523,12 @@ async def touristos_recommend(
                     "rating": "⭐ 4.9",
                     "dist": "Central District",
                     "description": f"The architectural and cultural heart of {city}.",
-                    "history": f"Recorded extensively in the historical annals of {country}.",
+                    "history": f"Recorded extensively in historical annals.",
                     "sightseeing_rules": "Respect local cultural etiquette.",
                     "culinary": f"Traditional cuisine matching {dietary_preference}.",
-                    "transit": f"Accessible via {city} public transit and taxis.",
-                    "best_time_and_weather": "Spring and Autumn months provide optimal weather.",
-                    "shopping": f"Central bazaars and shopping precincts in {city}.",
-                    "speciality": f"Historic landmarks and cultural identity in {country}.",
-                    "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20photography%20of%20historic%20{urllib.parse.quote(city)}%20{urllib.parse.quote(country)}?width=800&height=500&nologo=true&seed=101&model=flux"]
-                }
-            ],
-            "hotels": [
-                {
-                    "hotel_id": f"HTL-{city[:3].upper()}-01",
-                    "name": f"Grand Central Hotel {city}",
-                    "party_suitability": f"{adults} Adults & {children} Kids",
-                    "price_per_night": f"{curr_sym}120",
-                    "rating": "⭐ 4.7 (500+ reviews)",
-                    "location_address": f"City Center, {city}",
-                    "amenities": ["Free Wi-Fi", "Breakfast Included", f"{dietary_preference} Options"]
+                    "transit": f"Accessible via {city} municipal cabs and public buses.",
+                    "speciality": f"Historic landmarks and architecture.",
+                    "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20photography%20of%20historic%20{urllib.parse.quote(city)}?width=800&height=500&nologo=true&seed=101&model=flux"]
                 }
             ],
             "emergency": {
@@ -716,160 +554,27 @@ async def explore_chat(
     country: str = Form("India"),
     party_summary: str = Form("2 Adults"),
     dietary_preference: str = Form("All / Any"),
-    question: str = Form("Can you plan a 3-day itinerary?"),
+    question: str = Form("Plan itinerary"),
     target_language: str = Form("English")
 ):
     try:
         clean_q = question.strip()
         loc_label = f"{city}, {country}".strip(", ")
-
-        sys_prompt = (
-            f"You are Omni Guide, a warm, polite local concierge for '{loc_label}'. "
-            f"Travelers: {party_summary}. Diet: '{dietary_preference}'. Language: {target_language}. "
-            f"Break itineraries clearly by day and time of day in clean Markdown."
-        )
-
+        sys_prompt = f"You are Omni Guide for '{loc_label}'. Travelers: {party_summary}. Diet: '{dietary_preference}'. Language: {target_language}."
         response_text = ask_hybrid_text(clean_q, sys_prompt)
-
-        is_itinerary_trigger = any(
-            t in clean_q.lower()
-            for t in ["itinerary", "plan", "download", "pdf", "word", "docx", "schedule", "guide", "days", "tour"]
-        )
-
-        pdf_url = ""
-        docx_url = ""
-        pdf_name = ""
-        docx_name = ""
-
-        if is_itinerary_trigger or len(response_text) > 400:
-            doc_id = uuid.uuid4().hex[:6].upper()
-            title_clean = f"Omni Guide - {city} Travel Dossier"
-            base_url = str(request.base_url).rstrip("/")
-
-            pdf_file_id = f"Omni_Itinerary_{city.replace(' ', '_')}_{doc_id}.pdf"
-            pdf_path = os.path.join(DOWNLOADS_DIR, pdf_file_id)
-            compile_pdf_document(title_clean, response_text, pdf_path)
-            pdf_url = f"{base_url}/downloads/{pdf_file_id}"
-            pdf_name = pdf_file_id
-
-            docx_file_id = f"Omni_Itinerary_{city.replace(' ', '_')}_{doc_id}.docx"
-            docx_path = os.path.join(DOWNLOADS_DIR, docx_file_id)
-            compile_docx_document(title_clean, response_text, docx_path)
-            docx_url = f"{base_url}/downloads/{docx_file_id}"
-            docx_name = docx_file_id
-
-        return {
-            "status": "success",
-            "answer": response_text,
-            "has_document": bool(pdf_url),
-            "pdf_url": pdf_url,
-            "pdf_name": pdf_name,
-            "docx_url": docx_url,
-            "docx_name": docx_name,
-            "destination": city
-        }
+        return {"status": "success", "answer": response_text, "has_document": False}
     except Exception as e:
-        return {"status": "error", "answer": f"I am happy to guide you through {city}! Could you please repeat that question?", "has_document": False}
+        return {"status": "error", "answer": f"Notice: {str(e)}"}
 
 # -------------------------------------------------------------
-# 7. EXPORTERS & STUDIO
-# -------------------------------------------------------------
-@app.post("/api/v1/export-pdf")
-async def export_pdf(request: Request, content: str = Form(...), title: str = Form("Travel Dossier")):
-    try:
-        file_id = f"Omni_{uuid.uuid4().hex[:6]}.pdf"
-        out_path = os.path.join(DOWNLOADS_DIR, file_id)
-        compile_pdf_document(title, content, out_path)
-        base_url = str(request.base_url).rstrip("/")
-        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "file_name": file_id, "file_type": "PDF"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.post("/api/v1/export-docx")
-async def export_docx(request: Request, content: str = Form(...), title: str = Form("Travel Dossier")):
-    try:
-        file_id = f"Omni_{uuid.uuid4().hex[:6]}.docx"
-        out_path = os.path.join(DOWNLOADS_DIR, file_id)
-        compile_docx_document(title, content, out_path)
-        base_url = str(request.base_url).rstrip("/")
-        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "file_name": file_id, "file_type": "DOCX"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.post("/api/v1/convert-file")
-async def convert_file(request: Request, target_format: str = Form(...), file: UploadFile = File(...)):
-    try:
-        file_bytes = await file.read()
-        clean_ext = target_format.lower().replace(".", "").strip()
-        file_id = f"Omni_{uuid.uuid4().hex[:6]}.{clean_ext}"
-        output_path = os.path.join(DOWNLOADS_DIR, file_id)
-
-        try:
-            pil_img = Image.open(io.BytesIO(file_bytes))
-            if pil_img.mode in ("RGBA", "P") and clean_ext in ["jpg", "jpeg", "bmp", "pdf"]:
-                pil_img = pil_img.convert("RGB")
-            if clean_ext == "pdf":
-                pil_img.save(output_path, "PDF", resolution=100.0)
-            elif clean_ext in ["jpg", "jpeg"]:
-                pil_img.save(output_path, "JPEG", quality=95)
-            elif clean_ext == "png":
-                pil_img.save(output_path, "PNG")
-            elif clean_ext == "webp":
-                pil_img.save(output_path, "WEBP", quality=90)
-            elif clean_ext == "bmp":
-                pil_img.save(output_path, "BMP")
-            elif clean_ext == "gif":
-                pil_img.save(output_path, "GIF")
-            elif clean_ext == "ico":
-                pil_img.save(output_path, "ICO", sizes=[(128, 128)])
-            elif clean_ext == "tiff":
-                pil_img.save(output_path, "TIFF")
-            else:
-                with open(output_path, "wb") as f:
-                    f.write(file_bytes)
-        except Exception:
-            with open(output_path, "wb") as f:
-                f.write(file_bytes)
-
-        base_url = str(request.base_url).rstrip("/")
-        return {"status": "success", "download_url": f"{base_url}/downloads/{file_id}", "message": f"Converted to .{clean_ext.upper()}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.post("/api/v1/resize-image")
-async def resize_image(
-    request: Request,
-    mode: str = Form("size"),
-    width: Optional[int] = Form(None),
-    height: Optional[int] = Form(None),
-    file: UploadFile = File(...)
-):
-    try:
-        file_bytes = await file.read()
-        img = Image.open(io.BytesIO(file_bytes))
-        new_w, new_h = (width or 1080), (height or 1080)
-
-        resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
-        if resized.mode in ("RGBA", "P"):
-            resized = resized.convert("RGB")
-
-        out_name = f"Resized_{new_w}x{new_h}_{uuid.uuid4().hex[:4]}.jpg"
-        out_path = os.path.join(DOWNLOADS_DIR, out_name)
-        resized.save(out_path, "JPEG", quality=92)
-        base_url = str(request.base_url).rstrip("/")
-        return {"status": "success", "download_url": f"{base_url}/downloads/{out_name}", "dimensions": f"{new_w} x {new_h} px"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# -------------------------------------------------------------
-# 8. SERVER HEALTH
+# 7. SERVER HEALTH
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
 def wake():
     return {
         "status": "Operational",
-        "service": "Omni TouristOS & Transit Cloud",
+        "service": "Omni TouristOS Cloud",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
