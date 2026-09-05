@@ -17,7 +17,7 @@ from PIL import Image, ImageOps
 from groq import Groq
 import google.generativeai as genai
 
-# Digital and Scanned PDF Renderers
+# Digital & Scanned PDF Readers
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -29,9 +29,9 @@ except ImportError:
     pdfium = None
 
 app = FastAPI(
-    title="Omni Forensic PaperPilot & TouristOS Engine",
-    description="Resilient Multimodal Vision, Document Conversion & Concierge Platform",
-    version="61.0.0"
+    title="Omni Document Scanner & TouristOS Engine",
+    description="Fast Multi-Format Document Intelligence & Multimodal Vision",
+    version="62.0.0"
 )
 
 app.add_middleware(
@@ -47,7 +47,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & ENGINE DISCOVERY
+# KEYS & ENGINE CONFIGURATION
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     key = os.environ.get("GROQ_API_KEY", "").strip()
@@ -68,7 +68,7 @@ def get_active_groq_text_model(client: Groq) -> str:
         if filtered:
             return filtered[0]
     except Exception as e:
-        print(f"[Groq Text Discovery Error]: {e}")
+        print(f"[Groq Model Discovery]: {e}")
     return "llama-3.3-70b-versatile"
 
 def sanitize_ai_output(text: str) -> str:
@@ -177,7 +177,7 @@ def compile_docx_document(title: str, content: str, output_path: str):
         zf.writestr("word/document.xml", document_xml)
 
 # -------------------------------------------------------------
-# DUAL-ENGINE PDF & MULTIMODAL VISION PIPELINE
+# FAST PDF & IMAGE PREPROCESSING
 # -------------------------------------------------------------
 def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
     extracted_text = ""
@@ -188,101 +188,74 @@ def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
                 text = page.extract_text() or ""
                 extracted_text += text + "\n"
         except Exception as e:
-            print(f"[pypdf extraction notice]: {e}")
+            print(f"[pypdf notice]: {e}")
     return extracted_text.strip()
 
-def convert_pdf_first_page_to_image(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
-    """Renders page 1 of a scanned PDF into a standard PIL image."""
+def convert_pdf_first_page_to_image(file_bytes: bytes) -> Optional[Image.Image]:
     if pdfium is None:
-        return None, None
+        return None
     try:
         pdf = pdfium.PdfDocument(file_bytes)
         if len(pdf) == 0:
-            return None, None
+            return None
         page = pdf[0]
-        pil_img = page.render(scale=2.0).to_pil()
+        pil_img = page.render(scale=1.5).to_pil()
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=85)
-        clean_bytes = buf.getvalue()
-        b64_str = base64.b64encode(clean_bytes).decode("utf-8")
-        return pil_img, b64_str
+        return pil_img
     except Exception as e:
-        print(f"[pypdfium2 render notice]: {e}")
-        return None, None
+        print(f"[pdfium render notice]: {e}")
+        return None
 
-def prepare_image_safe(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
+def prepare_image_fast(file_bytes: bytes) -> Optional[Image.Image]:
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1280:
-            pil_img.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=82, optimize=True)
-        clean_bytes = buf.getvalue()
-        b64_str = base64.b64encode(clean_bytes).decode("utf-8")
-        del clean_bytes
-        gc.collect()
-        return pil_img, b64_str
+        if max(pil_img.size) > 1024:
+            pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
+        return pil_img
     except Exception as e:
-        print(f"[Pillow decode notice]: {e}")
-        return None, None
+        print(f"[Pillow notice]: {e}")
+        return None
 
-def run_gemini_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], Optional[str]]:
+# -------------------------------------------------------------
+# FAST VISION RUNNER (NO DISCOVERY DELAY)
+# -------------------------------------------------------------
+def run_fast_vision(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
     if not keys:
-        return None, "Gemini API key not configured."
+        return None, "Gemini API key is not configured on Render."
 
-    last_error = ""
+    fast_model_targets = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest"
+    ]
+
+    last_err = ""
     for key in keys:
         try:
             genai.configure(api_key=key)
-            # Dynamically discover active models supporting vision/generateContent
-            available_models = []
-            try:
-                for m in genai.list_models():
-                    if "generateContent" in getattr(m, "supported_generation_methods", []):
-                        available_models.append(m.name)
-            except Exception as le:
-                print(f"[Gemini list_models notice]: {le}")
-
-            # Prioritize latest fast vision endpoints
-            priority_candidates = [
-                "models/gemini-2.0-flash",
-                "models/gemini-2.0-flash-exp",
-                "models/gemini-1.5-flash-latest",
-                "models/gemini-1.5-flash",
-                "models/gemini-1.5-flash-8b",
-                "models/gemini-1.5-pro-latest",
-                "models/gemini-1.5-pro",
-                "gemini-2.0-flash",
-                "gemini-1.5-flash-latest",
-                "gemini-1.5-flash"
-            ]
-            
-            target_models = [m for m in priority_candidates if m in available_models]
-            if not target_models:
-                target_models = available_models if available_models else priority_candidates
-
-            for model_id in target_models:
+            for m_name in fast_model_targets:
                 try:
-                    model = genai.GenerativeModel(model_id)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 25})
-                    if res and res.text and len(res.text.strip()) > 10:
-                        return sanitize_ai_output(res.text), None
+                    model = genai.GenerativeModel(m_name)
+                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 18})
+                    if res and res.text and len(res.text.strip()) > 20:
+                        return sanitize_ai_output(res.text), ""
                 except Exception as me:
-                    last_error = f"{model_id}: {str(me)[:90]}"
+                    last_err = f"{m_name}: {str(me)[:90]}"
                     continue
         except Exception as ke:
-            last_error = f"Key config: {str(ke)[:90]}"
+            last_err = f"Key config: {str(ke)[:90]}"
             continue
 
-    return None, f"Gemini ({last_error})"
+    return None, f"Vision notice ({last_err})"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
+    # 1. Try Groq Llama-3.3 first (sub-second speed)
     client = get_groq_client()
     if client:
         try:
@@ -290,31 +263,32 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
             completion = client.chat.completions.create(
                 model=chosen,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
-                temperature=0.3,
+                temperature=0.2,
                 max_tokens=2500,
-                timeout=20
+                timeout=16
             )
             raw = completion.choices[0].message.content
-            if raw:
+            if raw and len(raw.strip()) > 20:
                 return sanitize_ai_output(raw)
         except Exception as e:
-            print(f"[Groq Text Error]: {e}")
+            print(f"[Groq Text Notice]: {e}")
 
+    # 2. Fallback to Gemini
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
-                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 16})
-                    if res and res.text:
+                    res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
+                    if res and res.text and len(res.text.strip()) > 20:
                         return sanitize_ai_output(res.text)
                 except Exception:
                     continue
         except Exception:
             continue
 
-    return "Document inspection complete. Review the summary above or ask follow-up questions."
+    return "Document inspection complete. Review the extracted details or enter an inquiry below."
 
 def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
@@ -327,23 +301,23 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
                 temperature=0.2,
                 max_tokens=3500,
                 response_format={"type": "json_object"},
-                timeout=25
+                timeout=20
             )
             raw = completion.choices[0].message.content
             if raw:
                 return json.loads(sanitize_ai_output(raw))
         except Exception as e:
-            print(f"[Groq JSON Extraction Error]: {e}")
+            print(f"[Groq JSON Notice]: {e}")
 
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash"]:
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
                         f"{system_prompt}\n\nStrictly return valid JSON only.\nUser: {prompt}",
-                        request_options={"timeout": 20}
+                        request_options={"timeout": 16}
                     )
                     if res and res.text:
                         clean = sanitize_ai_output(res.text)
@@ -360,7 +334,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 1. PAPERPILOT FORENSIC AUDITOR (EXPANDED CONVERSATIONAL FORMAT)
+# 1. DOCUMENT SCANNER AUDIT ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -377,55 +351,57 @@ async def analyze_document(
             extracted_pdf_text = extract_text_from_pdf_stream(file_bytes)
 
         analysis_prompt = (
-            f"You are PaperPilot, an authentic Forensic Document Auditor & Intelligence Specialist. "
-            f"Thoroughly analyze this document in {target_language}.\n\n"
-            f"Structure your response cleanly using conversational Markdown headers and bullet points:\n"
-            f"1. **Identity & Core Headline**: Type of document, source language, issuing authority, and primary headline.\n"
-            f"2. **Main Message & Directives**: Step-by-step breakdown of orders, clauses, or key announcements.\n"
-            f"3. **Risks, Legal Penalties & Public Impact**: Highlight predatory fine print, legal liabilities, or conservation/community impact.\n"
-            f"4. **Actionable Next Steps**: Concrete steps for the citizen, traveler, or legal party.\n\n"
-            f"At the very end of your response, output a JSON array on its own line labeled 'EXPLORE_SUGGESTIONS:' containing 3 concise, highly relevant follow-up prompts.\n"
-            f"Example:\n"
-            f"EXPLORE_SUGGESTIONS: [\"Explore Vasai's groundwater data\", \"Check municipal water conservation laws\", \"Report unauthorized construction\"]\n"
+            f"You are an expert Forensic Document Auditor & Legal Document Examiner. "
+            f"Thoroughly analyze and deconstruct this document in {target_language}.\n\n"
+            f"Deliver an authentic, in-depth breakdown using clear Markdown headers and bullet points:\n\n"
+            f"### Document Identity & Authority\n"
+            f"• **Type & Classification**: (e.g. Municipal Public Notice, Land Record 7/12, Sale Deed, Court Order, Travel Itinerary, News Circular)\n"
+            f"• **Original Language & Issuing Authority**: (e.g. Marathi / Vasai-Virar Municipal Corporation Mayor Office)\n"
+            f"• **Core Headline / Primary Subject**: Clear summary of what this document is declaring.\n\n"
+            f"### Key Directives, Orders & Content Breakdown\n"
+            f"Provide a comprehensive, numbered or bulleted translation and breakdown of all orders, clauses, survey directives, or contractual terms.\n\n"
+            f"### Legal Liabilities, Penalties & Community Impact\n"
+            f"Highlight fine print, legal risks, violations, statutory penalties, environmental impact, or public advisories.\n\n"
+            f"### Actionable Recommendations\n"
+            f"Provide concrete steps the reader, citizen, or traveler must take immediately.\n\n"
+            f"At the very end of your response, output a single line formatted strictly as:\n"
+            f"EXPLORE_SUGGESTIONS: [\"Follow-up suggestion 1\", \"Follow-up suggestion 2\", \"Follow-up suggestion 3\"]"
         )
 
         analysis_raw = None
         diagnostic_err = ""
 
-        # Branch A: PDF Text Extraction
+        # Branch A: Direct digital text PDF
         if is_pdf and len(extracted_pdf_text) > 30:
             analysis_raw = ask_hybrid_text(
                 f"DOCUMENT TEXT CONTENT:\n{extracted_pdf_text[:12000]}\n\nAnalyze this document completely.",
                 analysis_prompt
             )
         else:
-            # Branch B: Scanned PDF or Image Processing (Pillow + pypdfium2 + Vision Cascade)
+            # Branch B: Scanned PDF or Image File
             pil_img = None
-            b64_img = None
             if is_pdf:
-                # Render scanned PDF page 1 to an image
-                pil_img, b64_img = convert_pdf_first_page_to_image(file_bytes)
-
+                pil_img = convert_pdf_first_page_to_image(file_bytes)
+            
             if pil_img is None:
-                # Direct image upload (JPG, PNG, WebP)
-                pil_img, b64_img = prepare_image_safe(file_bytes)
+                pil_img = prepare_image_fast(file_bytes)
 
-            if pil_img and b64_img:
-                analysis_raw, diagnostic_err = run_gemini_vision(analysis_prompt, pil_img)
+            if pil_img:
+                analysis_raw, diagnostic_err = run_fast_vision(analysis_prompt, pil_img)
             else:
-                diagnostic_err = "Could not decode or render document. Ensure it is a valid image or PDF."
+                diagnostic_err = "Could not decode or render this document. Ensure it is a legible PDF, JPG, or PNG."
 
         del file_bytes
         gc.collect()
 
         if not analysis_raw:
-            return {"status": "error", "message": diagnostic_err or "Analysis engine timed out.", "data": None}
+            return {"status": "error", "message": diagnostic_err or "Analysis engine timed out. Please retry.", "data": None}
 
-        # Parse suggestions array if present
+        # Parse suggestions array
         suggestions = [
-            f"Verify authority contact details",
-            f"Inspect official legal precedent",
-            f"Save document dossier to Family Vault"
+            "Verify official authority registration details",
+            "Check municipal regulations and precedent",
+            "Save document voucher to Family Travel Vault"
         ]
 
         clean_text = analysis_raw
@@ -439,7 +415,7 @@ async def analyze_document(
             except Exception:
                 pass
 
-        # Detect destination references
+        # Regional destination detection
         detected_destination = None
         lower_raw = clean_text.lower()
         if "vasai" in lower_raw or "virar" in lower_raw:
@@ -450,6 +426,8 @@ async def analyze_document(
             detected_destination = "Mumbai, Maharashtra, India"
         elif "delhi" in lower_raw:
             detected_destination = "New Delhi, India"
+        elif "jerusalem" in lower_raw or "israel" in lower_raw:
+            detected_destination = "Jerusalem, Israel"
 
         return {
             "status": "success",
@@ -462,7 +440,7 @@ async def analyze_document(
             "raw_text": clean_text
         }
     except Exception as e:
-        return {"status": "error", "message": f"Audit error: {str(e)}", "data": None}
+        return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
 # 2. DOCUMENT EXPORTERS
@@ -522,11 +500,11 @@ async def ask_question(
                 "file_type": "IMAGE"
             }
 
-        doc_awareness = f"\n[DOCUMENT IN AUDIT MEMORY]:\n{active_document_context}\n" if active_document_context else ""
+        doc_awareness = f"\n[ACTIVE AUDIT DOCUMENT MEMORY]:\n{active_document_context}\n" if active_document_context else ""
         sys_prompt = (
-            f"You are PaperPilot Companion, an authentic forensic auditor and local intelligence guide. "
-            f"Answer thoroughly, directly, and politely in {target_language}. Never output <think> tags. "
-            f"Reference specific details from the document context when available.{doc_awareness}"
+            f"You are Document Scanner Companion, an authentic forensic auditor and local intelligence officer. "
+            f"Answer thoroughly, politely, and directly in {target_language}. Never output <think> tags. "
+            f"Extract specific answers from the document memory whenever relevant.{doc_awareness}"
         )
 
         ans = ask_hybrid_text(clean_q, sys_prompt)
@@ -590,7 +568,7 @@ async def resize_image(
         img = Image.open(io.BytesIO(file_bytes))
         new_w, new_h = (width or 1080), (height or 1080)
 
-        resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
         if resized.mode in ("RGBA", "P"):
             resized = resized.convert("RGB")
 
@@ -603,7 +581,7 @@ async def resize_image(
         return {"status": "error", "message": f"Resize failed: {str(e)}"}
 
 # -------------------------------------------------------------
-# 5. TOURISTOS DESTINATION EXPLORER (CLEAN INTERNATIONAL AI SCAN)
+# 5. TOURISTOS DESTINATION EXPLORER
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -620,7 +598,7 @@ async def touristos_recommend(
 
     if any(x in lower_loc for x in ["israel", "jerusalem", "tel aviv"]):
         curr_sym = "₪"
-        nat_police, nat_hosp, nat_fire, nat_pharm = "100", "101 (Magen David Adom)", "102", "Super-Pharm 24/7"
+        nat_police, nat_hosp, nat_fire, nat_pharm = "100", "101", "102", "Super-Pharm 24/7"
     elif any(x in lower_loc for x in ["united states", "usa", "us", "new york", "california", "florida", "texas"]):
         curr_sym = "$"
         nat_police, nat_hosp, nat_fire, nat_pharm = "911", "911", "911", "311 / 1-800-222-1222"
@@ -632,7 +610,7 @@ async def touristos_recommend(
         nat_police, nat_hosp, nat_fire, nat_pharm = "999", "998", "997", "04-4405100"
     elif any(x in lower_loc for x in ["france", "italy", "germany", "spain", "europe", "paris", "rome"]):
         curr_sym = "€"
-        nat_police, nat_hosp, nat_fire, nat_pharm = "112", "112", "112", "112 / Pharmacy on Duty"
+        nat_police, nat_hosp, nat_fire, nat_pharm = "112", "112", "112", "112 / 24/7 Chemist"
     else:
         curr_sym = "₹"
         nat_police, nat_hosp, nat_fire, nat_pharm = "112 / 100", "108 / 102", "101", "1800-200-1234"
@@ -641,9 +619,9 @@ async def touristos_recommend(
         f"You are the senior local tourism, geographic, and municipal intelligence officer for '{loc_clean}'.\n"
         f"Party: {adults} Adults, {children} Kids. Diet: '{dietary_preference}'. Language: {target_language}.\n\n"
         f"MANDATORY INSTRUCTIONS:\n"
-        f"1. STRICT GEOGRAPHIC ACCURACY: Give ONLY real data for '{loc_clean}'. NEVER return Vasai or Mumbai data for international locations.\n"
-        f"2. 5-10 KM RADIUS EMERGENCY SCAN: Name real local hospital, police, fire station, and 24/7 pharmacy in '{city}'.\n"
-        f"3. AUTHENTIC ICONIC LANDMARKS: Return 8-10 real, famous landmarks in '{city}'.\n"
+        f"1. STRICT GEOGRAPHIC ACCURACY: Give ONLY authentic real data for '{loc_clean}'. Never output Mumbai or Vasai data for other locations.\n"
+        f"2. 5-10 KM RADIUS EMERGENCY SCAN: Provide authentic local hospital, police, fire, and 24/7 chemist in '{city}'.\n"
+        f"3. AUTHENTIC ICONIC LANDMARKS: Return 8-10 authentic, real landmarks in '{city}'.\n"
         f"4. REAL HOTELS: Return 6 real hotels in '{city}' with rates in '{curr_sym}'.\n"
         f"Return strict JSON matching the schema."
     )
@@ -671,11 +649,11 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
-    # Dynamic fallback scoped specifically to requested destination
+    # Safe destination-specific fallback
     return {
         "status": "success",
         "data": {
-            "destination_summary": f"{city} ({country}) travel dossier and cultural exploration guide.",
+            "destination_summary": f"{city} ({country}) travel guide and regional municipal directory.",
             "spots": [
                 {
                     "page": 1,
@@ -683,14 +661,14 @@ async def touristos_recommend(
                     "category": "Cultural Heritage",
                     "rating": "⭐ 4.9",
                     "dist": "Central District",
-                    "description": f"The central historic and architectural quarter of {city}, celebrated for landmarks and heritage.",
-                    "history": f"Recorded extensively in historical chronicles of {country}.",
-                    "sightseeing_rules": "Respect local customs, attire etiquette, and photography guidelines.",
+                    "description": f"The architectural and cultural heart of {city}, celebrated for landmarks and heritage.",
+                    "history": f"Recorded extensively in the historical annals of {country}.",
+                    "sightseeing_rules": "Respect local customs, cultural etiquette, and photography guidelines.",
                     "culinary": f"Traditional culinary specialties adhering to {dietary_preference}.",
-                    "transit": f"Accessible via {city} municipal public transit and taxis.",
-                    "best_time_and_weather": "Spring and Autumn months offer pleasant sightseeing conditions.",
-                    "shopping": f"Local artisan markets and central shopping boulevards in {city}.",
-                    "speciality": f"Iconic cultural and historical significance in {country}.",
+                    "transit": f"Accessible via {city} public transit, buses, and taxis.",
+                    "best_time_and_weather": "Spring and Autumn months offer optimal weather.",
+                    "shopping": f"Local bazaars and central retail arcades in {city}.",
+                    "speciality": f"Historical and cultural significance in {country}.",
                     "images": [f"https://image.pollinations.ai/prompt/Scenic%20daylight%20photography%20of%20historic%20{urllib.parse.quote(city)}%20{urllib.parse.quote(country)}?width=800&height=500&nologo=true&seed=101&model=flux"]
                 }
             ],
@@ -710,9 +688,9 @@ async def touristos_recommend(
                 "hospital_phone": nat_hosp,
                 "police_name": f"{city} Metropolitan Police",
                 "police_phone": nat_police,
-                "fire_name": f"{city} Emergency Fire Service",
+                "fire_name": f"{city} Fire Station",
                 "fire_phone": nat_fire,
-                "pharmacy_name": f"{city} 24/7 Central Chemist",
+                "pharmacy_name": f"{city} 24/7 Chemist",
                 "pharmacy_phone": nat_pharm
             }
         }
@@ -838,7 +816,7 @@ async def explore_chat(
 def wake():
     return {
         "status": "Operational",
-        "service": "Omni Forensic & TouristOS Cloud",
+        "service": "Omni Document Scanner & TouristOS Cloud",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
