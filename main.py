@@ -32,7 +32,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
     description="Direct REST Vision, Multi-Page Legal Document Engine & Forensic Auditor",
-    version="75.0.0"
+    version="76.0.0"
 )
 
 app.add_middleware(
@@ -68,7 +68,7 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# DIRECT REST CALL FOR GEMINI 2.0 FLASH (ACCEPTS AQ... KEYS)
+# DIRECT REST CALL FOR ACTIVE GEMINI FLASH PRODUCTION MODELS
 # -------------------------------------------------------------
 async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
@@ -98,9 +98,14 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
         }
     }
 
-    models_to_try = ["gemini-2.0-flash", "gemini-2.0-flash-exp"]
+    # Active production models on Google AI Studio
+    models_to_try = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash",
+    ]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=35.0) as client:
         for key in keys:
             for model_name in models_to_try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
@@ -120,7 +125,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
                             if len(ans) > 20:
                                 return sanitize_ai_output(ans), ""
                     else:
-                        last_err = f"HTTP {res.status_code}: {res.text[:120]}"
+                        last_err = f"HTTP {res.status_code} ({model_name}): {res.text[:120]}"
                         print(f"[Gemini REST Error {model_name}]: {last_err}")
                 except Exception as ex:
                     last_err = f"{model_name} exception: {str(ex)[:100]}"
@@ -130,10 +135,9 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
     return None, f"Vision notice ({last_err})"
 
 # -------------------------------------------------------------
-# FAST TEXT ENGINE (GROQ LLAMA-3.3-70B WITH GEMINI REST FALLBACK)
+# FAST TEXT ENGINE (GROQ LLAMA-3.3-70B WITH REST FALLBACK)
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
-    # 1. Groq Ultra-Fast Call (under 2 seconds)
     client = get_groq_client()
     if client:
         try:
@@ -153,7 +157,6 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
         except Exception as e:
             print(f"[Groq Text Notice]: {e}")
 
-    # 2. Gemini REST Fallback
     keys = get_gemini_keys()
     if keys:
         payload = {
@@ -168,18 +171,19 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
         }
         async with httpx.AsyncClient(timeout=20.0) as http_client:
             for key in keys:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
-                try:
-                    res = await http_client.post(url, json=payload)
-                    if res.status_code == 200:
-                        candidates = res.json().get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                            if len(ans) > 10:
-                                return sanitize_ai_output(ans)
-                except Exception:
-                    continue
+                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+                    try:
+                        res = await http_client.post(url, json=payload)
+                        if res.status_code == 200:
+                            candidates = res.json().get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
+                                if len(ans) > 10:
+                                    return sanitize_ai_output(ans)
+                    except Exception:
+                        continue
 
     return "Document inspection complete. Review the forensic breakdown above or ask a specific follow-up question."
 
@@ -275,7 +279,6 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
         return ""
 
 def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[str, int]:
-    """Streams and extracts text from massive multi-page legal PDFs up to 250 pages."""
     if PdfReader is None:
         return "", 0
     try:
@@ -299,7 +302,6 @@ def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[s
         return "", 0
 
 def render_scanned_pdf_first_page(file_bytes: bytes) -> Optional[bytes]:
-    """Converts the primary page of an image-only/scanned PDF into an optimized JPEG buffer."""
     if pdfium is None:
         return None
     try:
@@ -349,7 +351,6 @@ async def analyze_document(
         extracted_text = ""
         total_pages_detected = 1
 
-        # Route 1: Office formats
         if filename.endswith(".docx"):
             extracted_text = extract_text_from_docx(file_bytes)
         elif filename.endswith(".pptx"):
@@ -368,12 +369,12 @@ async def analyze_document(
             f"You are Paper Pilot, an authentic Forensic Legal Auditor and Historical Facts Examiner. "
             f"Thoroughly analyze and deconstruct this document in {target_language}.\n\n"
             f"PRESENTATION & STYLE RULES:\n"
-            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Issuing Authority:**, **Effective Date:**). Regular descriptions must be in normal weight.\n"
+            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Issuing Authority:**, **Effective Date:**). Descriptions must be in regular weight.\n"
             f"2. Any rates, dimensions, schedules, penalties, or numerical comparisons MUST be rendered in a clean Markdown Table (like | Clause / Section | Detail | Liability |).\n"
             f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, arbitration trap, or statutory catch, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'. This renders in bright red for the user.\n\n"
             f"STRUCTURE:\n"
             f"• **Document Identity:** Type, Issuing Body, Document Date, Parties Involved, Official Seals, and Primary Headline.\n"
-            f"• **Scope & Multi-Page Summary:** (If multi-page, outline the overall legal covenants across sections).\n"
+            f"• **Scope & Multi-Page Summary:** Outline the overall legal covenants across sections.\n"
             f"• **Key Clauses, Tables & Directives:** Provide structured bullets and tables of terms, dates, and covenants.\n"
             f"• **Liabilities, Traps & Fine Print:** List every risky item prefixed with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
             f"• **Actionable Roadmap:** Concrete next steps for the citizen, advocate, or signatory.\n\n"
@@ -384,17 +385,16 @@ async def analyze_document(
         analysis_raw = None
         diagnostic_err = ""
 
-        # Path A: Digital Document (Processes up to 200+ pages instantly via Groq 128k context)
+        # Path A: Digital Document
         if len(extracted_text.strip()) > 30:
             doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages: {total_pages_detected})\n\n"
-            # Groq easily accommodates up to 80,000 characters of dense legal text
             truncated_content = extracted_text[:80000]
             analysis_raw = await ask_fast_text(
                 f"{doc_context_header}{truncated_content}\n\nConduct full forensic legal audit according to your directives.",
                 dual_role_prompt
             )
         else:
-            # Path B: Scanned PDF or Image File (Direct REST call to Gemini 2.0 Flash)
+            # Path B: Scanned PDF or Image File
             img_bytes = None
             if filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
                 img_bytes = render_scanned_pdf_first_page(file_bytes)
@@ -420,7 +420,6 @@ async def analyze_document(
                 "data": None
             }
 
-        # Parse suggestions
         suggestions = [
             "Verify official authority contact numbers",
             "Examine legal precedent and historical records",
@@ -590,7 +589,6 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
-    # Built-in robust fallback for any city
     return {
         "status": "success",
         "data": {
@@ -655,7 +653,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
-        "version": "75.0.0",
+        "version": "76.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
