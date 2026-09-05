@@ -32,7 +32,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & TouristOS Engine",
     description="Universal Multi-Format Document Intelligence, Historical Verification & Multimodal Vision",
-    version="67.0.0"
+    version="68.0.0"
 )
 
 app.add_middleware(
@@ -187,33 +187,50 @@ def prepare_image_pil(file_bytes: bytes) -> Optional[Image.Image]:
         return None
 
 # -------------------------------------------------------------
-# STABLE GEMINI MULTIMODAL VISION CALL
+# DYNAMIC, BULLETPROOF GEMINI VISION CALL
 # -------------------------------------------------------------
 def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
     if not keys:
-        return None, "Gemini API key is not configured on Render. Please verify GEMINI_API_KEY environment variable."
-
-    # Verified production models across Google Cloud and Google AI Studio
-    models_to_try = [
-        "gemini-2.0-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash-exp",
-        "gemini-2.5-pro"
-    ]
+        return None, "Gemini API key is not configured on Render. Check GEMINI_API_KEY."
 
     last_err = ""
     for key in keys:
         try:
             genai.configure(api_key=key)
-            for m_name in models_to_try:
+
+            # Discover active models for this key to prevent 404 mismatches
+            valid_models = []
+            try:
+                for m in genai.list_models():
+                    methods = getattr(m, "supported_generation_methods", [])
+                    if "generateContent" in methods:
+                        m_name = m.name.replace("models/", "")
+                        valid_models.append(m_name)
+            except Exception as le:
+                print(f"[Gemini list_models notice]: {le}")
+
+            # Preferred order of stable models
+            preferred_order = [
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-exp",
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
+            ]
+
+            candidates = [m for m in preferred_order if m in valid_models]
+            if not candidates:
+                # Fallback to any valid generateContent model or default to 2.0-flash
+                candidates = valid_models if valid_models else ["gemini-2.0-flash", "gemini-1.5-flash"]
+
+            for model_id in candidates:
                 try:
-                    model = genai.GenerativeModel(m_name)
+                    model = genai.GenerativeModel(model_id)
                     res = model.generate_content([prompt, pil_img], request_options={"timeout": 25})
                     if res and res.text and len(res.text.strip()) > 15:
                         return sanitize_ai_output(res.text), ""
                 except Exception as me:
-                    last_err = f"{m_name}: {str(me)[:95]}"
+                    last_err = f"{model_id}: {str(me)[:95]}"
                     continue
         except Exception as ke:
             last_err = f"Key config: {str(ke)[:95]}"
@@ -242,7 +259,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-2.5-flash"]:
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
@@ -277,7 +294,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.0-flash", "gemini-2.5-flash"]:
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
@@ -450,14 +467,14 @@ async def analyze_document(
         analysis_raw = None
         diagnostic_err = ""
 
-        # Route A: Direct digital text found
+        # Route A: Digital text found in file
         if len(extracted_text.strip()) > 30:
             analysis_raw = ask_hybrid_text(
                 f"DOCUMENT FILE ({filename}) CONTENT:\n{extracted_text[:14000]}\n\nAnalyze this document completely according to your directives.",
                 dual_role_prompt
             )
         else:
-            # Route B: Scanned PDF or Image File (Native PIL directly to Gemini 2.0 Flash)
+            # Route B: Scanned PDF or Image File
             pil_img = None
             if filename.endswith(".pdf"):
                 pil_img = convert_pdf_first_page_to_pil(file_bytes)
@@ -568,7 +585,7 @@ async def export_docx(request: Request, content: str = Form(...), title: str = F
         return {"status": "error", "message": f"Word build error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 4. INTERACTIVE DOCUMENT CHAT (NO UNSOLICITED ITINERARIES)
+# 4. INTERACTIVE DOCUMENT CHAT (NO RANDOM ITINERARIES)
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -600,15 +617,15 @@ async def ask_question(
                 "file_type": "IMAGE"
             }
 
-        doc_awareness = f"\n[ACTIVE DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
+        doc_awareness = f"\n[ACTIVE AUDITED DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
         sys_prompt = (
-            f"You are Paper Pilot Companion, an authentic forensic auditor and historical facts expert. "
-            f"The user is asking a specific question about the document currently being audited.\n"
-            f"CRITICAL DIRECTIVES:\n"
-            f"1. Answer strictly and directly about the user's question regarding this document in {target_language}.\n"
-            f"2. Format cleanly like Grok: make ONLY headlines bold, keep regular text normal weight, and use clean Markdown tables if presenting numbers or rates.\n"
-            f"3. Highlight any new risks with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
-            f"4. NEVER randomly generate a travel itinerary or tourist schedule unless the user explicitly requested a travel itinerary.{doc_awareness}"
+            f"You are Paper Pilot Companion, an authentic forensic document auditor and historical facts examiner. "
+            f"The user is asking a specific inquiry about the document being audited.\n\n"
+            f"STRICT RULES:\n"
+            f"1. Answer ONLY what the user asked about this document in {target_language}.\n"
+            f"2. Keep the Grok presentation style: bold headlines only, regular text normal weight, and clean Markdown tables for numbers or rates.\n"
+            f"3. Mark any fine print or risks with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
+            f"4. NEVER generate a travel itinerary or tourist plan unless the user explicitly requested a travel itinerary.{doc_awareness}"
         )
 
         ans = ask_hybrid_text(clean_q, sys_prompt)
