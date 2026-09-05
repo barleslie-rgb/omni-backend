@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & TouristOS Engine",
     description="Universal Multi-Format Document Intelligence, Historical Verification & Multimodal Vision",
-    version="65.0.0"
+    version="66.0.0"
 )
 
 app.add_middleware(
@@ -158,101 +158,82 @@ def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
             print(f"[pypdf notice]: {e}")
     return extracted.strip()
 
-def convert_pdf_first_page_to_image(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
+def convert_pdf_first_page_to_bytes(file_bytes: bytes) -> Optional[bytes]:
     if pdfium is None:
-        return None, None
+        return None
     try:
         pdf = pdfium.PdfDocument(file_bytes)
         if len(pdf) == 0:
-            return None, None
+            return None
         page = pdf[0]
         pil_img = page.render(scale=1.5).to_pil()
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=80)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return pil_img, b64
+        pil_img.save(buf, format="JPEG", quality=82)
+        return buf.getvalue()
     except Exception as e:
         print(f"[pdfium render notice]: {e}")
-        return None, None
+        return None
 
-def prepare_image_optimized(file_bytes: bytes) -> Tuple[Optional[Image.Image], Optional[str]]:
+def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
+    """Compresses phone photos to an optimal byte stream under 500KB for rapid vision inference."""
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1024:
-            pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
+        if max(pil_img.size) > 1200:
+            pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
         buf = io.BytesIO()
         pil_img.save(buf, format="JPEG", quality=82, optimize=True)
-        raw_clean = buf.getvalue()
-        b64 = base64.b64encode(raw_clean).decode("utf-8")
-        return pil_img, b64
+        return buf.getvalue()
     except Exception as e:
         print(f"[Pillow optimization notice]: {e}")
-        return None, None
+        return None
 
 # -------------------------------------------------------------
-# HIGH-SPEED MULTIMODAL VISION CALL
+# ROBUST MULTIMODAL VISION CALL (UNIVERSAL GEMINI FLASH)
 # -------------------------------------------------------------
-def run_vision_inspection(prompt: str, pil_img: Image.Image, b64_img: Optional[str] = None) -> Tuple[Optional[str], str]:
+def run_vision_inspection(prompt: str, image_bytes: bytes) -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
+    if not keys:
+        return None, "Gemini API key is not configured on Render. Please verify GEMINI_API_KEY environment variable."
+
+    # Active vision models supported across all Google AI Studio tiers
+    models_to_try = [
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-pro",
+        "models/gemini-2.0-flash",
+        "models/gemini-1.5-flash"
+    ]
+
     last_err = ""
+    # Standard raw image payload structure
+    image_part = {
+        "mime_type": "image/jpeg",
+        "data": image_bytes
+    }
 
-    # 1. Primary fast Gemini Flash call (12-second ceiling)
-    if keys:
-        for key in keys:
-            try:
-                genai.configure(api_key=key)
-                for m_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
-                    try:
-                        model = genai.GenerativeModel(m_name)
-                        res = model.generate_content([prompt, pil_img], request_options={"timeout": 12})
-                        if res and res.text and len(res.text.strip()) > 15:
-                            return sanitize_ai_output(res.text), ""
-                    except Exception as me:
-                        last_err = f"{m_name}: {str(me)[:95]}"
-                        continue
-            except Exception as ke:
-                last_err = f"Key config: {str(ke)[:95]}"
-                continue
-
-    # 2. Fast Fallback: Groq Multimodal Vision
-    client = get_groq_client()
-    if client and b64_img:
+    for key in keys:
         try:
-            for g_vision_model in ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]:
+            genai.configure(api_key=key)
+            for m_name in models_to_try:
                 try:
-                    completion = client.chat.completions.create(
-                        model=g_vision_model,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}
-                                    }
-                                ]
-                            }
-                        ],
-                        temperature=0.2,
-                        max_tokens=2500,
-                        timeout=12
-                    )
-                    raw_out = completion.choices[0].message.content
-                    if raw_out and len(raw_out.strip()) > 15:
-                        return sanitize_ai_output(raw_out), ""
-                except Exception as ge:
-                    last_err = f"Groq vision: {str(ge)[:95]}"
+                    model = genai.GenerativeModel(m_name)
+                    res = model.generate_content([prompt, image_part], request_options={"timeout": 22})
+                    if res and res.text and len(res.text.strip()) > 15:
+                        return sanitize_ai_output(res.text), ""
+                except Exception as me:
+                    last_err = f"{m_name}: {str(me)[:95]}"
                     continue
-        except Exception as oe:
-            last_err = f"Groq vision outer: {str(oe)[:95]}"
+        except Exception as ke:
+            last_err = f"Key config: {str(ke)[:95]}"
+            continue
 
-    return None, f"Vision notice ({last_err})"
+    return None, f"Vision notice: {last_err}"
 
 def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -275,7 +256,7 @@ def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
@@ -310,7 +291,7 @@ def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
     for key in get_gemini_keys():
         try:
             genai.configure(api_key=key)
-            for m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]:
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     model = genai.GenerativeModel(m)
                     res = model.generate_content(
@@ -463,7 +444,7 @@ async def analyze_document(
             f"You are Paper Pilot, an authentic Forensic Document Auditor and Historical Facts Examiner. "
             f"Thoroughly analyze and deconstruct this document/image in {target_language}.\n\n"
             f"PRESENTATION & STYLE RULES:\n"
-            f"1. Make ONLY the headlines and key labels bold (e.g. **Document Type:**, **Date:**, **Issuing Authority:**). Keep all explanation and description text in clean, normal regular weight.\n"
+            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Date:**, **Issuing Authority:**). Keep all explanation and description text in clean, normal regular weight.\n"
             f"2. Any rates, dimensions, or numerical comparisons MUST be rendered in a clean Markdown Table (like | Item | Details |).\n"
             f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, hidden risk, forgery, or statutory trap, prefix that specific line with '🚨 **[SUSPICIOUS / RISK]:**'. This will render in bright red for the user.\n\n"
             f"STRUCTURE:\n"
@@ -483,7 +464,7 @@ async def analyze_document(
         analysis_raw = None
         diagnostic_err = ""
 
-        # Route A: Digital text found
+        # Route A: Direct digital text found
         if len(extracted_text.strip()) > 30:
             analysis_raw = ask_hybrid_text(
                 f"DOCUMENT FILE ({filename}) CONTENT:\n{extracted_text[:14000]}\n\nAnalyze this document completely according to your directives.",
@@ -491,17 +472,15 @@ async def analyze_document(
             )
         else:
             # Route B: Scanned PDF or Image File
-            pil_img = None
-            b64_img = None
-
+            img_bytes = None
             if filename.endswith(".pdf"):
-                pil_img, b64_img = convert_pdf_first_page_to_image(file_bytes)
+                img_bytes = convert_pdf_first_page_to_bytes(file_bytes)
 
-            if pil_img is None:
-                pil_img, b64_img = prepare_image_optimized(file_bytes)
+            if img_bytes is None:
+                img_bytes = prepare_image_bytes(file_bytes)
 
-            if pil_img:
-                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, pil_img, b64_img)
+            if img_bytes:
+                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, img_bytes)
             else:
                 diagnostic_err = "Could not decode this document. Please ensure it is a valid image, PDF, or Office file."
 
@@ -784,7 +763,6 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
-    # Safe destination fallback
     return {
         "status": "success",
         "data": {
