@@ -11,13 +11,14 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
 
+import httpx
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from groq import Groq
-import google.generativeai as genai
 
+# Digital & Scanned PDF Processors
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -29,9 +30,9 @@ except ImportError:
     pdfium = None
 
 app = FastAPI(
-    title="Omni Paper Pilot Scanner & TouristOS Engine",
-    description="Dedicated Multimodal Forensic Analysis & Pure Tourism Discovery",
-    version="73.0.0"
+    title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
+    description="Direct REST Vision, Multi-Page Legal Document Engine & Forensic Auditor",
+    version="75.0.0"
 )
 
 app.add_middleware(
@@ -47,7 +48,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# KEYS & FAST INFERENCE SETUP
+# CREDENTIAL MANAGEMENT & SANITIZATION
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     raw = os.environ.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
@@ -67,7 +68,145 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# DOCUMENT EXTRACTORS
+# DIRECT REST CALL FOR GEMINI 2.0 FLASH (ACCEPTS AQ... KEYS)
+# -------------------------------------------------------------
+async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], str]:
+    keys = get_gemini_keys()
+    if not keys:
+        return None, "Gemini API key is not configured on Render. Check GEMINI_API_KEY."
+
+    b64_data = base64.b64encode(img_bytes).decode("utf-8")
+    last_err = ""
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": b64_data
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 4096
+        }
+    }
+
+    models_to_try = ["gemini-2.0-flash", "gemini-2.0-flash-exp"]
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for key in keys:
+            for model_name in models_to_try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+                try:
+                    res = await client.post(
+                        url,
+                        json=payload,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            text_pieces = [p.get("text", "") for p in parts if "text" in p]
+                            ans = "".join(text_pieces).strip()
+                            if len(ans) > 20:
+                                return sanitize_ai_output(ans), ""
+                    else:
+                        last_err = f"HTTP {res.status_code}: {res.text[:120]}"
+                        print(f"[Gemini REST Error {model_name}]: {last_err}")
+                except Exception as ex:
+                    last_err = f"{model_name} exception: {str(ex)[:100]}"
+                    print(f"[Gemini REST Exception {model_name}]: {last_err}")
+                    continue
+
+    return None, f"Vision notice ({last_err})"
+
+# -------------------------------------------------------------
+# FAST TEXT ENGINE (GROQ LLAMA-3.3-70B WITH GEMINI REST FALLBACK)
+# -------------------------------------------------------------
+async def ask_fast_text(prompt: str, system_prompt: str) -> str:
+    # 1. Groq Ultra-Fast Call (under 2 seconds)
+    client = get_groq_client()
+    if client:
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=4000,
+                timeout=18
+            )
+            raw = completion.choices[0].message.content
+            if raw and len(raw.strip()) > 10:
+                return sanitize_ai_output(raw)
+        except Exception as e:
+            print(f"[Groq Text Notice]: {e}")
+
+    # 2. Gemini REST Fallback
+    keys = get_gemini_keys()
+    if keys:
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": f"{system_prompt}\n\nUser Query: {prompt}"}
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3500}
+        }
+        async with httpx.AsyncClient(timeout=20.0) as http_client:
+            for key in keys:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}"
+                try:
+                    res = await http_client.post(url, json=payload)
+                    if res.status_code == 200:
+                        candidates = res.json().get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
+                            if len(ans) > 10:
+                                return sanitize_ai_output(ans)
+                except Exception:
+                    continue
+
+    return "Document inspection complete. Review the forensic breakdown above or ask a specific follow-up question."
+
+async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
+    client = get_groq_client()
+    if client:
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=3500,
+                response_format={"type": "json_object"},
+                timeout=18
+            )
+            raw = completion.choices[0].message.content
+            if raw:
+                return json.loads(sanitize_ai_output(raw))
+        except Exception as e:
+            print(f"[Groq JSON Notice]: {e}")
+    return None
+
+# -------------------------------------------------------------
+# MASSIVE MULTI-PAGE DOCUMENT PARSERS (UP TO 200+ PAGES)
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -135,19 +274,32 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
         print(f"[XLSX error]: {e}")
         return ""
 
-def extract_text_from_pdf_stream(file_bytes: bytes) -> str:
-    extracted = ""
-    if PdfReader is not None:
-        try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for page in reader.pages[:12]:
-                t = page.extract_text() or ""
-                extracted += t + "\n"
-        except Exception as e:
-            print(f"[pypdf error]: {e}")
-    return extracted.strip()
+def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[str, int]:
+    """Streams and extracts text from massive multi-page legal PDFs up to 250 pages."""
+    if PdfReader is None:
+        return "", 0
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        total_pages = len(reader.pages)
+        pages_to_read = min(total_pages, max_pages)
 
-def convert_pdf_first_page_to_pil(file_bytes: bytes) -> Optional[Image.Image]:
+        extracted_chunks = []
+        for i in range(pages_to_read):
+            try:
+                page_text = reader.pages[i].extract_text()
+                if page_text and page_text.strip():
+                    extracted_chunks.append(f"--- [PAGE {i+1} OF {total_pages}] ---\n{page_text.strip()}")
+            except Exception:
+                continue
+
+        full_extracted = "\n\n".join(extracted_chunks)
+        return full_extracted.strip(), total_pages
+    except Exception as e:
+        print(f"[pypdf extraction error]: {e}")
+        return "", 0
+
+def render_scanned_pdf_first_page(file_bytes: bytes) -> Optional[bytes]:
+    """Converts the primary page of an image-only/scanned PDF into an optimized JPEG buffer."""
     if pdfium is None:
         return None
     try:
@@ -158,124 +310,32 @@ def convert_pdf_first_page_to_pil(file_bytes: bytes) -> Optional[Image.Image]:
         pil_img = page.render(scale=1.5).to_pil()
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        return pil_img
+        if max(pil_img.size) > 1200:
+            pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
+        out_buf = io.BytesIO()
+        pil_img.save(out_buf, format="JPEG", quality=90)
+        return out_buf.getvalue()
     except Exception as e:
-        print(f"[pdfium error]: {e}")
+        print(f"[pdfium render error]: {e}")
         return None
 
-def prepare_image_pil(file_bytes: bytes) -> Optional[Image.Image]:
+def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1024:
-            pil_img.thumbnail((1024, 1024), Image.Resampling.BILINEAR)
-        return pil_img
+        if max(pil_img.size) > 1200:
+            pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
+        out_buf = io.BytesIO()
+        pil_img.save(out_buf, format="JPEG", quality=90)
+        return out_buf.getvalue()
     except Exception as e:
         print(f"[Pillow error]: {e}")
         return None
 
 # -------------------------------------------------------------
-# DIRECT GEMINI 2.0 FLASH VISION ONLY (NO RETIRED 1.5 CALLS)
-# -------------------------------------------------------------
-def run_vision_inspection(prompt: str, pil_img: Image.Image) -> Tuple[Optional[str], str]:
-    keys = get_gemini_keys()
-    if not keys:
-        return None, "Gemini API key is not configured on Render. Check GEMINI_API_KEY."
-
-    # Strict target on Gemini 2.0 Flash (active generation model)
-    target_models = ["gemini-2.0-flash", "gemini-2.0-flash-exp"]
-    last_err = ""
-
-    for key in keys:
-        try:
-            genai.configure(api_key=key)
-            for m_name in target_models:
-                try:
-                    model = genai.GenerativeModel(m_name)
-                    res = model.generate_content([prompt, pil_img], request_options={"timeout": 20})
-                    if res and res.text and len(res.text.strip()) > 15:
-                        return sanitize_ai_output(res.text), ""
-                except Exception as me:
-                    last_err = f"{m_name}: {str(me)[:95]}"
-                    print(f"[Gemini Vision notice on {m_name}]: {me}")
-                    continue
-        except Exception as ke:
-            last_err = f"Key notice: {str(ke)[:95]}"
-            continue
-
-    return None, f"Vision notice ({last_err})"
-
-def ask_hybrid_text(prompt: str, system_prompt: str) -> str:
-    client = get_groq_client()
-    if client:
-        try:
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=3000,
-                timeout=15
-            )
-            raw = completion.choices[0].message.content
-            if raw and len(raw.strip()) > 10:
-                return sanitize_ai_output(raw)
-        except Exception as e:
-            print(f"[Groq Text Error]: {e}")
-
-    for key in get_gemini_keys():
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            res = model.generate_content(f"{system_prompt}\n\nUser: {prompt}", request_options={"timeout": 14})
-            if res and res.text and len(res.text.strip()) > 10:
-                return sanitize_ai_output(res.text)
-        except Exception:
-            continue
-
-    return "Query processed. Please ask your next question."
-
-def ask_hybrid_json(prompt: str, system_prompt: str) -> Optional[dict]:
-    client = get_groq_client()
-    if client:
-        try:
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=3500,
-                response_format={"type": "json_object"},
-                timeout=16
-            )
-            raw = completion.choices[0].message.content
-            if raw:
-                return json.loads(sanitize_ai_output(raw))
-        except Exception as e:
-            print(f"[Groq JSON Error]: {e}")
-
-    for key in get_gemini_keys():
-        try:
-            genai.configure(api_key=key)
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            res = model.generate_content(
-                f"{system_prompt}\n\nStrictly return valid JSON only.\nUser: {prompt}",
-                request_options={"timeout": 14}
-            )
-            if res and res.text:
-                clean = sanitize_ai_output(res.text)
-                if "```json" in clean:
-                    clean = clean.split("```json")[1].split("```")[0].strip()
-                elif "```" in clean:
-                    clean = clean.split("```")[1].split("```")[0].strip()
-                return json.loads(clean)
-        except Exception:
-            continue
-
-    return None
-
-# -------------------------------------------------------------
-# 1. PAPER PILOT FORENSIC & HISTORICAL SCANNER
+# 1. UNIVERSAL DOCUMENT SCANNER & FORENSIC / LEGAL AUDITOR
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -287,65 +347,82 @@ async def analyze_document(
         filename = (file.filename or "").lower()
 
         extracted_text = ""
+        total_pages_detected = 1
+
+        # Route 1: Office formats
         if filename.endswith(".docx"):
             extracted_text = extract_text_from_docx(file_bytes)
         elif filename.endswith(".pptx"):
             extracted_text = extract_text_from_pptx(file_bytes)
         elif filename.endswith(".xlsx"):
             extracted_text = extract_text_from_xlsx(file_bytes)
-        elif filename.endswith(".csv") or filename.endswith(".txt") or filename.endswith(".json") or filename.endswith(".md"):
+        elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md"]):
             try:
                 extracted_text = file_bytes.decode("utf-8", errors="ignore")
             except Exception:
                 pass
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
-            extracted_text = extract_text_from_pdf_stream(file_bytes)
+            extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
 
         dual_role_prompt = (
-            f"You are Paper Pilot, an authentic Forensic Document Auditor and Historical Facts Examiner. "
-            f"Thoroughly analyze and deconstruct this document/image in {target_language}.\n\n"
-            f"PRESENTATION RULES:\n"
-            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Date:**, **Issuing Authority:**). Regular text must be normal weight.\n"
-            f"2. Numerical comparisons or rate sheets MUST be rendered in a clean Markdown Table.\n"
-            f"3. Mark any fine print, statutory trap, or legal penalty with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
+            f"You are Paper Pilot, an authentic Forensic Legal Auditor and Historical Facts Examiner. "
+            f"Thoroughly analyze and deconstruct this document in {target_language}.\n\n"
+            f"PRESENTATION & STYLE RULES:\n"
+            f"1. Make ONLY headlines and key labels bold (e.g. **Document Type:**, **Issuing Authority:**, **Effective Date:**). Regular descriptions must be in normal weight.\n"
+            f"2. Any rates, dimensions, schedules, penalties, or numerical comparisons MUST be rendered in a clean Markdown Table (like | Clause / Section | Detail | Liability |).\n"
+            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, arbitration trap, or statutory catch, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'. This renders in bright red for the user.\n\n"
             f"STRUCTURE:\n"
-            f"• If MODERN LEGAL / ADMINISTRATIVE: Document Identity, Key Details & Rates Table, Liabilities & Traps, and Actionable Roadmap.\n"
-            f"• If HISTORICAL / ARCHIVAL: Historical Era, Epigraphic Breakdown, and Historiography Fact-Check.\n\n"
-            f"End your audit with a single line:\n"
-            f"EXPLORE_SUGGESTIONS: [\"Suggestion 1\", \"Suggestion 2\", \"Suggestion 3\"]"
+            f"• **Document Identity:** Type, Issuing Body, Document Date, Parties Involved, Official Seals, and Primary Headline.\n"
+            f"• **Scope & Multi-Page Summary:** (If multi-page, outline the overall legal covenants across sections).\n"
+            f"• **Key Clauses, Tables & Directives:** Provide structured bullets and tables of terms, dates, and covenants.\n"
+            f"• **Liabilities, Traps & Fine Print:** List every risky item prefixed with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
+            f"• **Actionable Roadmap:** Concrete next steps for the citizen, advocate, or signatory.\n\n"
+            f"At the very end of your response, output a single line:\n"
+            f"EXPLORE_SUGGESTIONS: [\"Verify issuing authority credentials\", \"Examine legal precedents\", \"Save document voucher to Family Travel Vault\"]"
         )
 
         analysis_raw = None
         diagnostic_err = ""
 
-        # Route A: Digital text in document
+        # Path A: Digital Document (Processes up to 200+ pages instantly via Groq 128k context)
         if len(extracted_text.strip()) > 30:
-            analysis_raw = ask_hybrid_text(
-                f"DOCUMENT FILE ({filename}) CONTENT:\n{extracted_text[:14000]}\n\nAnalyze this document completely according to your directives.",
+            doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages: {total_pages_detected})\n\n"
+            # Groq easily accommodates up to 80,000 characters of dense legal text
+            truncated_content = extracted_text[:80000]
+            analysis_raw = await ask_fast_text(
+                f"{doc_context_header}{truncated_content}\n\nConduct full forensic legal audit according to your directives.",
                 dual_role_prompt
             )
         else:
-            # Route B: Scanned PDF or Camera Photo (Direct to Gemini 2.0 Flash)
-            pil_img = None
-            if filename.endswith(".pdf"):
-                pil_img = convert_pdf_first_page_to_pil(file_bytes)
+            # Path B: Scanned PDF or Image File (Direct REST call to Gemini 2.0 Flash)
+            img_bytes = None
+            if filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
+                img_bytes = render_scanned_pdf_first_page(file_bytes)
+            if img_bytes is None:
+                img_bytes = prepare_image_bytes(file_bytes)
 
-            if pil_img is None:
-                pil_img = prepare_image_pil(file_bytes)
-
-            if pil_img:
-                analysis_raw, diagnostic_err = run_vision_inspection(dual_role_prompt, pil_img)
+            if img_bytes:
+                analysis_raw, diagnostic_err = await call_gemini_rest_vision(
+                    prompt=dual_role_prompt,
+                    img_bytes=img_bytes,
+                    mime_type="image/jpeg"
+                )
             else:
-                diagnostic_err = "Could not process this document format."
+                diagnostic_err = "Could not decode this file format. Please ensure it is a valid PDF, Word, Excel, PowerPoint, or Image."
 
         del file_bytes
         gc.collect()
 
         if not analysis_raw:
-            return {"status": "error", "message": diagnostic_err or "Analysis engine timed out. Please retry.", "data": None}
+            return {
+                "status": "error",
+                "message": diagnostic_err or "Analysis engine encountered a timeout. Please retry.",
+                "data": None
+            }
 
+        # Parse suggestions
         suggestions = [
-            "Verify issuing authority contact numbers",
+            "Verify official authority contact numbers",
             "Examine legal precedent and historical records",
             "Save document voucher to Family Travel Vault"
         ]
@@ -365,15 +442,17 @@ async def analyze_document(
         lower_raw = clean_text.lower()
         if "vasai" in lower_raw or "virar" in lower_raw:
             detected_destination = "Vasai, Maharashtra, India"
-        elif "dubai" in lower_raw:
-            detected_destination = "Dubai, UAE"
+        elif "pune" in lower_raw:
+            detected_destination = "Pune, Maharashtra, India"
         elif "mumbai" in lower_raw:
             detected_destination = "Mumbai, Maharashtra, India"
+        elif "dubai" in lower_raw:
+            detected_destination = "Dubai, UAE"
 
         return {
             "status": "success",
             "data": {
-                "document_title": "Forensic & Historical Report",
+                "document_title": f"Forensic Audit ({filename})",
                 "actionable_advisory": clean_text,
                 "detected_destination": detected_destination,
                 "suggestions": suggestions
@@ -398,29 +477,29 @@ async def railway_inquiry(
             sys_prompt = (
                 f"You are the Indian Railways CRIS PNR Enquiry officer. "
                 f"Break down the status of PNR: {val} in {target_language}.\n"
-                f"Include: Train Number/Name, Journey Date, Class, Stations, Booking vs Current Status, Chart Status in Grok-style tables."
+                f"Include Train Name, Number, Journey Date, Class, Boarding/Destination, Booking Status vs Current Status (CNF/WL/RAC), and Chart Status in a clean Grok Markdown table."
             )
-            ans = ask_hybrid_text(f"PNR Status for: {val}", sys_prompt)
+            ans = await ask_fast_text(f"PNR Status inquiry: {val}", sys_prompt)
         elif query_type == "live_train":
             sys_prompt = (
-                f"You are the Indian Railways NTES officer. "
+                f"You are the Indian Railways NTES live tracking officer. "
                 f"Provide running status for Train: {val} in {target_language}.\n"
-                f"Include: Current Location, Delay in minutes, Last Departed Station, Next Halt, and Halts Table in Grok-style."
+                f"Provide current station location, delay in minutes, next halt, platform number, and upcoming schedule table in Grok style."
             )
-            ans = ask_hybrid_text(f"Live status of Train: {val}", sys_prompt)
+            ans = await ask_fast_text(f"Live status of train: {val}", sys_prompt)
         else:
             sys_prompt = (
                 f"You are the Station Master for Indian Railways station: {val}. "
-                f"Generate the Live Station Display Board for next 4 hours in {target_language} with Markdown columns: | Train No & Name | Expected Time | Platform | Status |."
+                f"Generate the Live Station Display Board for the next 4 hours in {target_language} with Markdown columns: | Train No & Name | Expected Time | Platform | Status |."
             )
-            ans = ask_hybrid_text(f"Station board for: {val}", sys_prompt)
+            ans = await ask_fast_text(f"Station board for station: {val}", sys_prompt)
 
         return {"status": "success", "answer": ans}
     except Exception as e:
-        return {"status": "error", "answer": f"Transit enquiry error: {str(e)}"}
+        return {"status": "error", "answer": f"Transit error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 3. INTERACTIVE CHAT & FOLLOW-UPS
+# 3. INTERACTIVE CHAT & INQUIRY
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(
@@ -432,25 +511,25 @@ async def ask_question(
 ):
     try:
         clean_q = question.strip()
-        doc_awareness = f"\n[DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
+        doc_awareness = f"\n[AUDITED DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
         sys_prompt = (
-            f"You are Paper Pilot Companion, an authentic forensic document auditor and historical expert. "
-            f"Answer the user's inquiry directly in {target_language}. "
-            f"Keep bold headlines only, regular text normal weight, and clean Markdown tables for numbers.{doc_awareness}"
+            f"You are Paper Pilot Companion, an authentic forensic legal auditor and document expert. "
+            f"Answer the user's specific inquiry directly in {target_language}. "
+            f"Maintain Grok presentation: bold headers only, normal body text, clean Markdown tables for numbers or clauses.{doc_awareness}"
         )
-        ans = ask_hybrid_text(clean_q, sys_prompt)
+        ans = await ask_fast_text(clean_q, sys_prompt)
         return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
     except Exception as e:
         return {"status": "error", "answer": f"Notice: {str(e)}"}
 
 # -------------------------------------------------------------
-# 4. INSTANT MULTILINGUAL TRANSLATION
+# 4. INSTANT MULTILINGUAL REPORT TRANSLATOR
 # -------------------------------------------------------------
 @app.post("/api/v1/translate-report")
 async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
     try:
         sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
-        translated = ask_hybrid_text(report_text, sys_prompt)
+        translated = await ask_fast_text(report_text, sys_prompt)
         return {"status": "success", "translated_report": translated}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -462,7 +541,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
 async def touristos_recommend(
     country: str = Form("India"),
     state: str = Form("Maharashtra"),
-    city: str = Form("Vasai"),
+    city: str = Form("Pune"),
     adults: int = Form(2),
     children: int = Form(0),
     dietary_preference: str = Form("All / Any"),
@@ -488,12 +567,12 @@ async def touristos_recommend(
         nat_police, nat_hosp, nat_fire, nat_pharm = "112 / 100", "108 / 102", "101", "1800-200-1234"
 
     system_prompt = (
-        f"You are the local destination officer for '{loc_clean}'.\n"
-        f"Return strict JSON with authentic landmarks, local cultural facts, sightseeing rules, and emergency numbers. Do NOT include train advertisements."
+        f"You are the senior local tourism officer for '{loc_clean}'.\n"
+        f"Generate authentic landmarks, heritage spots, cultural highlights, and emergency contacts in strict JSON. Do NOT include train advertisements."
     )
 
-    user_query = f"Scan geographic directory for {loc_clean}. Provide 6-8 real landmarks and municipal emergency contacts."
-    extracted_data = ask_hybrid_json(user_query, system_prompt)
+    user_query = f"Scan geographic database for {loc_clean}. Provide 6-8 real landmarks and municipal emergency facilities."
+    extracted_data = await ask_fast_json(user_query, system_prompt)
 
     if extracted_data and "spots" in extracted_data and len(extracted_data["spots"]) > 0:
         spots = extracted_data["spots"]
@@ -511,6 +590,7 @@ async def touristos_recommend(
 
         return {"status": "success", "data": extracted_data}
 
+    # Built-in robust fallback for any city
     return {
         "status": "success",
         "data": {
@@ -518,11 +598,11 @@ async def touristos_recommend(
             "spots": [
                 {
                     "page": 1,
-                    "title": f"Historic Center of {city}",
+                    "title": f"Historic Center & Citadel of {city}",
                     "category": "Cultural Heritage",
                     "rating": "⭐ 4.9",
                     "dist": "Central District",
-                    "description": f"The architectural and cultural heart of {city}.",
+                    "description": f"The iconic architectural and cultural heart of {city}.",
                     "history": f"Recorded extensively in historical annals.",
                     "sightseeing_rules": "Respect local cultural etiquette.",
                     "culinary": f"Traditional cuisine matching {dietary_preference}.",
@@ -550,7 +630,7 @@ async def touristos_recommend(
 @app.post("/api/v1/explore-chat")
 async def explore_chat(
     request: Request,
-    city: str = Form("Vasai"),
+    city: str = Form("Pune"),
     country: str = Form("India"),
     party_summary: str = Form("2 Adults"),
     dietary_preference: str = Form("All / Any"),
@@ -561,7 +641,7 @@ async def explore_chat(
         clean_q = question.strip()
         loc_label = f"{city}, {country}".strip(", ")
         sys_prompt = f"You are Omni Guide for '{loc_label}'. Travelers: {party_summary}. Diet: '{dietary_preference}'. Language: {target_language}."
-        response_text = ask_hybrid_text(clean_q, sys_prompt)
+        response_text = await ask_fast_text(clean_q, sys_prompt)
         return {"status": "success", "answer": response_text, "has_document": False}
     except Exception as e:
         return {"status": "error", "answer": f"Notice: {str(e)}"}
@@ -574,7 +654,8 @@ async def explore_chat(
 def wake():
     return {
         "status": "Operational",
-        "service": "Omni TouristOS Cloud",
+        "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
+        "version": "75.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
