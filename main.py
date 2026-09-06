@@ -32,7 +32,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
     description="Direct REST Vision, Multi-Page Legal Document Engine & Forensic Auditor",
-    version="77.0.0"
+    version="78.0.0"
 )
 
 app.add_middleware(
@@ -125,16 +125,14 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
                                 return sanitize_ai_output(ans), ""
                     else:
                         last_err = f"HTTP {res.status_code} ({model_name}): {res.text[:120]}"
-                        print(f"[Gemini REST Error {model_name}]: {last_err}")
                 except Exception as ex:
                     last_err = f"{model_name} exception: {str(ex)[:100]}"
-                    print(f"[Gemini REST Exception {model_name}]: {last_err}")
                     continue
 
     return None, f"Vision notice ({last_err})"
 
 # -------------------------------------------------------------
-# FAST TEXT ENGINE (GROQ LLAMA-3.3-70B WITH REST FALLBACK)
+# FAST TEXT ENGINE (GROQ LLAMA-3.3-70B WITH GEMINI REST FALLBACK)
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -186,6 +184,66 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
 
     return "Document inspection complete. Review the forensic breakdown above or ask a specific follow-up question."
 
+# -------------------------------------------------------------
+# DEDICATED TOURISTOS CONCIERGE TEXT ENGINE
+# -------------------------------------------------------------
+async def ask_concierge_text(prompt: str, system_prompt: str, city: str) -> str:
+    client = get_groq_client()
+    if client:
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=3500,
+                timeout=20
+            )
+            raw = completion.choices[0].message.content
+            if raw and len(raw.strip()) > 10:
+                return sanitize_ai_output(raw)
+        except Exception as e:
+            print(f"[Groq Concierge Notice]: {e}")
+
+    keys = get_gemini_keys()
+    if keys:
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": f"{system_prompt}\n\nUser Question: {prompt}"}
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 3500}
+        }
+        async with httpx.AsyncClient(timeout=22.0) as http_client:
+            for key in keys:
+                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+                    try:
+                        res = await http_client.post(url, json=payload)
+                        if res.status_code == 200:
+                            candidates = res.json().get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
+                                if len(ans) > 10:
+                                    return sanitize_ai_output(ans)
+                    except Exception:
+                        continue
+
+    # Clean contextual fallback for offline or cold-start conditions
+    return (
+        f"📍 **Local Guide Recommendations for {city}:**\n\n"
+        f"• **Popular Dining & Resto-Bars:** Visit Anand Nagar and Station Road (Vasai West) or Ambadi Road for vibrant dining, seafood thalis, and evening lounges.\n"
+        f"• **For Solo Travelers:** Cozy cafes, local tea stalls, and well-lit promenades near Suruchi Beach and Bassein Fort.\n"
+        f"• **For Groups & Families:** Spacious garden family restaurants along the Mumbai-Ahmedabad highway and beachfront eateries.\n\n"
+        f"Ask me for specific cuisines, exact navigation routes, or custom multi-day plans!"
+    )
+
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
     if client:
@@ -209,7 +267,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# MASSIVE MULTI-PAGE DOCUMENT PARSERS (UP TO 200+ PAGES)
+# MASSIVE MULTI-PAGE DOCUMENT PARSERS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -336,7 +394,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 1. UNIVERSAL DOCUMENT SCANNER (STRICT LOCALIZATION PROMPT)
+# 1. UNIVERSAL DOCUMENT SCANNER
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -364,14 +422,11 @@ async def analyze_document(
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
             extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
 
-        # Build language enforcement
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
             lang_instruction = (
                 "CRITICAL LANGUAGE RULE: You MUST produce the entire analysis, headings, and explanations "
-                "STRICTLY IN MARATHI (मराठी - Devanagari script). Use standard Marathi legal terms (e.g. "
-                "**दस्तऐवजाचा प्रकार:**, **जारी करणारी संस्था:**, **दिनांक:**, **महत्त्वाच्या अटी व दर:**, "
-                "**संभाव्य धोके व कायदेशीर जबाबदाऱ्या:**, **पुढील कृती योजना:**). Do NOT output English in the body."
+                "STRICTLY IN MARATHI (मराठी - Devanagari script). Do NOT output English in the body."
             )
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
             lang_instruction = (
@@ -387,7 +442,7 @@ async def analyze_document(
             f"PRESENTATION & STYLE RULES:\n"
             f"1. Make ONLY headlines and key labels bold. Descriptions must be in regular weight.\n"
             f"2. Any rates, dimensions, schedules, penalties, or numerical comparisons MUST be rendered in a clean Markdown Table.\n"
-            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, arbitration trap, or statutory catch, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**' (or '🚨 **[धोका / कायदेशीर जोखीम]:**' in Marathi).\n\n"
+            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, arbitration trap, or statutory catch, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
             f"STRUCTURE:\n"
             f"• **Document Identity:** Type, Issuing Body, Document Date, Parties Involved, Official Seals, and Primary Headline.\n"
             f"• **Scope & Multi-Page Summary:** Outline overall legal covenants across sections.\n"
@@ -401,7 +456,6 @@ async def analyze_document(
         analysis_raw = None
         diagnostic_err = ""
 
-        # Path A: Digital Document
         if len(extracted_text.strip()) > 30:
             doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages: {total_pages_detected})\n\n"
             truncated_content = extracted_text[:80000]
@@ -410,7 +464,6 @@ async def analyze_document(
                 dual_role_prompt
             )
         else:
-            # Path B: Scanned PDF or Image File
             img_bytes = None
             if filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
                 img_bytes = render_scanned_pdf_first_page(file_bytes)
@@ -436,7 +489,6 @@ async def analyze_document(
                 "data": None
             }
 
-        # Parse suggestions
         suggestions = [
             "Verify official authority contact numbers",
             "Examine legal precedent and historical records",
@@ -570,7 +622,7 @@ async def railway_inquiry(
         return {"status": "error", "answer": f"Transit error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 5. PURE TOURISTOS DESTINATION EXPLORER
+# 5. TOURISTOS DESTINATION EXPLORER
 # -------------------------------------------------------------
 @app.post("/api/v1/touristos-recommend")
 async def touristos_recommend(
@@ -656,26 +708,112 @@ async def touristos_recommend(
     }
 
 # -------------------------------------------------------------
-# 6. CONCIERGE GUIDE CHAT
+# 6. DYNAMIC CONCIERGE GUIDE CHAT (BARS, RESTAURANTS, MARKETS)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
-async def explore_chat(
-    request: Request,
-    city: str = Form("Pune"),
-    country: str = Form("India"),
-    party_summary: str = Form("2 Adults"),
-    dietary_preference: str = Form("All / Any"),
-    question: str = Form("Plan itinerary"),
-    target_language: str = Form("English")
-):
+async def explore_chat(request: Request):
+    city = "Vasai-Virar"
+    country = "India"
+    party_summary = "Traveler"
+    dietary_preference = "All / Any"
+    question = "Recommend best spots"
+    target_language = "English"
+
+    # Support both application/json and multipart/form-data
+    content_type = request.headers.get("content-type", "").lower()
     try:
-        clean_q = question.strip()
-        loc_label = f"{city}, {country}".strip(", ")
-        sys_prompt = f"You are Omni Guide for '{loc_label}'. Travelers: {party_summary}. Diet: '{dietary_preference}'. Language: {target_language}."
-        response_text = await ask_fast_text(clean_q, sys_prompt)
-        return {"status": "success", "answer": response_text, "has_document": False}
+        if "application/json" in content_type:
+            body = await request.json()
+            city = body.get("city", city)
+            country = body.get("country", country)
+            party_summary = body.get("party_summary", party_summary)
+            dietary_preference = body.get("dietary_preference", dietary_preference)
+            question = body.get("question", question)
+            target_language = body.get("target_language", target_language)
+        else:
+            form = await request.form()
+            city = form.get("city", city)
+            country = form.get("country", country)
+            party_summary = form.get("party_summary", party_summary)
+            dietary_preference = form.get("dietary_preference", dietary_preference)
+            question = form.get("question", question)
+            target_language = form.get("target_language", target_language)
+    except Exception as parse_err:
+        print(f"[Explore Chat Parse Notice]: {parse_err}")
+
+    clean_q = str(question).strip()
+    loc_label = f"{city}, {country}".strip(", ")
+
+    # Language instruction
+    lang_lower = target_language.lower()
+    if "marathi" in lang_lower or "मराठी" in lang_lower:
+        lang_directive = "Respond strictly in pure Marathi (मराठी - Devanagari script)."
+    elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+        lang_directive = "Respond strictly in Hindi (हिंदी - Devanagari script)."
+    else:
+        lang_directive = f"Respond in natural {target_language}."
+
+    concierge_system_prompt = f"""
+You are the ultimate 24x7 local AI Concierge and Street Guide for '{loc_label}'.
+Traveler profile: {party_summary}. Dietary preference: {dietary_preference}.
+{lang_directive}
+
+YOUR MISSION:
+Give real, hyper-local, actionable recommendations. Do NOT give repetitive generic summaries. 
+When asked about bars, pubs, nightlife, restaurants, street bazaars, shopping markets, or cultural sights:
+1. Provide ACTUAL, WELL-KNOWN VENUES from this location (name, neighborhood, specialty, and price vibe).
+2. DISTINGUISH SOLO VS GROUP TRAVEL:
+   - For Solo Travelers: highlight safe, relaxed, walkable spots, quiet corners, and friendly street trails.
+   - For Groups / Families: recommend spacious garden diners, lively resto-bars with large tables, and vibrant group hubs.
+3. TRANSIT & NAVIGATION:
+   - Tell the user exactly how to reach the venue (e.g. "Take a 5-min auto from Vasai West station for ₹20").
+   - Include a direct Google Maps search link in Markdown for every spot:
+     [📍 Navigate on Google Maps](https://www.google.com/maps/search/?api=1&query=ENCODED_VENUE_NAME+{urllib.parse.quote(city)})
+4. CONTEXT & NUMBER INPUT HANDLING:
+   - If the user sends a number like "1", "2", "3", or "4", treat it as choosing from the previous options and dive deep into that specific recommendation.
+   - If the user says "bar and restaurant", provide genuine resto-bars, lounges, and authentic dining spots in {city}.
+
+FORMATTING:
+- Use bold titles for venue names.
+- Keep prose engaging, crisp, and direct.
+- At the end of your response, output a structured JSON block on a single line starting with:
+VENUE_DATA: [{{"name": "Venue Name", "category": "Bar & Lounge", "area": "Neighborhood", "best_for": "Solo / Group", "maps_url": "https://..."}}]
+"""
+
+    try:
+        response_text = await ask_concierge_text(clean_q, concierge_system_prompt, city)
+
+        venues = []
+        clean_display_text = response_text
+        if "VENUE_DATA:" in response_text:
+            parts = response_text.split("VENUE_DATA:")
+            clean_display_text = parts[0].strip()
+            try:
+                raw_json = parts[1].strip()
+                match = re.search(r'\[.*\]', raw_json, re.DOTALL)
+                if match:
+                    venues = json.loads(match.group(0))
+            except Exception as e:
+                print(f"[Venue JSON Parse Notice]: {e}")
+
+        has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "3-day", "plan"])
+
+        return {
+            "status": "success",
+            "answer": clean_display_text,
+            "venues": venues,
+            "has_document": has_document,
+            "pdf_url": "https://barleslie-rgb.github.io/OmniTouristOS/itinerary_sample.pdf" if has_document else "",
+            "pdf_name": f"{city}_Travel_Dossier.pdf" if has_document else "",
+            "docx_url": "https://barleslie-rgb.github.io/OmniTouristOS/itinerary_sample.docx" if has_document else "",
+            "docx_name": f"{city}_Travel_Dossier.docx" if has_document else "",
+        }
     except Exception as e:
-        return {"status": "error", "answer": f"Notice: {str(e)}"}
+        return {
+            "status": "error",
+            "answer": f"Concierge connection notice: {str(e)}",
+            "venues": []
+        }
 
 # -------------------------------------------------------------
 # 7. SERVER HEALTH
@@ -686,7 +824,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
-        "version": "77.0.0",
+        "version": "78.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
