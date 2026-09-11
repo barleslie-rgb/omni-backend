@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, Request, Query
+from fastapi import FastAPI, UploadFile, File, Form, Request, Query, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -32,14 +32,14 @@ except ImportError:
     PdfReader = None
 
 try:
-    import pypdfium2 as pdfium
+    import pypdfium2 as pdfium# type: ignore
 except ImportError:
     pdfium = None
 
 app = FastAPI(
     title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
     description="Vision Legal Auditor, Bullion Engine, Indian Railways Transit & Global Explorer",
-    version="80.0.0"
+    version="80.1.0"
 )
 
 app.add_middleware(
@@ -175,7 +175,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
     models_to_try = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
-        "gemini-3.5-flash",
+        "gemini-2.0-flash",
     ]
 
     async with httpx.AsyncClient(timeout=35.0) as client:
@@ -238,7 +238,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
         }
         async with httpx.AsyncClient(timeout=20.0) as http_client:
             for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
+                for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
                     try:
                         res = await http_client.post(url, json=payload)
@@ -287,7 +287,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, city: str) -> str:
         }
         async with httpx.AsyncClient(timeout=22.0) as http_client:
             for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
+                for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
                     try:
                         res = await http_client.post(url, json=payload)
@@ -340,7 +340,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
         }
         async with httpx.AsyncClient(timeout=22.0) as http_client:
             for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
+                for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
                     try:
                         res = await http_client.post(url, json=payload)
@@ -361,7 +361,6 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {"User-Agent": "OmniTouristOS/2.0 (traveler.support@omni.app)"}
     
-    # Strip redundant city name from landmark query to prevent search ambiguity
     clean_name = re.sub(rf"(?i)\b{re.escape(city)}\b", "", landmark_name).strip(" -:,")
     search_queries = [
         clean_name,
@@ -374,7 +373,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         if not q or len(q.strip()) < 3:
             continue
         try:
-            # 1. Query Wikipedia Page Summary API for verified thumbnail/original image
             page_slug = urllib.parse.quote(q.strip().replace(" ", "_"))
             sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{page_slug}"
             r = requests.get(sum_url, headers=headers, timeout=4.0)
@@ -386,7 +384,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                     thumb = p_data["thumbnail"]["source"]
                     return re.sub(r'/\d+px-', '/1000px-', thumb)
 
-            # 2. Query Wikimedia search API as backup
             query_url = (
                 f"https://en.wikipedia.org/w/api.php?action=query&generator=search"
                 f"&gsrsearch={urllib.parse.quote(q.strip())}&gsrlimit=1&prop=pageimages"
@@ -403,7 +400,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    # Fallback to authentic Maharashtra coastal fortress/sanctuary photo
     return "https://images.unsplash.com/photo-1590073844006-33379778ae09?auto=format&fit=crop&w=1200&q=80"
 
 # -------------------------------------------------------------
@@ -534,7 +530,88 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 8. FORENSIC LEGAL AUDITOR ENDPOINTS
+# 8. AUTHENTICATION & ACCESS ENDPOINTS
+# -------------------------------------------------------------
+@app.post("/api/v1/auth/login")
+async def auth_login(request: Request):
+    try:
+        email, password = "", ""
+        content_type = request.headers.get("content-type", "").lower()
+        if "application/json" in content_type:
+            body = await request.json()
+            email = str(body.get("email", "")).strip().lower()
+            password = str(body.get("password", "")).strip()
+        else:
+            form = await request.form()
+            email = str(form.get("email", "")).strip().lower()
+            password = str(form.get("password", "")).strip()
+
+        if not email or len(password) < 6:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Valid email and 6+ character password required."
+            )
+
+        user_id = f"usr_{abs(hash(email))}"
+        name = email.split("@")[0].capitalize()
+        token = f"omni_sec_{uuid.uuid4().hex}"
+
+        return {
+            "status": "success",
+            "message": "Authenticated successfully",
+            "user_id": user_id,
+            "email": email,
+            "name": name,
+            "token": token,
+            "role": "user"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"status": "error", "message": f"Auth error: {str(e)}"}
+
+@app.post("/api/v1/auth/signup")
+async def auth_signup(request: Request):
+    try:
+        name, email, password = "", "", ""
+        content_type = request.headers.get("content-type", "").lower()
+        if "application/json" in content_type:
+            body = await request.json()
+            name = str(body.get("name", "")).strip()
+            email = str(body.get("email", "")).strip().lower()
+            password = str(body.get("password", "")).strip()
+        else:
+            form = await request.form()
+            name = str(form.get("name", "")).strip()
+            email = str(form.get("email", "")).strip().lower()
+            password = str(form.get("password", "")).strip()
+
+        if not email or len(password) < 6:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Valid email and 6+ character password required."
+            )
+
+        user_id = f"usr_{abs(hash(email))}"
+        display_name = name if name else email.split("@")[0].capitalize()
+        token = f"omni_sec_{uuid.uuid4().hex}"
+
+        return {
+            "status": "success",
+            "message": "Account provisioned successfully",
+            "user_id": user_id,
+            "email": email,
+            "name": display_name,
+            "token": token,
+            "role": "user"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"status": "error", "message": f"Registration error: {str(e)}"}
+
+# -------------------------------------------------------------
+# 9. FORENSIC LEGAL AUDITOR ENDPOINTS
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -712,7 +789,7 @@ async def ask_question(
         sys_prompt = (
             f"You are Paper Pilot Companion, an authentic forensic legal auditor. "
             f"{lang_rule} "
-            f"Maintain Grok presentation: bold headers only, normal body text, clean Markdown tables for numbers or clauses.{doc_awareness}"
+            f"Maintain clean presentation: bold headers only, normal body text, clean Markdown tables for numbers or clauses.{doc_awareness}"
         )
         ans = await ask_fast_text(clean_q, sys_prompt)
         return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
@@ -720,7 +797,7 @@ async def ask_question(
         return {"status": "error", "answer": f"Notice: {str(e)}"}
 
 # -------------------------------------------------------------
-# 9. STANDALONE INDIAN RAILWAYS TRANSIT API
+# 10. STANDALONE INDIAN RAILWAYS TRANSIT API
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(
@@ -734,14 +811,14 @@ async def railway_inquiry(
             sys_prompt = (
                 f"You are the Indian Railways CRIS PNR Enquiry officer. "
                 f"Break down the status of PNR: {val} in {target_language}.\n"
-                f"Include Train Name, Number, Journey Date, Class, Boarding/Destination, Booking Status vs Current Status (CNF/WL/RAC), and Chart Status in a clean Grok Markdown table."
+                f"Include Train Name, Number, Journey Date, Class, Boarding/Destination, Booking Status vs Current Status (CNF/WL/RAC), and Chart Status in a clean Markdown table."
             )
             ans = await ask_fast_text(f"PNR Status inquiry: {val}", sys_prompt)
         elif query_type == "live_train":
             sys_prompt = (
                 f"You are the Indian Railways NTES live tracking officer. "
                 f"Provide running status for Train: {val} in {target_language}.\n"
-                f"Provide current station location, delay in minutes, next halt, platform number, and upcoming schedule table in Grok style."
+                f"Provide current station location, delay in minutes, next halt, platform number, and upcoming schedule table."
             )
             ans = await ask_fast_text(f"Live status of train: {val}", sys_prompt)
         else:
@@ -756,7 +833,7 @@ async def railway_inquiry(
         return {"status": "error", "answer": f"Transit error: {str(e)}"}
 
 # -------------------------------------------------------------
-# 10. FILE CONVERTER ENDPOINT (FOR CONVERTER STUDIO)
+# 11. FILE CONVERTER ENDPOINT (FOR CONVERTER STUDIO)
 # -------------------------------------------------------------
 @app.post("/api/v1/convert-file")
 async def convert_file(
@@ -781,7 +858,7 @@ async def convert_file(
         return {"status": "error", "message": f"Conversion failure: {str(e)}"}
 
 # -------------------------------------------------------------
-# 11. TOURISTOS GLOBAL DESTINATION EXPLORER ENDPOINT
+# 12. TOURISTOS GLOBAL DESTINATION EXPLORER ENDPOINT
 # -------------------------------------------------------------
 
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
@@ -926,7 +1003,6 @@ async def explore_city(request: Request):
 
     loc_slug = city.lower().replace(" ", "-").strip()
 
-    # Use ground truth if available; otherwise use dynamic AI with strict rules
     if loc_slug in REGIONAL_ANCHORS:
         anchor = REGIONAL_ANCHORS[loc_slug]
         data = {
@@ -990,7 +1066,6 @@ Provide 6 to 10 genuine landmarks in the 'heritage' array.
 """
         data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
 
-    # Attach verified Wikipedia high-res photographs
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
             s_name = spot.get("name", "")
@@ -999,7 +1074,7 @@ Provide 6 to 10 genuine landmarks in the 'heritage' array.
     return data
 
 # -------------------------------------------------------------
-# 12. EXPLORE-CHAT ROUTE
+# 13. EXPLORE-CHAT ROUTE
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1054,7 +1129,7 @@ Respond directly with real, authentic recommendations.
     }
 
 # -------------------------------------------------------------
-# 13. SERVER HEALTH & STATUS
+# 14. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1062,7 +1137,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
-        "version": "80.0.0",
+        "version": "80.1.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
