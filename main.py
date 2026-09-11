@@ -32,14 +32,14 @@ except ImportError:
     PdfReader = None
 
 try:
-    import pypdfium2 as pdfium# type: ignore
+    import pypdfium2 as pdfium  # type: ignore
 except ImportError:
     pdfium = None
 
 app = FastAPI(
     title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
     description="Vision Legal Auditor, Bullion Engine, Indian Railways Transit & Global Explorer",
-    version="80.1.0"
+    version="80.2.0"
 )
 
 app.add_middleware(
@@ -252,61 +252,112 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     except Exception:
                         continue
 
-    return "Document inspection complete. Review the forensic breakdown above or ask a specific follow-up question."
+    return "Information compiled successfully. Please review the structured breakdown above."
 
 # -------------------------------------------------------------
-# 5. DEDICATED TOURISTOS CONCIERGE TEXT ENGINE
+# 5. UNIVERSAL TRAVEL CONCIERGE & ADVISOR ENGINE
 # -------------------------------------------------------------
-async def ask_concierge_text(prompt: str, system_prompt: str, city: str) -> str:
+async def ask_universal_travel_guide(
+    prompt: str,
+    active_city: str,
+    target_language: str = "English",
+    chat_history: Optional[List[Dict[str, str]]] = None
+) -> str:
     client = get_groq_client()
+
+    lang_lower = target_language.lower()
+    if "marathi" in lang_lower or "मराठी" in lang_lower:
+        lang_rule = "Respond strictly in fluent, natural Marathi (मराठी - Devanagari script)."
+    elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+        lang_rule = "Respond strictly in fluent, natural Hindi (हिंदी - Devanagari script)."
+    elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
+        lang_rule = "Respond strictly in fluent Gujarati (ગુજરાતી script)."
+    else:
+        lang_rule = f"Respond in clear, polished {target_language}."
+
+    system_prompt = f"""
+You are the authoritative Omni Universal Travel Concierge, Itinerary Architect, and Ground Intelligence Guide.
+{lang_rule}
+
+CORE INTELLIGENCE DIRECTIVES:
+1. ADAPT TO ANY DESTINATION WORLDWIDE: The traveler is currently anchored around {active_city}, but they can ask about ANY city, country, or route across the world (e.g., Tokyo, Paris, Dubai, Goa, Switzerland, Ladakh, or local hidden spots). Seamlessly guide them wherever they request.
+2. GROK-STYLE PRESENTATION:
+   - Make primary section titles bold.
+   - Use structured bullet points and clean Markdown Tables for costs, hotel tiers, day-wise itineraries, or transit fares.
+   - Do NOT output wall-of-text paragraphs. Keep it legible, high-contrast, and actionable.
+3. COMPREHENSIVE ITINERARY & TRIP ARCHITECTURE (Include when asked for plans or recommendations):
+   - 📍 Must-Visit Highlights (Clustered geographically to prevent travel fatigue)
+   - 🍲 Authentic Local Food & Iconic Spots (Street eats to legendary diners)
+   - 🏨 Stay Recommendations by Budget:
+     * Budget / Hostel / Guesthouse
+     * Mid-Range / Boutique
+     * Luxury / Premium Resort
+   - 🚇 Transit & Navigation: Metro lines, passes, trains, local autos, and fare hacks.
+   - ⚠️ Warnings & Scam Alerts: Common local tourist traps, overcharging spots, safety, and dress etiquette.
+   - ☀️ Season & Weather: Best months to visit, current season traits, and typical temperatures.
+   - 🤝 Recommended Travel Agencies / Tour Operators: Name reputable, verified operators, local guides, or official tourism boards.
+4. BUDGET ADVISORY:
+   - When a specific budget is provided, tailor all hotel, food, and transit choices to that exact amount.
+   - If the user hasn't specified their budget, provide estimated costs across 3 tiers (Budget, Moderate, Luxury) and prompt them to confirm their budget.
+"""
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+
+    if chat_history and isinstance(chat_history, list):
+        for msg in chat_history[-6:]:
+            role = "user" if msg.get("role") == "user" else "assistant"
+            content = msg.get("text") or msg.get("content") or ""
+            if content:
+                messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": prompt})
+
     if client:
         for model_id in ["llama-3.1-70b-versatile", "llama-3.1-8b-instant"]:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
+                    messages=messages,
                     temperature=0.3,
-                    max_tokens=3500,
-                    timeout=20
+                    max_tokens=3800,
+                    timeout=22
                 )
                 raw = completion.choices[0].message.content
-                if raw and len(raw.strip()) > 10:
+                if raw and len(raw.strip()) > 20:
                     return sanitize_ai_output(raw)
             except Exception as e:
-                print(f"[Groq Concierge Notice with {model_id}]: {e}")
+                print(f"[Groq Concierge Error {model_id}]: {e}")
                 continue
 
     keys = get_gemini_keys()
     if keys:
-        payload = {
+        gemini_payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Question: {prompt}"}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 3500}
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 3800}
         }
-        async with httpx.AsyncClient(timeout=22.0) as http_client:
+        async with httpx.AsyncClient(timeout=24.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
                     try:
-                        res = await http_client.post(url, json=payload)
+                        res = await http_client.post(url, json=gemini_payload)
                         if res.status_code == 200:
                             candidates = res.json().get("candidates", [])
                             if candidates:
                                 parts = candidates[0].get("content", {}).get("parts", [])
                                 ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                                if len(ans) > 10:
+                                if len(ans) > 20:
                                     return sanitize_ai_output(ans)
                     except Exception:
                         continue
 
     return (
-        f"📍 **Local Guide Recommendations for {city}:**\n\n"
-        f"• **Popular Dining & Resto-Bars:** Visit central dining strips for authentic culinary specialties.\n"
-        f"• **For Solo Travelers:** Walkable routes, tea spots, and historical highlights.\n"
-        f"• **For Groups & Families:** Spacious garden family restaurants and scenic promenades.\n\n"
-        f"Ask me for specific cuisines, exact navigation routes, or custom multi-day plans!"
+        f"📍 **Travel Advisory for Your Inquiry:**\n\n"
+        f"• **Highlights & Must-Visits:** Prioritize key landmarks during morning hours to avoid peak crowds.\n"
+        f"• **Dining & Local Flavors:** Seek busy culinary stalls with high local turnover for freshness.\n"
+        f"• **Hotels & Stay:** Look into transit-connected properties for easier daily mobility.\n"
+        f"• **Safety Tip:** Confirm taxi meter rates or app-based fares prior to departure.\n\n"
+        f"Tell me your target destination and budget, and I will build an optimized itinerary with costs."
     )
 
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
@@ -360,7 +411,6 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {"User-Agent": "OmniTouristOS/2.0 (traveler.support@omni.app)"}
-    
     clean_name = re.sub(rf"(?i)\b{re.escape(city)}\b", "", landmark_name).strip(" -:,")
     search_queries = [
         clean_name,
@@ -1074,48 +1124,45 @@ Provide 6 to 10 genuine landmarks in the 'heritage' array.
     return data
 
 # -------------------------------------------------------------
-# 13. EXPLORE-CHAT ROUTE
+# 13. EXPLORE-CHAT ROUTE (UNIVERSAL TRAVEL ADVISOR)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
     city = "Vasai-Virar"
-    country = "India"
-    party_summary = "Traveler"
-    dietary_preference = "All / Any"
-    question = "Recommend best spots"
+    question = "Plan an itinerary"
     target_language = "English"
+    chat_history = []
 
     content_type = request.headers.get("content-type", "").lower()
     try:
         if "application/json" in content_type:
             body = await request.json()
             city = body.get("city", city)
-            country = body.get("country", country)
-            party_summary = body.get("party_summary", party_summary)
-            dietary_preference = body.get("dietary_preference", dietary_preference)
             question = body.get("question", question)
             target_language = body.get("target_language", target_language)
+            chat_history = body.get("chat_history", [])
         else:
             form = await request.form()
             city = form.get("city", city)
-            country = form.get("country", country)
-            party_summary = form.get("party_summary", party_summary)
-            dietary_preference = form.get("dietary_preference", dietary_preference)
             question = form.get("question", question)
             target_language = form.get("target_language", target_language)
     except Exception:
         pass
 
     clean_q = str(question).strip()
-    loc_label = f"{city}, {country}".strip(", ")
+    
+    # Universal Travel Advisor Engine
+    ans = await ask_universal_travel_guide(
+        prompt=clean_q,
+        active_city=city,
+        target_language=target_language,
+        chat_history=chat_history
+    )
 
-    concierge_system_prompt = f"""
-You are the 24x7 local AI Concierge and Street Guide for '{loc_label}'.
-Traveler profile: {party_summary}. Dietary preference: {dietary_preference}.
-Respond directly with real, authentic recommendations.
-"""
-    ans = await ask_concierge_text(clean_q, concierge_system_prompt, city)
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "3-day", "plan"])
+    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "day", "plan", "export", "pdf", "docx"])
+
+    # Sanitize city label for file names
+    file_slug = re.sub(r'[^\w\-_]', '_', city)
 
     return {
         "status": "success",
@@ -1123,9 +1170,9 @@ Respond directly with real, authentic recommendations.
         "venues": [],
         "has_document": has_document,
         "pdf_url": "https://barleslie-rgb.github.io/OmniTouristOS/itinerary_sample.pdf" if has_document else "",
-        "pdf_name": f"{city}_Travel_Dossier.pdf" if has_document else "",
+        "pdf_name": f"{file_slug}_Travel_Dossier.pdf" if has_document else "",
         "docx_url": "https://barleslie-rgb.github.io/OmniTouristOS/itinerary_sample.docx" if has_document else "",
-        "docx_name": f"{city}_Travel_Dossier.docx" if has_document else "",
+        "docx_name": f"{file_slug}_Travel_Dossier.docx" if has_document else "",
     }
 
 # -------------------------------------------------------------
@@ -1137,7 +1184,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
-        "version": "80.1.0",
+        "version": "80.2.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
