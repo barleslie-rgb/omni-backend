@@ -39,7 +39,7 @@ except ImportError:
 app = FastAPI(
     title="Omni Paper Pilot Scanner & Unified Intelligence Cloud",
     description="Vision Legal Auditor, Bullion Engine, Indian Railways Transit & Global Explorer",
-    version="80.2.0"
+    version="80.3.0"
 )
 
 app.add_middleware(
@@ -55,7 +55,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 
 # -------------------------------------------------------------
-# 1. LIVE BULLION BENCHMARK ENGINE (WITH REGEX CLEANING)
+# 1. LIVE BULLION BENCHMARK ENGINE
 # -------------------------------------------------------------
 _bullion_cache = {
     "timestamp": 0,
@@ -174,7 +174,6 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
 
     models_to_try = [
         "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
         "gemini-2.0-flash",
     ]
 
@@ -206,12 +205,12 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
     return None, f"Vision notice ({last_err})"
 
 # -------------------------------------------------------------
-# 4. FAST TEXT ENGINE (GROQ LLAMA-3.1 WITH GEMINI REST FALLBACK)
+# 4. FAST TEXT ENGINE (GROQ LLAMA-3.3 WITH GEMINI REST FALLBACK)
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
     if client:
-        for model_id in ["llama-3.1-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
+        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
@@ -221,13 +220,13 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     ],
                     temperature=0.2,
                     max_tokens=4000,
-                    timeout=18
+                    timeout=20
                 )
                 raw = completion.choices[0].message.content
                 if raw and len(raw.strip()) > 10:
                     return sanitize_ai_output(raw)
             except Exception as e:
-                print(f"[Groq Text Notice with {model_id}]: {e}")
+                print(f"[Groq Text Error with {model_id}]: {e}")
                 continue
 
     keys = get_gemini_keys()
@@ -236,7 +235,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3500}
         }
-        async with httpx.AsyncClient(timeout=20.0) as http_client:
+        async with httpx.AsyncClient(timeout=22.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -249,7 +248,8 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                                 ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
                                 if len(ans) > 10:
                                     return sanitize_ai_output(ans)
-                    except Exception:
+                    except Exception as ex:
+                        print(f"[Gemini Text Error with {m}]: {ex}")
                         continue
 
     return "Information compiled successfully. Please review the structured breakdown above."
@@ -280,14 +280,14 @@ You are the authoritative Omni Universal Travel Concierge, Itinerary Architect, 
 {lang_rule}
 
 CORE INTELLIGENCE DIRECTIVES:
-1. ADAPT TO ANY DESTINATION WORLDWIDE: The traveler is currently anchored around {active_city}, but they can ask about ANY city, country, or route across the world (e.g., Tokyo, Paris, Dubai, Goa, Switzerland, Ladakh, or local hidden spots). Seamlessly guide them wherever they request.
+1. ADAPT TO ANY DESTINATION WORLDWIDE: The traveler is currently anchored around {active_city}, but they can ask about ANY city, region, or country across the world (e.g., Tokyo, Paris, Dubai, Goa, Switzerland, Ladakh, Vasai-Virar, or New York). Guide them specifically and authoritatively on whatever destination they inquire about.
 2. GROK-STYLE PRESENTATION:
-   - Make primary section titles bold.
+   - Make primary section titles bold with markdown headers (## or ###).
    - Use structured bullet points and clean Markdown Tables for costs, hotel tiers, day-wise itineraries, or transit fares.
-   - Do NOT output wall-of-text paragraphs. Keep it legible, high-contrast, and actionable.
-3. COMPREHENSIVE ITINERARY & TRIP ARCHITECTURE (Include when asked for plans or recommendations):
+   - Avoid generic fluff or wall-of-text paragraphs. Keep it high-contrast, specific, and actionable.
+3. COMPREHENSIVE TRIP ARCHITECTURE (Provide these dimensions whenever appropriate):
    - 📍 Must-Visit Highlights (Clustered geographically to prevent travel fatigue)
-   - 🍲 Authentic Local Food & Iconic Spots (Street eats to legendary diners)
+   - 🍲 Authentic Local Food & Iconic Spots (Specific dishes, names of local food streets/eateries)
    - 🏨 Stay Recommendations by Budget:
      * Budget / Hostel / Guesthouse
      * Mid-Range / Boutique
@@ -313,7 +313,7 @@ CORE INTELLIGENCE DIRECTIVES:
     messages.append({"role": "user", "content": prompt})
 
     if client:
-        for model_id in ["llama-3.1-70b-versatile", "llama-3.1-8b-instant"]:
+        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
@@ -326,7 +326,7 @@ CORE INTELLIGENCE DIRECTIVES:
                 if raw and len(raw.strip()) > 20:
                     return sanitize_ai_output(raw)
             except Exception as e:
-                print(f"[Groq Concierge Error {model_id}]: {e}")
+                print(f"[Groq Universal Guide Error {model_id}]: {e}")
                 continue
 
     keys = get_gemini_keys()
@@ -348,22 +348,23 @@ CORE INTELLIGENCE DIRECTIVES:
                                 ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
                                 if len(ans) > 20:
                                     return sanitize_ai_output(ans)
-                    except Exception:
+                    except Exception as ex:
+                        print(f"[Gemini Universal Guide Error {m}]: {ex}")
                         continue
 
     return (
-        f"📍 **Travel Advisory for Your Inquiry:**\n\n"
-        f"• **Highlights & Must-Visits:** Prioritize key landmarks during morning hours to avoid peak crowds.\n"
-        f"• **Dining & Local Flavors:** Seek busy culinary stalls with high local turnover for freshness.\n"
-        f"• **Hotels & Stay:** Look into transit-connected properties for easier daily mobility.\n"
-        f"• **Safety Tip:** Confirm taxi meter rates or app-based fares prior to departure.\n\n"
-        f"Tell me your target destination and budget, and I will build an optimized itinerary with costs."
+        f"### 📍 Travel Advisory for {active_city}\n\n"
+        f"• **Must-Visit Highlights:** Morning visits to primary landmarks ensure fewer crowds and better lighting.\n"
+        f"• **Authentic Food:** Choose busy dining hubs with high turnover for fresh local flavors.\n"
+        f"• **Hotels & Stay:** Select accommodation located near primary transit corridors for quick connectivity.\n"
+        f"• **Safety Tip:** Always confirm meter rates or ride-hailing fares before starting journeys.\n\n"
+        f"Please share your target destination and budget, and I will generate an optimized, cost-tailored plan."
     )
 
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
     if client:
-        for model_id in ["llama-3.1-70b-versatile", "llama-3.1-8b-instant"]:
+        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
@@ -450,7 +451,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    return "https://images.unsplash.com/photo-1590073844006-33379778ae09?auto=format&fit=crop&w=1200&q=80"
+    return "https://images.unsplash.com/photo-1488646953014-85cb44e25828?auto=format&fit=crop&w=1200&q=80"
 
 # -------------------------------------------------------------
 # 7. DOCUMENT PARSERS FOR EXCEL, WORD, PPTX & PDF
@@ -910,127 +911,6 @@ async def convert_file(
 # -------------------------------------------------------------
 # 12. TOURISTOS GLOBAL DESTINATION EXPLORER ENDPOINT
 # -------------------------------------------------------------
-
-REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
-    "vasai-virar": {
-        "tagline": "A historic coastal realm famed for Portuguese maritime fortresses, hilltop shrines, and peaceful beaches.",
-        "spots": [
-            {
-                "name": "Fort Vasai (Bassein Fort)",
-                "category": "Historic Bastion",
-                "rating": "4.8",
-                "detail": "Centuries-old Indo-Portuguese stone citadel featuring arched ruins, grand ramparts, and historic chapels overlooking Vasai Creek.",
-                "timing": "06:00 AM – 06:30 PM",
-                "entry": "Free Public Access",
-                "tips": "Wear comfortable walking shoes to explore the vast ramparts; carry drinking water.",
-                "best_transit": "Auto-Rickshaw / VVMT Bus from Vasai Railway Station",
-                "lat": 19.3308,
-                "lng": 72.8149
-            },
-            {
-                "name": "Jivdani Mata Temple",
-                "category": "Sacred Pilgrimage",
-                "rating": "4.9",
-                "detail": "Venerated hilltop shrine atop Jivdani Hill offering panoramic valley views, accessible by funicular ropeway and stone steps.",
-                "timing": "05:30 AM – 08:30 PM",
-                "entry": "Free Admission (Ropeway ticket chargeable)",
-                "tips": "Climb early in the morning to avoid midday heat and weekend pilgrimage queues.",
-                "best_transit": "Funicular Ropeway / Auto-Rickshaw from Virar East Station",
-                "lat": 19.4678,
-                "lng": 72.8256
-            },
-            {
-                "name": "Arnala Fort",
-                "category": "Maritime Fortress",
-                "rating": "4.7",
-                "detail": "Island fortress off the Arnala coast with solid bastions, stone elephant carvings, and an octagonal freshwater reservoir.",
-                "timing": "07:00 AM – 06:00 PM",
-                "entry": "Free Entry (Ferry fare approx. ₹20-₹30)",
-                "tips": "Check local boat ferry timings and tide schedules before heading across from Arnala wharf.",
-                "best_transit": "Local Ferry Boat from Arnala Beach, reachable by Auto from Virar West",
-                "lat": 19.4619,
-                "lng": 72.7303
-            },
-            {
-                "name": "Suruchi Beach",
-                "category": "Coastal Shoreline",
-                "rating": "4.6",
-                "detail": "Peaceful shoreline lined with dense Casuarina (Suru) groves, famed for tranquil sea breezes and evening sunsets.",
-                "timing": "Open 24 Hours",
-                "entry": "Free Public Access",
-                "tips": "Ideal for evening walks and photography; avoid venturing into deep water during high tide.",
-                "best_transit": "Auto-Rickshaw / Bicycle from Vasai West",
-                "lat": 19.3496,
-                "lng": 72.7842
-            },
-            {
-                "name": "Tungareshwar Wildlife Sanctuary & Shiva Temple",
-                "category": "Nature & Forest Sanctuary",
-                "rating": "4.7",
-                "detail": "Lush forested mountain corridor connecting to SGNP, featuring waterfalls, birdlife trails, and an ancient Shiva shrine.",
-                "timing": "06:00 AM – 06:00 PM",
-                "entry": "Forest Entry Fee Applicable",
-                "tips": "Stay on marked trails; carry insect repellent and ample drinking water for the uphill trek.",
-                "best_transit": "Auto-Rickshaw / Taxi from Vasai East highway junction",
-                "lat": 19.3871,
-                "lng": 72.9094
-            },
-            {
-                "name": "Vajreshwari Hot Springs & Temple",
-                "category": "Geothermal Sanctuary",
-                "rating": "4.6",
-                "detail": "Natural mineral-rich sulfur hot springs along the Tansa river valley, located near the ancient Vajreshwari Yogini temple.",
-                "timing": "06:00 AM – 07:00 PM",
-                "entry": "Free Admission",
-                "tips": "Test water temperature carefully before entering the bathing kunds.",
-                "best_transit": "MSRTC State Transport Bus / Shared Auto from Vasai Station",
-                "lat": 19.4912,
-                "lng": 73.0275
-            },
-            {
-                "name": "Bhuigaon Beach",
-                "category": "Tranquil Beach",
-                "rating": "4.6",
-                "detail": "Clean, secluded coastal stretch surrounded by palm plantations, perfect for quiet sunset strolls away from crowds.",
-                "timing": "Open 24 Hours",
-                "entry": "Free Public Access",
-                "tips": "Minimal commercial stalls; carry your own snacks and dispose of trash responsibly.",
-                "best_transit": "Auto-Rickshaw from Vasai Railway Station",
-                "lat": 19.3739,
-                "lng": 72.7758
-            },
-            {
-                "name": "St. Gonsalo Garcia Church, Ghas",
-                "category": "Sacred Architecture",
-                "rating": "4.7",
-                "detail": "Prominent Catholic church dedicated to India's first native saint, featuring classic Portuguese-influenced architecture.",
-                "timing": "06:30 AM – 07:00 PM",
-                "entry": "Free Admission",
-                "tips": "Maintain decorum and silence during religious services.",
-                "best_transit": "Auto-Rickshaw / VVMT Bus from Vasai West",
-                "lat": 19.3601,
-                "lng": 72.8058
-            }
-        ],
-        "flavours": [
-            {
-                "name": "Vasai Sukeli (Sun-Dried Bananas)",
-                "detail": "Traditional sweet dried Rajeli bananas, a GI-tagged local culinary specialty unique to Vasai-Virar."
-            },
-            {
-                "name": "Kupari Coastal Seafood & Fugiyas",
-                "detail": "Fresh Arabian Sea fish curry, bombil fry, and festive fried balloon breads (fugiyas) crafted by the indigenous East Indian community."
-            }
-        ],
-        "transit": {
-            "railway": "Western Railway Mumbai Suburban Network: Vasai Road (BSR) & Virar (VR) Stations",
-            "bus_depot": "VVMT (Vasai-Virar Municipal Transport) & MSRTC State Transport Depot",
-            "bus_depot_phone": "0250-2525105 / Municipal Helpline 1800-233-4353",
-            "auto_fares": "Regulated metered and share-rickshaw services available 24/7 across all station exits."
-        }
-    }
-}
-
 @app.post("/api/v1/explore-city")
 async def explore_city(request: Request):
     city = "Vasai-Virar"
@@ -1051,31 +931,15 @@ async def explore_city(request: Request):
     except Exception:
         pass
 
-    loc_slug = city.lower().replace(" ", "-").strip()
-
-    if loc_slug in REGIONAL_ANCHORS:
-        anchor = REGIONAL_ANCHORS[loc_slug]
-        data = {
-            "city": city,
-            "state": state,
-            "country": country,
-            "tagline": anchor["tagline"],
-            "pillars": {
-                "heritage": anchor["spots"],
-                "flavours": anchor["flavours"],
-                "transit": anchor["transit"]
-            }
-        }
-    else:
-        loc_label = f"{city}, {state}, {country}".strip(", ")
-        sys_prompt = f"""
+    loc_label = f"{city}, {state}, {country}".strip(", ")
+    sys_prompt = f"""
 You are the authoritative Global Tourism Concierge for '{loc_label}'.
 Output a JSON object ONLY without markdown backticks.
 
 CRITICAL RULES:
 1. ONLY include REAL, VERIFIABLE historical, architectural, or natural attractions that actually exist in {city}.
 2. DO NOT invent fake names like 'Citadel', 'Metropolitan Pier', or 'Spice Souk' unless that exact place exists.
-3. Transit must reflect real local transit (e.g., local trains, auto-rickshaws, buses), not imaginary trams or metros.
+3. Transit must reflect real local transit (e.g., local trains, subways, metro, auto-rickshaws, municipal buses).
 
 Format:
 {{
@@ -1083,6 +947,7 @@ Format:
   "state": "{state}",
   "country": "{country}",
   "tagline": "Compelling 1-sentence description of what makes {city} world-renowned.",
+  "traveler_advisory": "Practical advisory on best visiting hours, safety, and transit.",
   "pillars": {{
     "heritage": [
       {{
@@ -1093,7 +958,7 @@ Format:
         "timing": "09:00 AM – 06:00 PM",
         "entry": "Free Public Access or Admission Fee",
         "tips": "Practical tip on visiting hours or footwear.",
-        "best_transit": "Real transit mode",
+        "best_transport": "Real transit mode",
         "lat": 0.0,
         "lng": 0.0
       }}
@@ -1114,7 +979,7 @@ Format:
 }}
 Provide 6 to 10 genuine landmarks in the 'heritage' array.
 """
-        data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
+    data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
 
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
@@ -1159,7 +1024,7 @@ async def explore_chat(request: Request):
         chat_history=chat_history
     )
 
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "day", "plan", "export", "pdf", "docx"])
+    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "day", "plan", "export", "pdf", "docx", "budget"])
 
     # Sanitize city label for file names
     file_slug = re.sub(r'[^\w\-_]', '_', city)
@@ -1184,7 +1049,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni Paper Pilot Scanner & Unified Intelligence Cloud",
-        "version": "80.2.0",
+        "version": "80.3.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini": len(get_gemini_keys())
