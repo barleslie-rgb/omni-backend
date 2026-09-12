@@ -34,7 +34,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Forensic Auditor, Real Hotel Engine & Transit Cloud",
-    version="80.3.0"
+    version="80.4.0"
 )
 
 app.add_middleware(
@@ -250,7 +250,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     return "Response generated. Let me know if you would like deeper details on this."
 
 # -------------------------------------------------------------
-# 5. DEDICATED UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B)
+# 5. UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B)
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -324,7 +324,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
                     temperature=0.2,
                     max_tokens=4000,
                     response_format={"type": "json_object"},
-                    timeout=22
+                    timeout=24
                 )
                 raw = completion.choices[0].message.content
                 if raw:
@@ -339,7 +339,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
         }
-        async with httpx.AsyncClient(timeout=22.0) as http_client:
+        async with httpx.AsyncClient(timeout=24.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -360,48 +360,59 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
 # 6. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
-    headers = {"User-Agent": "OmniTouristOS/3.0 (verified.traveler@omni.app)"}
+    """
+    Fetches the authentic, curated lead image of any global attraction from Wikipedia/Wikimedia.
+    """
+    headers = {
+        "User-Agent": "OmniTouristOS/4.0 (contact: info@touristos.app) requests/2.31"
+    }
 
     clean_name = re.sub(r'\(.*?\)', '', landmark_name).strip()
-    clean_name = re.sub(rf"(?i)\b{re.escape(city)}\b", "", clean_name).strip(" -:,")
 
     search_candidates = [
-        f"{clean_name} {city}",
         clean_name,
+        f"{clean_name}, {city}",
         landmark_name,
     ]
 
-    for candidate in search_candidates:
-        if not candidate or len(candidate) < 3:
+    for cand in search_candidates:
+        if not cand or len(cand) < 2:
             continue
         try:
-            open_search_url = (
-                f"https://en.wikipedia.org/w/api.php?action=opensearch"
-                f"&search={urllib.parse.quote(candidate)}&limit=1&namespace=0&format=json"
-            )
-            r_search = requests.get(open_search_url, headers=headers, timeout=3.5)
-            if r_search.status_code == 200:
-                search_data = r_search.json()
-                titles = search_data[1] if len(search_data) > 1 else []
-                if titles:
-                    resolved_title = titles[0]
-                    page_slug = urllib.parse.quote(resolved_title.replace(" ", "_"))
-                    sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{page_slug}"
-                    r_sum = requests.get(sum_url, headers=headers, timeout=3.5)
-                    if r_sum.status_code == 200:
-                        p_data = r_sum.json()
-                        if "originalimage" in p_data and "source" in p_data["originalimage"]:
-                            return p_data["originalimage"]["source"]
-                        if "thumbnail" in p_data and "source" in p_data["thumbnail"]:
-                            thumb = p_data["thumbnail"]["source"]
-                            return re.sub(r'/\d+px-', '/1200px-', thumb)
+            # 1. Try direct Wikipedia REST summary endpoint
+            slug = cand.strip().replace(" ", "_")
+            sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(slug)}"
+            r_sum = requests.get(sum_url, headers=headers, timeout=4.0)
+            if r_sum.status_code == 200:
+                p_data = r_sum.json()
+                if "originalimage" in p_data and "source" in p_data["originalimage"]:
+                    return p_data["originalimage"]["source"]
+                if "thumbnail" in p_data and "source" in p_data["thumbnail"]:
+                    thumb = p_data["thumbnail"]["source"]
+                    return re.sub(r'/\d+px-', '/1200px-', thumb)
 
+            # 2. Search query via Opensearch to resolve exact page title
+            open_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(cand)}&limit=2&namespace=0&format=json"
+            r_open = requests.get(open_url, headers=headers, timeout=4.0)
+            if r_open.status_code == 200:
+                titles = r_open.json()[1] if len(r_open.json()) > 1 else []
+                for title in titles:
+                    title_slug = urllib.parse.quote(title.replace(" ", "_"))
+                    t_sum = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_slug}", headers=headers, timeout=4.0)
+                    if t_sum.status_code == 200:
+                        t_data = t_sum.json()
+                        if "originalimage" in t_data and "source" in t_data["originalimage"]:
+                            return t_data["originalimage"]["source"]
+                        if "thumbnail" in t_data and "source" in t_data["thumbnail"]:
+                            return re.sub(r'/\d+px-', '/1200px-', t_data["thumbnail"]["source"])
+
+            # 3. Direct Wikimedia Commons pageimages query
             query_url = (
                 f"https://en.wikipedia.org/w/api.php?action=query&generator=search"
-                f"&gsrsearch={urllib.parse.quote(candidate)}&gsrlimit=1&prop=pageimages"
+                f"&gsrsearch={urllib.parse.quote(cand)}&gsrlimit=1&prop=pageimages"
                 f"&piprop=original|thumbnail&pithumbsize=1200&format=json"
             )
-            rq = requests.get(query_url, headers=headers, timeout=3.5)
+            rq = requests.get(query_url, headers=headers, timeout=4.0)
             if rq.status_code == 200:
                 pages = rq.json().get("query", {}).get("pages", {})
                 for _, page in pages.items():
@@ -412,7 +423,8 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    return "https://images.unsplash.com/photo-1590073844006-33379778ae09?auto=format&fit=crop&w=1200&q=80"
+    # Clean generic fallback if Wikimedia has no entry
+    return ""
 
 # -------------------------------------------------------------
 # 7. DOCUMENT PARSERS (DOCX, PPTX, XLSX, PDF)
@@ -593,7 +605,6 @@ async def analyze_document(
             )
         else:
             img_bytes = prepare_image_bytes(file_bytes)
-
             if img_bytes:
                 analysis_raw, diagnostic_err = await call_gemini_rest_vision(
                     prompt=dual_role_prompt,
@@ -913,20 +924,26 @@ async def explore_city(request: Request):
 
     try:
         body = await request.json()
-        city = body.get("city", city).strip()
-        state = body.get("state", state).strip()
-        country = body.get("country", country).strip()
-        adults = body.get("adults", adults)
-        children = body.get("children", children)
-        language = body.get("language", language)
+        city = (body.get("city") or "").strip()
+        state = (body.get("state") or "").strip()
+        country = (body.get("country") or "").strip()
+        adults = body.get("adults", 2)
+        children = body.get("children", 0)
+        language = body.get("language", "English")
     except Exception:
         pass
 
-    loc_slug = city.lower().replace(" ", "-").replace(",", "").strip()
+    if not city:
+        city = "Vasai-Virar"
+    if not country:
+        country = "India"
 
-    is_vasai_virar = any(k in loc_slug for k in ["vasai", "virar", "bassein"])
+    city_clean = city.lower()
+    # Strict boundary check: only Vasai-Virar triggers the hardcoded anchor
+    is_vasai_virar = any(city_clean == name or city_clean.startswith(f"{name}-") or city_clean.startswith(f"{name} ")
+                         for name in ["vasai", "virar", "vasai-virar", "bassein"])
 
-    if is_vasai_virar:
+    if is_vasai_virar and ("india" in country.lower() or not country):
         anchor = REGIONAL_ANCHORS["vasai-virar"]
         data = {
             "city": "Vasai-Virar",
@@ -941,34 +958,34 @@ async def explore_city(request: Request):
             }
         }
     else:
-        loc_label = f"{city}, {state}, {country}".strip(", ")
+        loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
         sys_prompt = f"""
 You are the authoritative Global Tourism Concierge for '{loc_label}'.
-Output a JSON object ONLY without markdown backticks.
+Output a JSON object ONLY without markdown backticks or commentary.
 
-CRITICAL RULES:
-1. ONLY include REAL, VERIFIABLE attractions that genuinely exist in {city} (e.g. for Tokyo: Senso-ji, Tokyo Tower, Meiji Shrine; for Osaka: Osaka Castle, Dotonbori).
-2. DO NOT invent fictional names like 'Citadel & Ramparts' or 'Golden Sands Promenade'. Use the standard international English proper names.
-3. Include real, currently operational hotels in {city} categorized by real tiers.
-4. Transit must accurately reflect the city's real transit lines.
+CRITICAL ACCURACY DIRECTIVES:
+1. Every landmark in 'heritage' MUST genuinely exist inside {city}. (For Dubai: Burj Khalifa, The Dubai Mall, Dubai Frame, Museum of the Future, Palm Jumeirah, Burj Al Arab, Dubai Miracle Garden, Al Fahidi Historical Neighbourhood. For Tokyo: Senso-ji, Tokyo Tower, Meiji Shrine, Shibuya Crossing).
+2. DO NOT include any landmarks or references from India, Mumbai, or Vasai unless the requested city is actually in that region.
+3. 'real_hotels' MUST list genuine, operational hotels physically located in {city} across Budget, Comfort (3-4 Star), and 5-Star Luxury.
+4. 'transit' must list actual metros, bullet trains, or local transit systems serving {city}.
 
-Format:
+JSON FORMAT:
 {{
   "city": "{city}",
   "state": "{state}",
   "country": "{country}",
-  "tagline": "Compelling 1-sentence description of what makes {city} world-renowned.",
+  "tagline": "Compelling 1-sentence description capturing what {city} is globally recognized for.",
   "pillars": {{
     "heritage": [
       {{
-        "name": "Standard Proper Name of Landmark in {city}",
-        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary / Architecture",
+        "name": "Proper International Name of Attraction in {city}",
+        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary / Architecture / Modern Wonder",
         "rating": "4.8",
-        "detail": "2 factual, engaging sentences on why travelers visit this landmark.",
-        "timing": "09:00 AM – 06:00 PM",
-        "entry": "Free Public Access or Standard Ticket",
+        "detail": "2 factual, vivid sentences on why travelers visit this landmark.",
+        "timing": "09:00 AM – 07:00 PM",
+        "entry": "Ticket rate in local currency or Free Public Access",
         "tips": "Practical tip on visiting hours or photography.",
-        "best_transit": "Actual metro line, train or bus route",
+        "best_transit": "Actual metro line, station name, or tram",
         "lat": 0.0,
         "lng": 0.0
       }}
@@ -976,37 +993,41 @@ Format:
     "real_hotels": [
       {{
         "tier": "Budget / Value / Comfort (3-4 Star) / 5-Star Luxury",
-        "name": "Real Operational Hotel Name in {city}",
-        "basePrice": 65.0,
-        "rating": "4.6",
-        "reviews": "2,100",
-        "suitability": "Family / Solo / Couples",
-        "highlight": "Actual real amenities and district location in {city}"
+        "name": "Actual Operational Hotel Name in {city}",
+        "basePrice": 75.0,
+        "rating": "4.7",
+        "reviews": "2,400",
+        "suitability": "Family / Couples / Solo",
+        "highlight": "Specific neighborhood and standout amenity in {city}"
       }}
     ],
     "flavours": [
       {{
-        "name": "Authentic regional dish or specialty in {city}",
+        "name": "Iconic regional dish or specialty in {city}",
         "detail": "Culinary description."
       }}
     ],
     "transit": {{
-      "railway": "Main railway station or metro hub",
+      "railway": "Main metro line or central train terminal in {city}",
       "bus_depot": "Central bus terminal",
-      "bus_depot_phone": "Official transit helpline",
-      "auto_fares": "Local transit fares and pass advice"
+      "bus_depot_phone": "Official transit agency or helpline",
+      "auto_fares": "Taxi, rideshare, or transit pass rules"
     }}
   }}
 }}
-Provide 6 to 8 genuine landmarks in 'heritage' and 6 to 10 genuine hotels in 'real_hotels'.
+Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in 'real_hotels'.
 """
-        data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
+        data = await ask_fast_json(f"Generate authoritative verified travel dossier for {loc_label}.", sys_prompt)
 
+    # Fetch authentic Wikipedia photos for all landmarks
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
-            if not spot.get("image") or "wikimedia" not in spot["image"]:
-                s_name = spot.get("name", "")
-                spot["image"] = get_verified_landmark_photo(s_name, city)
+            s_name = spot.get("name", "")
+            # If no image or if image is missing/broken, resolve via Wikipedia
+            if not spot.get("image") or not spot["image"].startswith("http"):
+                wiki_photo = get_verified_landmark_photo(s_name, city)
+                if wiki_photo:
+                    spot["image"] = wiki_photo
 
     return data
 
@@ -1116,7 +1137,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "80.3.0",
+        "version": "80.4.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
