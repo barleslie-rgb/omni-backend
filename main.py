@@ -1076,7 +1076,7 @@ async def explore_chat(request: Request):
             "status": "success",
             "answer": greeting_msg,
             "venues": [],
-            "has_document": false
+            "has_document": False
         }
 
     # 2. SYSTEM PROMPT: GROK-STYLE TRAVEL GUIDE INTELLIGENCE
