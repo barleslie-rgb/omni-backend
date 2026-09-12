@@ -34,7 +34,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Forensic Auditor, Real Hotel Engine & Transit Cloud",
-    version="80.4.0"
+    version="81.0.0"
 )
 
 app.add_middleware(
@@ -269,7 +269,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                 completion = client.chat.completions.create(
                     model=model_id,
                     messages=messages,
-                    temperature=0.35,
+                    temperature=0.3,
                     max_tokens=4000,
                     timeout=25
                 )
@@ -277,7 +277,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                 if raw and len(raw.strip()) > 10:
                     return sanitize_ai_output(raw)
             except Exception as e:
-                print(f"[Groq Universal Concierge with {model_id}]: {e}")
+                print(f"[Groq Concierge Notice with {model_id}]: {e}")
                 continue
 
     keys = get_gemini_keys()
@@ -285,7 +285,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
         formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages[1:]])
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nConversation Flow:\n{formatted_history}"}]}],
-            "generationConfig": {"temperature": 0.35, "maxOutputTokens": 3500}
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 3500}
         }
         async with httpx.AsyncClient(timeout=24.0) as http_client:
             for key in keys:
@@ -304,10 +304,9 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                         continue
 
     return (
-        f"### 📍 Direct Response & Advisory\n\n"
-        f"Regarding your query on **{prompt}**:\n"
-        f"I am actively tracking real-time local schedules, authentic transit routes, and itineraries. "
-        f"Could you specify your exact travel dates or budget preferences so I can tailor this specifically?"
+        f"### 📍 Trip Outline\n\n"
+        f"I am ready to plan your trip for **{prompt}**. "
+        f"Please share your exact departure city, preferred travel dates, or budget preferences so I can generate a complete itinerary."
     )
 
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
@@ -360,9 +359,6 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
 # 6. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
-    """
-    Fetches the authentic, curated lead image of any global attraction from Wikipedia/Wikimedia.
-    """
     headers = {
         "User-Agent": "OmniTouristOS/4.0 (contact: info@touristos.app) requests/2.31"
     }
@@ -423,7 +419,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    # Clean generic fallback if Wikimedia has no entry
     return ""
 
 # -------------------------------------------------------------
@@ -939,7 +934,6 @@ async def explore_city(request: Request):
         country = "India"
 
     city_clean = city.lower()
-    # Strict boundary check: only Vasai-Virar triggers the hardcoded anchor
     is_vasai_virar = any(city_clean == name or city_clean.startswith(f"{name}-") or city_clean.startswith(f"{name} ")
                          for name in ["vasai", "virar", "vasai-virar", "bassein"])
 
@@ -964,8 +958,8 @@ You are the authoritative Global Tourism Concierge for '{loc_label}'.
 Output a JSON object ONLY without markdown backticks or commentary.
 
 CRITICAL ACCURACY DIRECTIVES:
-1. Every landmark in 'heritage' MUST genuinely exist inside {city}. (For Dubai: Burj Khalifa, The Dubai Mall, Dubai Frame, Museum of the Future, Palm Jumeirah, Burj Al Arab, Dubai Miracle Garden, Al Fahidi Historical Neighbourhood. For Tokyo: Senso-ji, Tokyo Tower, Meiji Shrine, Shibuya Crossing).
-2. DO NOT include any landmarks or references from India, Mumbai, or Vasai unless the requested city is actually in that region.
+1. Every landmark in 'heritage' MUST genuinely exist inside {city}. (e.g., For Dubai: Burj Khalifa, The Dubai Mall, Dubai Frame, Museum of the Future. For Tokyo: Senso-ji, Tokyo Tower, Shibuya Crossing).
+2. DO NOT include any landmarks or references from India or Vasai unless the requested city is actually in that region.
 3. 'real_hotels' MUST list genuine, operational hotels physically located in {city} across Budget, Comfort (3-4 Star), and 5-Star Luxury.
 4. 'transit' must list actual metros, bullet trains, or local transit systems serving {city}.
 
@@ -978,7 +972,7 @@ JSON FORMAT:
   "pillars": {{
     "heritage": [
       {{
-        "name": "Proper International Name of Attraction in {city}",
+        "name": "Proper Name of Attraction in {city}",
         "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary / Architecture / Modern Wonder",
         "rating": "4.8",
         "detail": "2 factual, vivid sentences on why travelers visit this landmark.",
@@ -1023,7 +1017,6 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
             s_name = spot.get("name", "")
-            # If no image or if image is missing/broken, resolve via Wikipedia
             if not spot.get("image") or not spot["image"].startswith("http"):
                 wiki_photo = get_verified_landmark_photo(s_name, city)
                 if wiki_photo:
@@ -1032,7 +1025,7 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     return data
 
 # -------------------------------------------------------------
-# 12. UNIVERSAL AI GUIDE & CONCIERGE CHAT ENDPOINT
+# 12. UNIVERSAL AI GUIDE ASSISTANT (GROK-STYLE ARCHITECTURE)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1067,37 +1060,62 @@ async def explore_chat(request: Request):
         pass
 
     clean_q = str(question).strip()
-    loc_label = f"{city}, {country}".strip(", ")
-
+    lower_q = clean_q.lower().strip("?!., \t")
     lang_lower = target_language.lower()
+
+    # 1. SIMPLE GREETING INTERCEPTOR: NO UNWANTED TEXT DUMPS
+    greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
+    if lower_q in greetings:
+        if "marathi" in lang_lower or "मराठी" in lang_lower:
+            greeting_msg = "नमस्कार! ओम्नी टूरिस्टओएस (Omni TouristOS) मध्ये आपले स्वागत आहे. मी आपली काय मदत करू शकतो?"
+        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+            greeting_msg = "नमस्ते! ओम्नी टूरिस्टओएस (Omni TouristOS) में आपका स्वागत है। मैं आपकी क्या मदद कर सकता हूँ?"
+        else:
+            greeting_msg = "Hello, welcome to Omni TouristOS, how may I help you?"
+        return {
+            "status": "success",
+            "answer": greeting_msg,
+            "venues": [],
+            "has_document": false
+        }
+
+    # 2. SYSTEM PROMPT: GROK-STYLE TRAVEL GUIDE INTELLIGENCE
     if "marathi" in lang_lower or "मराठी" in lang_lower:
-        lang_instruction = "Answer strictly in natural Marathi (मराठी - Devanagari script)."
+        lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
     elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-        lang_instruction = "Answer strictly in natural Hindi (हिंदी - Devanagari script)."
+        lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
     else:
         lang_instruction = f"Answer clearly in {target_language}."
 
     concierge_system_prompt = f"""
-You are Omni Universal AI, an authentic, perceptive, and knowledgeable personal collaborator and guide.
-Current User Location Context: {loc_label}. Traveler Profile: {party_summary}. Dietary: {dietary_preference}.
+You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion.
 {lang_instruction}
 
-GUIDING PRINCIPLES:
-1. DIRECT STRUCTURAL OPENINGS: Start directly with the answer in sentence 1. Avoid introductory filler ("Sure!", "Here is a breakdown:", "Certainly!").
-2. UNIVERSAL EXPERTISE: You are NOT a rigid chatbot. Answer ANY query thoroughly—whether building multi-day global itineraries, budget breakdowns, weather and season questions (state exact months, temperatures, and conditions), local delicacies, or broad questions about career, technology, coding, life decisions, or history.
-3. CONCRETE OVER DESCRIPTIVE: Provide exact names, real locations, realistic costs, and actionable advice rather than vague adjectives.
-4. GROK FORMATTING: Use bolding ONLY for headings and labels. Render numerical comparisons, hotel tiers, or schedules in clean Markdown Tables.
+GUIDE RULES & PRESENTATION STYLE (Modeled after Grok):
+1. HEADLINE SUMMARY: Start sentence 1 with a direct summary of the travel plan (e.g. "Here's a realistic, family-friendly 10-day / 7-night Paris itinerary for 4 adults + 1 child..."). State the balance of sights, rest time, and kid appeal clearly.
+2. IMPORTANT ASSUMPTIONS & NOTES: Use a prominent section heading '### Important Assumptions & Notes'. Inside, use bullet points with bold sub-labels:
+   • **Origin:** State departure city / direct vs connecting flight facts.
+   • **Child advantages:** Mention free entries for minors, playground stops, metro discounts.
+   • **Transport:** Mention passes (e.g., Navigo Easy, Suica, Metro Day Pass).
+   • **Accommodation:** Mention recommended central districts, family suites, or aparthotels.
+   • **Budget ballpark:** Give realistic cost per day/head.
+   • **Book ahead:** Mention which monuments strictly require timed advance tickets.
+   • **Visa / Requirements:** Mandatory travel insurance, passport validity, or visa requirements.
+3. FLIGHTS & COMMUTE: Provide a dedicated '### Sample Flights' section with realistic airline options (Air India, Air France, Singapore Airlines, Emirates), direct departure/arrival hours, flight duration, and round-trip economy cost ranges.
+4. DAY-BY-DAY ITINERARY: For each day, use clean Markdown headers like '### Day 1 – Arrival + Orientation', '### Day 2 – Eiffel Tower + Seine Cruise'. Break each day into Morning, Afternoon, and Evening activities with a dedicated *Tip:* line for pacing and energy.
+5. PRACTICAL FAMILY TIPS: Conclude with a clean '### Practical Tips for Your Family' section covering getting around, kid-friendly dining, and pacing.
+6. NO UNRENDERED TABLE PIPES: Use clean bullet points and clear headings.
 """
     ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "3-day", "5-day", "budget breakdown"])
+    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "3-day", "5-day", "budget", "flights"])
 
     return {
         "status": "success",
         "answer": ans,
         "venues": [],
         "has_document": has_document,
-        "pdf_name": f"{city}_Travel_Plan.pdf",
-        "docx_name": f"{city}_Travel_Plan.docx",
+        "pdf_name": f"{city}_Itinerary.pdf",
+        "docx_name": f"{city}_Itinerary.docx",
     }
 
 # -------------------------------------------------------------
@@ -1137,7 +1155,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "80.4.0",
+        "version": "81.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
