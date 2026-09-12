@@ -31,11 +31,6 @@ try:
 except ImportError:
     PdfReader = None
 
-try:
-    import pypdfium2 as pdfium
-except ImportError:
-    pdfium = None
-
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Forensic Auditor, Real Hotel Engine & Transit Cloud",
@@ -287,7 +282,6 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
 
     keys = get_gemini_keys()
     if keys:
-        # Format history into a single structured prompt for Gemini fallback
         formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages[1:]])
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nConversation Flow:\n{formatted_history}"}]}],
@@ -368,7 +362,6 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {"User-Agent": "OmniTouristOS/3.0 (verified.traveler@omni.app)"}
 
-    # Step 1: Clean search string from trailing parentheticals or generic prefixes
     clean_name = re.sub(r'\(.*?\)', '', landmark_name).strip()
     clean_name = re.sub(rf"(?i)\b{re.escape(city)}\b", "", clean_name).strip(" -:,")
 
@@ -382,7 +375,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         if not candidate or len(candidate) < 3:
             continue
         try:
-            # 1. Resolve exact title via Wikipedia Opensearch API
             open_search_url = (
                 f"https://en.wikipedia.org/w/api.php?action=opensearch"
                 f"&search={urllib.parse.quote(candidate)}&limit=1&namespace=0&format=json"
@@ -393,7 +385,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                 titles = search_data[1] if len(search_data) > 1 else []
                 if titles:
                     resolved_title = titles[0]
-                    # 2. Fetch page summary for the exact resolved title
                     page_slug = urllib.parse.quote(resolved_title.replace(" ", "_"))
                     sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{page_slug}"
                     r_sum = requests.get(sum_url, headers=headers, timeout=3.5)
@@ -405,7 +396,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                             thumb = p_data["thumbnail"]["source"]
                             return re.sub(r'/\d+px-', '/1200px-', thumb)
 
-            # 3. Direct Wikimedia Generator search backup
             query_url = (
                 f"https://en.wikipedia.org/w/api.php?action=query&generator=search"
                 f"&gsrsearch={urllib.parse.quote(candidate)}&gsrlimit=1&prop=pageimages"
@@ -422,7 +412,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    # Fallback to authentic nature / heritage photography
     return "https://images.unsplash.com/photo-1590073844006-33379778ae09?auto=format&fit=crop&w=1200&q=80"
 
 # -------------------------------------------------------------
@@ -517,26 +506,6 @@ def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[s
         print(f"[pypdf extraction error]: {e}")
         return "", 0
 
-def render_scanned_pdf_first_page(file_bytes: bytes) -> Optional[bytes]:
-    if pdfium is None:
-        return None
-    try:
-        pdf = pdfium.PdfDocument(file_bytes)
-        if len(pdf) == 0:
-            return None
-        page = pdf[0]
-        pil_img = page.render(scale=1.5).to_pil()
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1200:
-            pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
-        out_buf = io.BytesIO()
-        pil_img.save(out_buf, format="JPEG", quality=90)
-        return out_buf.getvalue()
-    except Exception as e:
-        print(f"[pdfium render error]: {e}")
-        return None
-
 def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
     try:
         pil_img = Image.open(io.BytesIO(file_bytes))
@@ -623,11 +592,7 @@ async def analyze_document(
                 dual_role_prompt
             )
         else:
-            img_bytes = None
-            if filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
-                img_bytes = render_scanned_pdf_first_page(file_bytes)
-            if img_bytes is None:
-                img_bytes = prepare_image_bytes(file_bytes)
+            img_bytes = prepare_image_bytes(file_bytes)
 
             if img_bytes:
                 analysis_raw, diagnostic_err = await call_gemini_rest_vision(
@@ -959,7 +924,6 @@ async def explore_city(request: Request):
 
     loc_slug = city.lower().replace(" ", "-").replace(",", "").strip()
 
-    # Robust matching for Vasai-Virar variations
     is_vasai_virar = any(k in loc_slug for k in ["vasai", "virar", "bassein"])
 
     if is_vasai_virar:
@@ -1038,10 +1002,8 @@ Provide 6 to 8 genuine landmarks in 'heritage' and 6 to 10 genuine hotels in 're
 """
         data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
 
-    # Attach verified Wikipedia high-resolution photographs
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
-            # If an image is not already anchored with a verified URL, resolve it via Wikipedia
             if not spot.get("image") or "wikimedia" not in spot["image"]:
                 s_name = spot.get("name", "")
                 spot["image"] = get_verified_landmark_photo(s_name, city)
