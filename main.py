@@ -32,8 +32,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Street Lens Vision, Dual Voice & Transit Cloud",
-    version="82.0.0"
+    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
+    version="83.0.0"
 )
 
 app.add_middleware(
@@ -136,7 +136,7 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# 3. DIRECT REST CALL FOR GEMINI FLASH VISION MODELS
+# 3. DIRECT REST CALL FOR GEMINI FLASH VISION
 # -------------------------------------------------------------
 async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], str]:
     keys = get_gemini_keys()
@@ -200,7 +200,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
     return None, f"Vision notice ({last_err})"
 
 # -------------------------------------------------------------
-# 4. FAST TEXT ENGINE
+# 4. FAST TEXT ENGINE (GROQ / GEMINI FALLBACK)
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -249,7 +249,56 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     return "Response generated. Let me know if you would like deeper details on this."
 
 # -------------------------------------------------------------
-# 5. UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B - 8192 TOKENS)
+# 5. FAST JSON ENGINE
+# -------------------------------------------------------------
+async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
+    client = get_groq_client()
+    if client:
+        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            try:
+                completion = client.chat.completions.create(
+                    model=model_id,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=4000,
+                    response_format={"type": "json_object"},
+                    timeout=30
+                )
+                raw = completion.choices[0].message.content
+                if raw:
+                    return json.loads(sanitize_ai_output(raw))
+            except Exception as e:
+                print(f"[Groq JSON Notice with {model_id}]: {e}")
+                continue
+
+    keys = get_gemini_keys()
+    if keys:
+        payload = {
+            "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
+        }
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            for key in keys:
+                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+                    try:
+                        res = await http_client.post(url, json=payload)
+                        if res.status_code == 200:
+                            candidates = res.json().get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
+                                if ans:
+                                    return json.loads(sanitize_ai_output(ans))
+                    except Exception:
+                        continue
+    return None
+
+# -------------------------------------------------------------
+# 6. UNIVERSAL AI CONCIERGE (8192 TOKENS FOR COMPLETE ITINERARIES)
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -308,54 +357,8 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
         f"Please share your exact departure city, preferred travel dates, or budget preferences so I can generate a complete itinerary."
     )
 
-async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
-    client = get_groq_client()
-    if client:
-        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.2,
-                    max_tokens=4000,
-                    response_format={"type": "json_object"},
-                    timeout=30
-                )
-                raw = completion.choices[0].message.content
-                if raw:
-                    return json.loads(sanitize_ai_output(raw))
-            except Exception as e:
-                print(f"[Groq JSON Notice with {model_id}]: {e}")
-                continue
-
-    keys = get_gemini_keys()
-    if keys:
-        payload = {
-            "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
-        }
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
-                    try:
-                        res = await http_client.post(url, json=payload)
-                        if res.status_code == 200:
-                            candidates = res.json().get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                                if ans:
-                                    return json.loads(sanitize_ai_output(ans))
-                    except Exception:
-                        continue
-    return None
-
 # -------------------------------------------------------------
-# 6. STREET VOICE DIRECT TRANSLATE (SUB-300ms GROQ ENGINE)
+# 7. STREET VOICE TRANSLATION (SUB-300ms GROQ ENGINE)
 # -------------------------------------------------------------
 @app.post("/api/v1/street-voice-translate")
 async def street_voice_translate(
@@ -416,7 +419,7 @@ async def street_voice_translate(
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
 # -------------------------------------------------------------
-# 7. STREET LENS (CAM/OCR SIGNBOARD & MENU TRANSLATOR)
+# 8. STREET LENS (CAMERA SIGNBOARD OCR SCANNER)
 # -------------------------------------------------------------
 @app.post("/api/v1/street-lens")
 async def street_lens(
@@ -456,7 +459,44 @@ async def street_lens(
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 8. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
+# 9. BARGAIN PAL (HAGGLING STUDIO EVALUATOR)
+# -------------------------------------------------------------
+@app.post("/api/v1/bargain-evaluate")
+async def bargain_evaluate(request: Request):
+    try:
+        body = await request.json()
+        item_name = body.get("item_name", "Souvenir")
+        quoted_price = float(body.get("quoted_price", 100))
+        currency = body.get("currency", "INR")
+        city = body.get("city", "Mumbai")
+        target_language = body.get("target_language", "English")
+
+        sys_prompt = f"""
+You are Bargain Pal, an authentic local street market expert for {city}.
+Evaluate the quoted price for '{item_name}' ({quoted_price} {currency}).
+Return STRICT JSON ONLY without markdown backticks.
+
+JSON FORMAT:
+{{
+  "verdict": "Fair Price / Mild Markup / Tourist Trap",
+  "rating_color": "green / yellow / red",
+  "estimated_fair_price": 0.0,
+  "suggested_counter_offer": 0.0,
+  "advice": "1 practical sentence on local bargaining etiquette for this item.",
+  "polite_counter_phrase": "Polite phrase in native script to negotiate",
+  "phonetic": "Pronunciation in English letters",
+  "phrase_translation": "English meaning of phrase"
+}}
+"""
+        res = await ask_fast_json(f"Evaluate street price for {item_name}", sys_prompt)
+        if res:
+            return {"status": "success", "data": res}
+        return {"status": "error", "message": "Evaluation timed out"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -------------------------------------------------------------
+# 10. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
@@ -500,7 +540,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     return ""
 
 # -------------------------------------------------------------
-# 9. DOCUMENT PARSERS
+# 11. DOCUMENT PARSERS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -607,7 +647,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 10. FORENSIC LEGAL AUDITOR ENDPOINTS
+# 12. FORENSIC LEGAL AUDITOR ENDPOINTS
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -739,7 +779,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 11. REGIONAL EXPLORER ENGINE
+# 13. REGIONAL EXPLORER ENGINE
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -895,7 +935,7 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     return data
 
 # -------------------------------------------------------------
-# 12. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
+# 14. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -980,7 +1020,7 @@ CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
     }
 
 # -------------------------------------------------------------
-# 13. SERVER HEALTH & STATUS
+# 15. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -988,7 +1028,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "82.0.0",
+        "version": "83.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
