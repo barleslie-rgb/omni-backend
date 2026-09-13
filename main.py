@@ -32,8 +32,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Forensic Auditor, Real Hotel Engine & Transit Cloud",
-    version="81.2.0"
+    description="Universal Travel AI, Street Lens Vision, Dual Voice & Transit Cloud",
+    version="82.0.0"
 )
 
 app.add_middleware(
@@ -189,7 +189,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
                             parts = candidates[0].get("content", {}).get("parts", [])
                             text_pieces = [p.get("text", "") for p in parts if "text" in p]
                             ans = "".join(text_pieces).strip()
-                            if len(ans) > 20:
+                            if len(ans) > 10:
                                 return sanitize_ai_output(ans), ""
                     else:
                         last_err = f"HTTP {res.status_code} ({model_name}): {res.text[:120]}"
@@ -249,7 +249,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     return "Response generated. Let me know if you would like deeper details on this."
 
 # -------------------------------------------------------------
-# 5. UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B WITH 8192 TOKENS)
+# 5. UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B - 8192 TOKENS)
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -355,7 +355,108 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
+# 6. STREET VOICE DIRECT TRANSLATE (SUB-300ms GROQ ENGINE)
+# -------------------------------------------------------------
+@app.post("/api/v1/street-voice-translate")
+async def street_voice_translate(
+    text: str = Form(...),
+    source_language: str = Form("English"),
+    target_language: str = Form("Marathi")
+):
+    clean_text = text.strip()
+    if not clean_text:
+        return {"status": "error", "translation": ""}
+
+    sys_prompt = (
+        f"You are a real-time conversational voice interpreter. "
+        f"Translate spoken speech directly from {source_language} into natural, colloquial {target_language}. "
+        f"CRITICAL: Output ONLY the direct translated phrase in the target script. "
+        f"Do NOT include explanations, romanizations, quotes, or conversational preamble."
+    )
+
+    client = get_groq_client()
+    if client:
+        try:
+            comp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": clean_text}
+                ],
+                temperature=0.1,
+                max_tokens=500,
+                timeout=8
+            )
+            raw_ans = comp.choices[0].message.content.strip().strip('"')
+            if raw_ans:
+                return {"status": "success", "translation": sanitize_ai_output(raw_ans)}
+        except Exception as e:
+            print(f"[Street Voice Groq Notice]: {e}")
+
+    keys = get_gemini_keys()
+    if keys:
+        try:
+            payload = {
+                "contents": [{"parts": [{"text": f"{sys_prompt}\n\nSentence to translate: {clean_text}"}]}],
+                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}
+            }
+            async with httpx.AsyncClient(timeout=6.0) as http_client:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={keys[0]}"
+                res = await http_client.post(url, json=payload)
+                if res.status_code == 200:
+                    candidates = res.json().get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip().strip('"')
+                        if ans:
+                            return {"status": "success", "translation": sanitize_ai_output(ans)}
+        except Exception:
+            pass
+
+    return {"status": "error", "translation": "Translation failed. Check connection."}
+
+# -------------------------------------------------------------
+# 7. STREET LENS (CAM/OCR SIGNBOARD & MENU TRANSLATOR)
+# -------------------------------------------------------------
+@app.post("/api/v1/street-lens")
+async def street_lens(
+    file: UploadFile = File(...),
+    target_language: str = Form("English")
+):
+    try:
+        file_bytes = await file.read()
+        img_bytes = prepare_image_bytes(file_bytes)
+        if not img_bytes:
+            return {"status": "error", "message": "Could not decode this photo."}
+
+        lens_prompt = (
+            f"You are Omni Street Lens, an instant camera visual translator for travelers on the move.\n"
+            f"Target Language: {target_language}.\n\n"
+            f"INSTRUCTIONS:\n"
+            f"1. Detect and read all visible text in the image (street sign, store name, restaurant menu, warning board, transit exit).\n"
+            f"2. Provide a 2-to-3 sentence clear explanation in {target_language} of what the sign says and its practical meaning for a visitor.\n"
+            f"3. If there is a restriction, timing, or fine (e.g., No Parking, Metro Exit, Entry Fee, Dangerous Wave, Halal/Vegetarian), clearly highlight it.\n"
+            f"4. Keep it concise so it can be read aloud in 15 seconds."
+        )
+
+        analysis, err = await call_gemini_rest_vision(
+            prompt=lens_prompt,
+            img_bytes=img_bytes,
+            mime_type="image/jpeg"
+        )
+
+        del file_bytes
+        del img_bytes
+        gc.collect()
+
+        if analysis:
+            return {"status": "success", "interpretation": analysis}
+        return {"status": "error", "message": err or "Street Lens encountered a timeout."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -------------------------------------------------------------
+# 8. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
@@ -363,12 +464,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     }
 
     clean_name = re.sub(r'\(.*?\)', '', landmark_name).strip()
-
-    search_candidates = [
-        clean_name,
-        f"{clean_name}, {city}",
-        landmark_name,
-    ]
+    search_candidates = [clean_name, f"{clean_name}, {city}", landmark_name]
 
     for cand in search_candidates:
         if not cand or len(cand) < 2:
@@ -398,27 +494,13 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                             return t_data["originalimage"]["source"]
                         if "thumbnail" in t_data and "source" in t_data["thumbnail"]:
                             return re.sub(r'/\d+px-', '/1200px-', t_data["thumbnail"]["source"])
-
-            query_url = (
-                f"https://en.wikipedia.org/w/api.php?action=query&generator=search"
-                f"&gsrsearch={urllib.parse.quote(cand)}&gsrlimit=1&prop=pageimages"
-                f"&piprop=original|thumbnail&pithumbsize=1200&format=json"
-            )
-            rq = requests.get(query_url, headers=headers, timeout=4.0)
-            if rq.status_code == 200:
-                pages = rq.json().get("query", {}).get("pages", {})
-                for _, page in pages.items():
-                    if "original" in page and "source" in page["original"]:
-                        return page["original"]["source"]
-                    if "thumbnail" in page and "source" in page["thumbnail"]:
-                        return page["thumbnail"]["source"]
         except Exception:
             continue
 
     return ""
 
 # -------------------------------------------------------------
-# 7. DOCUMENT PARSERS
+# 9. DOCUMENT PARSERS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -525,7 +607,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 8. FORENSIC LEGAL AUDITOR ENDPOINTS
+# 10. FORENSIC LEGAL AUDITOR ENDPOINTS
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -626,25 +708,12 @@ async def analyze_document(
             except Exception:
                 pass
 
-        detected_destination = None
-        lower_raw = clean_text.lower()
-        if "vasai" in lower_raw or "virar" in lower_raw or "वसई" in lower_raw or "विरार" in lower_raw:
-            detected_destination = "Vasai, Maharashtra, India"
-        elif "pune" in lower_raw or "पुणे" in lower_raw:
-            detected_destination = "Pune, Maharashtra, India"
-        elif "mumbai" in lower_raw or "मुंबई" in lower_raw:
-            detected_destination = "Mumbai, Maharashtra, India"
-        elif "tokyo" in lower_raw or "東京" in lower_raw:
-            detected_destination = "Tokyo, Japan"
-        elif "osaka" in lower_raw or "大阪" in lower_raw:
-            detected_destination = "Osaka, Japan"
-
         return {
             "status": "success",
             "data": {
                 "document_title": f"Forensic Audit ({filename})",
                 "actionable_advisory": clean_text,
-                "detected_destination": detected_destination,
+                "detected_destination": None,
                 "suggestions": suggestions
             },
             "raw_text": clean_text
@@ -669,98 +738,8 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.post("/api/v1/ask-question")
-async def ask_question(
-    request: Request,
-    question: str = Form(...),
-    target_language: str = Form("English"),
-    active_document_context: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
-):
-    try:
-        clean_q = question.strip()
-        doc_awareness = f"\n[AUDITED DOCUMENT CONTEXT]:\n{active_document_context}\n" if active_document_context else ""
-        lang_lower = target_language.lower()
-
-        if "marathi" in lang_lower or "मराठी" in lang_lower:
-            lang_rule = "Answer strictly in pure Marathi (मराठी - Devanagari script)."
-        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            lang_rule = "Answer strictly in Hindi (हिंदी - Devanagari script)."
-        else:
-            lang_rule = f"Answer in {target_language}."
-
-        sys_prompt = (
-            f"You are Paper Pilot Companion, an authentic forensic auditor and historical guide. "
-            f"{lang_rule} Maintain bold headers and clean Markdown tables for numerical comparisons.{doc_awareness}"
-        )
-        ans = await ask_fast_text(clean_q, sys_prompt)
-        return {"status": "success", "answer": ans, "image_url": "", "download_url": ""}
-    except Exception as e:
-        return {"status": "error", "answer": f"Notice: {str(e)}"}
-
 # -------------------------------------------------------------
-# 9. STANDALONE INDIAN RAILWAYS TRANSIT API
-# -------------------------------------------------------------
-@app.post("/api/v1/railway-inquiry")
-async def railway_inquiry(
-    query_type: str = Form(...),
-    query_value: str = Form(...),
-    target_language: str = Form("English")
-):
-    try:
-        val = query_value.strip()
-        if query_type == "pnr":
-            sys_prompt = (
-                f"You are the Indian Railways CRIS PNR Enquiry officer. "
-                f"Break down the status of PNR: {val} in {target_language}.\n"
-                f"Include Train Name, Number, Journey Date, Class, Boarding/Destination, Booking Status vs Current Status (CNF/WL/RAC), and Chart Status in a clean Grok Markdown table."
-            )
-            ans = await ask_fast_text(f"PNR Status inquiry: {val}", sys_prompt)
-        elif query_type == "live_train":
-            sys_prompt = (
-                f"You are the Indian Railways NTES live tracking officer. "
-                f"Provide running status for Train: {val} in {target_language}.\n"
-                f"Provide current station location, delay in minutes, next halt, platform number, and upcoming schedule table."
-            )
-            ans = await ask_fast_text(f"Live status of train: {val}", sys_prompt)
-        else:
-            sys_prompt = (
-                f"You are the Station Master for Indian Railways station: {val}. "
-                f"Generate the Live Station Display Board for the next 4 hours in {target_language} with Markdown columns: | Train No & Name | Expected Time | Platform | Status |."
-            )
-            ans = await ask_fast_text(f"Station board for station: {val}", sys_prompt)
-
-        return {"status": "success", "answer": ans}
-    except Exception as e:
-        return {"status": "error", "answer": f"Transit error: {str(e)}"}
-
-# -------------------------------------------------------------
-# 10. FILE CONVERTER ENDPOINT
-# -------------------------------------------------------------
-@app.post("/api/v1/convert-file")
-async def convert_file(
-    file: UploadFile = File(...),
-    target_format: str = Form(...)
-):
-    try:
-        file_bytes = await file.read()
-        file_ext = (target_format or "pdf").lower()
-        file_id = f"converted_{int(time.time())}_{uuid.uuid4().hex[:6]}.{file_ext}"
-        out_path = os.path.join(DOWNLOADS_DIR, file_id)
-
-        with open(out_path, "wb") as f:
-            f.write(file_bytes)
-
-        return {
-            "status": "success",
-            "message": f"Successfully processed into {target_format.upper()}",
-            "download_url": f"/downloads/{file_id}"
-        }
-    except Exception as e:
-        return {"status": "error", "message": f"Conversion failure: {str(e)}"}
-
-# -------------------------------------------------------------
-# 11. REGIONAL GROUND TRUTH & ACCURATE GLOBAL EXPLORER
+# 11. REGIONAL EXPLORER ENGINE
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -791,101 +770,16 @@ REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
                 "lat": 19.4678,
                 "lng": 72.8256,
                 "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Jivdani_temple.jpg/1200px-Jivdani_temple.jpg"
-            },
-            {
-                "name": "Arnala Fort",
-                "category": "Maritime Fortress",
-                "rating": "4.7",
-                "detail": "Island fortress off the Arnala coast with solid bastions, stone elephant carvings, and an octagonal freshwater reservoir.",
-                "timing": "07:00 AM – 06:00 PM",
-                "entry": "Free Entry (Local ferry fare ₹20-₹30)",
-                "tips": "Check local boat ferry timings and tide schedules before heading across from Arnala wharf.",
-                "best_transit": "Local Ferry Boat from Arnala Beach, reachable by Auto from Virar West",
-                "lat": 19.4619,
-                "lng": 72.7303,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/9/91/Arnala_Fort_Entrance.jpg/1200px-Arnala_Fort_Entrance.jpg"
-            },
-            {
-                "name": "Suruchi Beach",
-                "category": "Coastal Shoreline",
-                "rating": "4.6",
-                "detail": "Tranquil shoreline lined with dense Casuarina (Suru) groves, famed for peaceful sea breezes and evening sunsets.",
-                "timing": "Open 24 Hours",
-                "entry": "Free Public Access",
-                "tips": "Ideal for evening strolls and photography; avoid deep water during high tide.",
-                "best_transit": "Auto-Rickshaw / Bicycle from Vasai West",
-                "lat": 19.3496,
-                "lng": 72.7842,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5a/Casuarina_grove_beach.jpg/1200px-Casuarina_grove_beach.jpg"
-            },
-            {
-                "name": "Tungareshwar Wildlife Sanctuary",
-                "category": "Nature & Forest Sanctuary",
-                "rating": "4.7",
-                "detail": "Lush forested mountain corridor connecting to SGNP, featuring waterfalls, birdlife trails, and an ancient Shiva shrine.",
-                "timing": "06:00 AM – 06:00 PM",
-                "entry": "Forest Entry Fee Applicable",
-                "tips": "Stay on marked trails; carry insect repellent and ample drinking water for the trek.",
-                "best_transit": "Auto-Rickshaw / Taxi from Vasai East highway junction",
-                "lat": 19.3871,
-                "lng": 72.9094,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/2/29/Tungareshwar_waterfall.jpg/1200px-Tungareshwar_waterfall.jpg"
-            },
-            {
-                "name": "Vajreshwari Hot Springs & Temple",
-                "category": "Geothermal Sanctuary",
-                "rating": "4.6",
-                "detail": "Natural mineral-rich sulfur hot springs along the Tansa river valley, located near the ancient Vajreshwari Yogini temple.",
-                "timing": "06:00 AM – 07:00 PM",
-                "entry": "Free Admission",
-                "tips": "Test water temperature carefully before entering the bathing kunds.",
-                "best_transit": "MSRTC State Transport Bus / Shared Auto from Vasai Station",
-                "lat": 19.4912,
-                "lng": 73.0275,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/7/7b/Vajreshwari_temple_complex.jpg/1200px-Vajreshwari_temple_complex.jpg"
-            },
-            {
-                "name": "Bhuigaon Beach",
-                "category": "Tranquil Beach",
-                "rating": "4.6",
-                "detail": "Clean, secluded coastal stretch surrounded by betel nut and palm plantations, ideal for sunset walks away from city noise.",
-                "timing": "Open 24 Hours",
-                "entry": "Free Public Access",
-                "tips": "Limited commercial stalls; carry snacks and dispose of trash responsibly.",
-                "best_transit": "Auto-Rickshaw from Vasai Railway Station",
-                "lat": 19.3739,
-                "lng": 72.7758,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/e/eb/Bhuigaon_beach_sunset.jpg/1200px-Bhuigaon_beach_sunset.jpg"
-            },
-            {
-                "name": "St. Gonsalo Garcia Church, Ghas",
-                "category": "Sacred Architecture",
-                "rating": "4.7",
-                "detail": "Historic Catholic church dedicated to India's first native saint, featuring classic Portuguese-influenced architecture.",
-                "timing": "06:30 AM – 07:00 PM",
-                "entry": "Free Admission",
-                "tips": "Maintain decorum and silence during religious services.",
-                "best_transit": "Auto-Rickshaw / VVMT Bus from Vasai West",
-                "lat": 19.3601,
-                "lng": 72.8058,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Portuguese_church_in_Vasai.jpg/1200px-Portuguese_church_in_Vasai.jpg"
             }
         ],
         "real_hotels": [
             {"tier": "Comfort (3-4 Star)", "name": "The Golden Chariot Vasai Hotel & Suites", "basePrice": 48.0, "rating": "4.3", "reviews": "1,820", "suitability": "Family & Business", "highlight": "Swimming pool, rooftop dining, located directly on NH-48 highway."},
-            {"tier": "Budget / Value", "name": "Farmhouse Garden Family Resort Vasai", "basePrice": 32.0, "rating": "4.2", "reviews": "1,140", "suitability": "Couples & Family", "highlight": "Lush garden lawns, multi-cuisine seafood restaurant, quiet ambiance."},
-            {"tier": "Budget / Value", "name": "Hotel Regency Vasai Station Road", "basePrice": 24.0, "rating": "4.1", "reviews": "920", "suitability": "Solo & Transit", "highlight": "500m from Vasai Road Junction, 24/7 front desk, high-speed Wi-Fi."},
-            {"tier": "Comfort (3-4 Star)", "name": "West Palm Beach Resort Arnala", "basePrice": 42.0, "rating": "4.4", "reviews": "1,530", "suitability": "Family & Groups", "highlight": "Beachfront access, water park slides, fresh coastal seafood buffet."},
-            {"tier": "Comfort (3-4 Star)", "name": "Royal Garden Resort & Water Park", "basePrice": 52.0, "rating": "4.3", "reviews": "2,460", "suitability": "Family & Kids", "highlight": "Wave pool, landscaped amusement area, spacious family cottages."}
+            {"tier": "Budget / Value", "name": "Farmhouse Garden Family Resort Vasai", "basePrice": 32.0, "rating": "4.2", "reviews": "1,140", "suitability": "Couples & Family", "highlight": "Lush garden lawns, multi-cuisine seafood restaurant, quiet ambiance."}
         ],
         "flavours": [
             {
                 "name": "Vasai Sukeli (Sun-Dried Bananas)",
                 "detail": "Traditional sweet dried Rajeli bananas, a GI-tagged local culinary specialty unique to Vasai-Virar."
-            },
-            {
-                "name": "Kupari Coastal Seafood & Fugiyas",
-                "detail": "Fresh Arabian Sea fish curry, bombil fry, and festive fried balloon breads (fugiyas) crafted by the indigenous East Indian community."
             }
         ],
         "transit": {
@@ -902,18 +796,12 @@ async def explore_city(request: Request):
     city = "Vasai-Virar"
     state = "Maharashtra"
     country = "India"
-    adults = 2
-    children = 0
-    language = "English"
 
     try:
         body = await request.json()
         city = (body.get("city") or "").strip()
         state = (body.get("state") or "").strip()
         country = (body.get("country") or "").strip()
-        adults = body.get("adults", 2)
-        children = body.get("children", 0)
-        language = body.get("language", "English")
     except Exception:
         pass
 
@@ -946,12 +834,6 @@ async def explore_city(request: Request):
 You are the authoritative Global Tourism Concierge for '{loc_label}'.
 Output a JSON object ONLY without markdown backticks or commentary.
 
-CRITICAL ACCURACY DIRECTIVES:
-1. Every landmark in 'heritage' MUST genuinely exist inside {city}. (e.g. For Dubai: Burj Khalifa, The Dubai Mall, Museum of the Future. For Tokyo: Senso-ji, Tokyo Tower, Shibuya Crossing).
-2. DO NOT include any landmarks or references from India or Vasai unless the requested city is actually in that region.
-3. 'real_hotels' MUST list genuine, operational hotels physically located in {city} across Budget, Comfort (3-4 Star), and 5-Star Luxury.
-4. 'transit' must list actual metros, bullet trains, or local transit systems serving {city}.
-
 JSON FORMAT:
 {{
   "city": "{city}",
@@ -962,12 +844,12 @@ JSON FORMAT:
     "heritage": [
       {{
         "name": "Proper Name of Attraction in {city}",
-        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary / Architecture / Modern Wonder",
+        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary",
         "rating": "4.8",
-        "detail": "2 factual, vivid sentences on why travelers visit this landmark.",
+        "detail": "2 factual sentences on why travelers visit.",
         "timing": "09:00 AM – 07:00 PM",
         "entry": "Ticket rate in local currency or Free Public Access",
-        "tips": "Practical tip on visiting hours or photography.",
+        "tips": "Practical tip on visiting hours.",
         "best_transit": "Actual metro line, station name, or tram",
         "lat": 0.0,
         "lng": 0.0
@@ -981,26 +863,26 @@ JSON FORMAT:
         "rating": "4.7",
         "reviews": "2,400",
         "suitability": "Family / Couples / Solo",
-        "highlight": "Specific neighborhood and standout amenity in {city}"
+        "highlight": "Standout amenity"
       }}
     ],
     "flavours": [
       {{
-        "name": "Iconic regional dish or specialty in {city}",
+        "name": "Iconic regional dish in {city}",
         "detail": "Culinary description."
       }}
     ],
     "transit": {{
-      "railway": "Main metro line or central train terminal in {city}",
+      "railway": "Main metro line or central train terminal",
       "bus_depot": "Central bus terminal",
-      "bus_depot_phone": "Official transit agency or helpline",
-      "auto_fares": "Taxi, rideshare, or transit pass rules"
+      "bus_depot_phone": "Official transit agency",
+      "auto_fares": "Taxi or rideshare rules"
     }}
   }}
 }}
 Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in 'real_hotels'.
 """
-        data = await ask_fast_json(f"Generate authoritative verified travel dossier for {loc_label}.", sys_prompt)
+        data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
 
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
@@ -1013,14 +895,12 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     return data
 
 # -------------------------------------------------------------
-# 12. UNIVERSAL AI GUIDE ASSISTANT (HIGH-CAPACITY COMPLETE ENGINE)
+# 12. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
     city = "Vasai-Virar"
     country = "India"
-    party_summary = "Traveler"
-    dietary_preference = "All / Any"
     question = ""
     target_language = "English"
     chat_history: List[Dict[str, str]] = []
@@ -1031,8 +911,6 @@ async def explore_chat(request: Request):
             body = await request.json()
             city = body.get("city", city)
             country = body.get("country", country)
-            party_summary = body.get("party_summary", party_summary)
-            dietary_preference = body.get("dietary_preference", dietary_preference)
             question = body.get("question", "")
             target_language = body.get("target_language", target_language)
             chat_history = body.get("chat_history", [])
@@ -1040,8 +918,6 @@ async def explore_chat(request: Request):
             form = await request.form()
             city = form.get("city", city)
             country = form.get("country", country)
-            party_summary = form.get("party_summary", party_summary)
-            dietary_preference = form.get("dietary_preference", dietary_preference)
             question = form.get("question", "")
             target_language = form.get("target_language", target_language)
     except Exception:
@@ -1051,7 +927,6 @@ async def explore_chat(request: Request):
     lower_q = clean_q.lower().strip("?!., \t")
     lang_lower = target_language.lower()
 
-    # Greeting Interceptor
     greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
     if lower_q in greetings:
         if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -1105,35 +980,7 @@ CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
     }
 
 # -------------------------------------------------------------
-# 13. INSTANT BOOKING ENGINE
-# -------------------------------------------------------------
-@app.post("/api/v1/instant-book")
-async def instant_book(request: Request):
-    try:
-        body = await request.form()
-        hotel_name = body.get("hotel_name", "Boutique Hotel")
-        hotel_location = body.get("hotel_location", "City Center")
-        price_rate = body.get("price_per_night", "Best Available Rate")
-        guest_name = body.get("guest_name", "Verified Traveler")
-
-        voucher_id = f"OMNI-{int(time.time()) % 999999}"
-
-        return {
-            "status": "success",
-            "voucher": {
-                "booking_id": voucher_id,
-                "hotel_name": hotel_name,
-                "hotel_location": hotel_location,
-                "guest_name": guest_name,
-                "price_rate": price_rate,
-                "payment_status": "Pre-Reserved (Pay at Property / Live Confirmation)"
-            }
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# -------------------------------------------------------------
-# 14. SERVER HEALTH & STATUS
+# 13. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1141,7 +988,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "81.2.0",
+        "version": "82.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
