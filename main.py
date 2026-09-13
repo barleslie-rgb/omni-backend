@@ -20,7 +20,6 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from groq import Groq
 
-# Optional native processors
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -34,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Forensic Auditor, Real Hotel Engine & Transit Cloud",
-    version="81.0.0"
+    version="81.2.0"
 )
 
 app.add_middleware(
@@ -173,7 +172,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
         "gemini-3.5-flash",
     ]
 
-    async with httpx.AsyncClient(timeout=35.0) as client:
+    async with httpx.AsyncClient(timeout=45.0) as client:
         for key in keys:
             for model_name in models_to_try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
@@ -201,7 +200,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
     return None, f"Vision notice ({last_err})"
 
 # -------------------------------------------------------------
-# 4. FAST TEXT ENGINE (GROQ LLAMA-3.3-70B WITH GEMINI REST FALLBACK)
+# 4. FAST TEXT ENGINE
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -215,8 +214,8 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0.2,
-                    max_tokens=4000,
-                    timeout=22
+                    max_tokens=8192,
+                    timeout=55
                 )
                 raw = completion.choices[0].message.content
                 if raw and len(raw.strip()) > 10:
@@ -229,9 +228,9 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     if keys:
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3500}
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
         }
-        async with httpx.AsyncClient(timeout=22.0) as http_client:
+        async with httpx.AsyncClient(timeout=45.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -250,7 +249,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     return "Response generated. Let me know if you would like deeper details on this."
 
 # -------------------------------------------------------------
-# 5. UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B)
+# 5. UNIVERSAL AI CONCIERGE (GROQ LLAMA-3.3-70B WITH 8192 TOKENS)
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -270,8 +269,8 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                     model=model_id,
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=4000,
-                    timeout=25
+                    max_tokens=8192,
+                    timeout=60
                 )
                 raw = completion.choices[0].message.content
                 if raw and len(raw.strip()) > 10:
@@ -285,9 +284,9 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
         formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages[1:]])
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nConversation Flow:\n{formatted_history}"}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 3500}
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}
         }
-        async with httpx.AsyncClient(timeout=24.0) as http_client:
+        async with httpx.AsyncClient(timeout=50.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -323,7 +322,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
                     temperature=0.2,
                     max_tokens=4000,
                     response_format={"type": "json_object"},
-                    timeout=24
+                    timeout=30
                 )
                 raw = completion.choices[0].message.content
                 if raw:
@@ -338,7 +337,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
         }
-        async with httpx.AsyncClient(timeout=24.0) as http_client:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -375,7 +374,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         if not cand or len(cand) < 2:
             continue
         try:
-            # 1. Try direct Wikipedia REST summary endpoint
             slug = cand.strip().replace(" ", "_")
             sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(slug)}"
             r_sum = requests.get(sum_url, headers=headers, timeout=4.0)
@@ -387,7 +385,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                     thumb = p_data["thumbnail"]["source"]
                     return re.sub(r'/\d+px-', '/1200px-', thumb)
 
-            # 2. Search query via Opensearch to resolve exact page title
             open_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(cand)}&limit=2&namespace=0&format=json"
             r_open = requests.get(open_url, headers=headers, timeout=4.0)
             if r_open.status_code == 200:
@@ -402,7 +399,6 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                         if "thumbnail" in t_data and "source" in t_data["thumbnail"]:
                             return re.sub(r'/\d+px-', '/1200px-', t_data["thumbnail"]["source"])
 
-            # 3. Direct Wikimedia Commons pageimages query
             query_url = (
                 f"https://en.wikipedia.org/w/api.php?action=query&generator=search"
                 f"&gsrsearch={urllib.parse.quote(cand)}&gsrlimit=1&prop=pageimages"
@@ -422,7 +418,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     return ""
 
 # -------------------------------------------------------------
-# 7. DOCUMENT PARSERS (DOCX, PPTX, XLSX, PDF)
+# 7. DOCUMENT PARSERS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -559,15 +555,9 @@ async def analyze_document(
 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            lang_instruction = (
-                "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables "
-                "STRICTLY IN MARATHI (मराठी - Devanagari script)."
-            )
+            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            lang_instruction = (
-                "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables "
-                "STRICTLY IN HINDI (हिंदी - Devanagari script)."
-            )
+            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN HINDI (हिंदी - Devanagari script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
@@ -772,7 +762,6 @@ async def convert_file(
 # -------------------------------------------------------------
 # 11. REGIONAL GROUND TRUTH & ACCURATE GLOBAL EXPLORER
 # -------------------------------------------------------------
-
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
         "tagline": "A historic coastal realm famed for Portuguese maritime fortresses, hilltop shrines, Casuarina beaches, and East Indian culinary culture.",
@@ -958,7 +947,7 @@ You are the authoritative Global Tourism Concierge for '{loc_label}'.
 Output a JSON object ONLY without markdown backticks or commentary.
 
 CRITICAL ACCURACY DIRECTIVES:
-1. Every landmark in 'heritage' MUST genuinely exist inside {city}. (e.g., For Dubai: Burj Khalifa, The Dubai Mall, Dubai Frame, Museum of the Future. For Tokyo: Senso-ji, Tokyo Tower, Shibuya Crossing).
+1. Every landmark in 'heritage' MUST genuinely exist inside {city}. (e.g. For Dubai: Burj Khalifa, The Dubai Mall, Museum of the Future. For Tokyo: Senso-ji, Tokyo Tower, Shibuya Crossing).
 2. DO NOT include any landmarks or references from India or Vasai unless the requested city is actually in that region.
 3. 'real_hotels' MUST list genuine, operational hotels physically located in {city} across Budget, Comfort (3-4 Star), and 5-Star Luxury.
 4. 'transit' must list actual metros, bullet trains, or local transit systems serving {city}.
@@ -1013,7 +1002,6 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
 """
         data = await ask_fast_json(f"Generate authoritative verified travel dossier for {loc_label}.", sys_prompt)
 
-    # Fetch authentic Wikipedia photos for all landmarks
     if data and "pillars" in data and "heritage" in data["pillars"]:
         for spot in data["pillars"]["heritage"]:
             s_name = spot.get("name", "")
@@ -1025,7 +1013,7 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     return data
 
 # -------------------------------------------------------------
-# 12. UNIVERSAL AI GUIDE ASSISTANT (GROK-STYLE ARCHITECTURE)
+# 12. UNIVERSAL AI GUIDE ASSISTANT (HIGH-CAPACITY COMPLETE ENGINE)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1063,7 +1051,7 @@ async def explore_chat(request: Request):
     lower_q = clean_q.lower().strip("?!., \t")
     lang_lower = target_language.lower()
 
-    # 1. SIMPLE GREETING INTERCEPTOR: NO UNWANTED TEXT DUMPS
+    # Greeting Interceptor
     greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
     if lower_q in greetings:
         if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -1079,7 +1067,6 @@ async def explore_chat(request: Request):
             "has_document": False
         }
 
-    # 2. SYSTEM PROMPT: GROK-STYLE TRAVEL GUIDE INTELLIGENCE
     if "marathi" in lang_lower or "मराठी" in lang_lower:
         lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
     elif "hindi" in lang_lower or "हिंदी" in lang_lower:
@@ -1091,23 +1078,22 @@ async def explore_chat(request: Request):
 You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion.
 {lang_instruction}
 
-GUIDE RULES & PRESENTATION STYLE (Modeled after Grok):
-1. HEADLINE SUMMARY: Start sentence 1 with a direct summary of the travel plan (e.g. "Here's a realistic, family-friendly 10-day / 7-night Paris itinerary for 4 adults + 1 child..."). State the balance of sights, rest time, and kid appeal clearly.
-2. IMPORTANT ASSUMPTIONS & NOTES: Use a prominent section heading '### Important Assumptions & Notes'. Inside, use bullet points with bold sub-labels:
-   • **Origin:** State departure city / direct vs connecting flight facts.
-   • **Child advantages:** Mention free entries for minors, playground stops, metro discounts.
-   • **Transport:** Mention passes (e.g., Navigo Easy, Suica, Metro Day Pass).
-   • **Accommodation:** Mention recommended central districts, family suites, or aparthotels.
-   • **Budget ballpark:** Give realistic cost per day/head.
-   • **Book ahead:** Mention which monuments strictly require timed advance tickets.
-   • **Visa / Requirements:** Mandatory travel insurance, passport validity, or visa requirements.
-3. FLIGHTS & COMMUTE: Provide a dedicated '### Sample Flights' section with realistic airline options (Air India, Air France, Singapore Airlines, Emirates), direct departure/arrival hours, flight duration, and round-trip economy cost ranges.
-4. DAY-BY-DAY ITINERARY: For each day, use clean Markdown headers like '### Day 1 – Arrival + Orientation', '### Day 2 – Eiffel Tower + Seine Cruise'. Break each day into Morning, Afternoon, and Evening activities with a dedicated *Tip:* line for pacing and energy.
-5. PRACTICAL FAMILY TIPS: Conclude with a clean '### Practical Tips for Your Family' section covering getting around, kid-friendly dining, and pacing.
-6. NO UNRENDERED TABLE PIPES: Use clean bullet points and clear headings.
+CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
+1. COMPLETION GUARANTEE: If the user asks for N days (e.g. 8 days, 7 days, 5 days), you MUST generate and conclude EVERY SINGLE DAY from Day 1 through Day N. Never truncate, stop early, or summarize remaining days.
+2. CONCISE PACING: To ensure all days fit completely without cutoffs:
+   • Keep introductory notes focused and brief.
+   • For each day (e.g. '### Day 1 – Arrival + Orientation'), write punchy, practical bullet points for Morning, Afternoon, and Evening (1-2 sentences each).
+   • Add one short italic *Tip:* per day for pacing, energy, or dining.
+3. STRUCTURE:
+   • **Sentence 1 Summary:** State the trip scope and party balance directly.
+   • '### Important Assumptions & Notes': Bullet points with bold labels (• **Origin:**, • **Transport:**, • **Budget ballpark:**, • **Book ahead:**).
+   • '### Sample Flights': Flight timing, airline names, and economy fares.
+   • '### Day-by-Day Itinerary': Include every single day up to the final departure day.
+   • '### Practical Tips for Your Family': Short concluding bullet points.
+4. NO RAW TABLE PIPES: Use clean bullets and bold headings only.
 """
     ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "3-day", "5-day", "budget", "flights"])
+    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "8 days", "3-day", "5-day", "budget", "flights"])
 
     return {
         "status": "success",
@@ -1119,7 +1105,7 @@ GUIDE RULES & PRESENTATION STYLE (Modeled after Grok):
     }
 
 # -------------------------------------------------------------
-# 13. INSTANT BOOKING ENGINE (OFFLINE VOUCHER GENERATION)
+# 13. INSTANT BOOKING ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/instant-book")
 async def instant_book(request: Request):
@@ -1155,7 +1141,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "81.0.0",
+        "version": "81.2.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
