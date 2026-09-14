@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
-    version="83.0.0"
+    version="84.0.0"
 )
 
 app.add_middleware(
@@ -298,7 +298,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. UNIVERSAL AI CONCIERGE (8192 TOKENS FOR COMPLETE ITINERARIES)
+# 6. UNIVERSAL AI CONCIERGE
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -358,7 +358,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
     )
 
 # -------------------------------------------------------------
-# 7. STREET VOICE TRANSLATION (SUB-300ms GROQ ENGINE)
+# 7. STREET VOICE TRANSLATION
 # -------------------------------------------------------------
 @app.post("/api/v1/street-voice-translate")
 async def street_voice_translate(
@@ -419,7 +419,7 @@ async def street_voice_translate(
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
 # -------------------------------------------------------------
-# 8. STREET LENS (CAMERA SIGNBOARD OCR SCANNER)
+# 8. STREET LENS
 # -------------------------------------------------------------
 @app.post("/api/v1/street-lens")
 async def street_lens(
@@ -438,7 +438,7 @@ async def street_lens(
             f"INSTRUCTIONS:\n"
             f"1. Detect and read all visible text in the image (street sign, store name, restaurant menu, warning board, transit exit).\n"
             f"2. Provide a 2-to-3 sentence clear explanation in {target_language} of what the sign says and its practical meaning for a visitor.\n"
-            f"3. If there is a restriction, timing, or fine (e.g., No Parking, Metro Exit, Entry Fee, Dangerous Wave, Halal/Vegetarian), clearly highlight it.\n"
+            f"3. If there is a restriction, timing, or fine, clearly highlight it.\n"
             f"4. Keep it concise so it can be read aloud in 15 seconds."
         )
 
@@ -459,7 +459,7 @@ async def street_lens(
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 9. BARGAIN PAL (HAGGLING STUDIO EVALUATOR)
+# 9. BARGAIN PAL
 # -------------------------------------------------------------
 @app.post("/api/v1/bargain-evaluate")
 async def bargain_evaluate(request: Request):
@@ -469,7 +469,6 @@ async def bargain_evaluate(request: Request):
         quoted_price = float(body.get("quoted_price", 100))
         currency = body.get("currency", "INR")
         city = body.get("city", "Mumbai")
-        target_language = body.get("target_language", "English")
 
         sys_prompt = f"""
 You are Bargain Pal, an authentic local street market expert for {city}.
@@ -500,11 +499,16 @@ JSON FORMAT:
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
-        "User-Agent": "OmniTouristOS/4.0 (contact: info@touristos.app) requests/2.31"
+        "User-Agent": "OmniTouristOS/5.0 (contact: info@touristos.app) requests/2.31"
     }
 
     clean_name = re.sub(r'\(.*?\)', '', landmark_name).strip()
-    search_candidates = [clean_name, f"{clean_name}, {city}", landmark_name]
+    search_candidates = [
+        clean_name,
+        f"{clean_name}, {city}",
+        f"{clean_name} landmark",
+        landmark_name
+    ]
 
     for cand in search_candidates:
         if not cand or len(cand) < 2:
@@ -512,7 +516,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         try:
             slug = cand.strip().replace(" ", "_")
             sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(slug)}"
-            r_sum = requests.get(sum_url, headers=headers, timeout=4.0)
+            r_sum = requests.get(sum_url, headers=headers, timeout=3.5)
             if r_sum.status_code == 200:
                 p_data = r_sum.json()
                 if "originalimage" in p_data and "source" in p_data["originalimage"]:
@@ -522,12 +526,12 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                     return re.sub(r'/\d+px-', '/1200px-', thumb)
 
             open_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(cand)}&limit=2&namespace=0&format=json"
-            r_open = requests.get(open_url, headers=headers, timeout=4.0)
+            r_open = requests.get(open_url, headers=headers, timeout=3.5)
             if r_open.status_code == 200:
                 titles = r_open.json()[1] if len(r_open.json()) > 1 else []
                 for title in titles:
                     title_slug = urllib.parse.quote(title.replace(" ", "_"))
-                    t_sum = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_slug}", headers=headers, timeout=4.0)
+                    t_sum = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_slug}", headers=headers, timeout=3.5)
                     if t_sum.status_code == 200:
                         t_data = t_sum.json()
                         if "originalimage" in t_data and "source" in t_data["originalimage"]:
@@ -537,10 +541,11 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    return ""
+    encoded_term = urllib.parse.quote(f"{clean_name},{city},landmark")
+    return f"https://images.unsplash.com/photo-1590050752117-238cb0fb12b1?auto=format&fit=crop&w=1200&q=80"
 
 # -------------------------------------------------------------
-# 11. DOCUMENT PARSERS
+# 11. DOCUMENT PARSERS & IMAGE RESIZERS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -553,8 +558,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                 if texts:
                     paragraphs.append("".join(texts))
             return "\n".join(paragraphs)
-    except Exception as e:
-        print(f"[DOCX error]: {e}")
+    except Exception:
         return ""
 
 def extract_text_from_pptx(file_bytes: bytes) -> str:
@@ -569,8 +573,7 @@ def extract_text_from_pptx(file_bytes: bytes) -> str:
                 if slide_texts:
                     all_text.append(" • " + " ".join(slide_texts))
             return "\n\n".join(all_text)
-    except Exception as e:
-        print(f"[PPTX error]: {e}")
+    except Exception:
         return ""
 
 def extract_text_from_xlsx(file_bytes: bytes) -> str:
@@ -604,8 +607,7 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
                     if row_vals:
                         table_output.append(" | ".join(row_vals))
             return "\n".join(table_output)
-    except Exception as e:
-        print(f"[XLSX error]: {e}")
+    except Exception:
         return ""
 
 def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[str, int]:
@@ -627,8 +629,7 @@ def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[s
 
         full_extracted = "\n\n".join(extracted_chunks)
         return full_extracted.strip(), total_pages
-    except Exception as e:
-        print(f"[pypdf extraction error]: {e}")
+    except Exception:
         return "", 0
 
 def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
@@ -642,12 +643,11 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         out_buf = io.BytesIO()
         pil_img.save(out_buf, format="JPEG", quality=90)
         return out_buf.getvalue()
-    except Exception as e:
-        print(f"[Pillow error]: {e}")
+    except Exception:
         return None
 
 # -------------------------------------------------------------
-# 12. FORENSIC LEGAL AUDITOR ENDPOINTS
+# 12. FORENSIC LEGAL AUDITOR
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -761,25 +761,8 @@ async def analyze_document(
     except Exception as e:
         return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
-@app.post("/api/v1/translate-report")
-async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
-    try:
-        lang_lower = target_language.lower()
-        if "marathi" in lang_lower or "मराठी" in lang_lower:
-            sys_prompt = (
-                "Translate this forensic audit report completely into pure Marathi (Devanagari script). "
-                "Keep all markdown tables, bold styling, and warning tags (🚨 **[धोका / कायदेशीर जोखीम]:**) intact."
-            )
-        else:
-            sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
-
-        translated = await ask_fast_text(report_text, sys_prompt)
-        return {"status": "success", "translated_report": translated}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
 # -------------------------------------------------------------
-# 13. REGIONAL EXPLORER ENGINE
+# 13. REGIONAL EXPLORER ENGINE (FULL SYNC FOR FRONTEND)
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -856,18 +839,10 @@ async def explore_city(request: Request):
 
     if is_vasai_virar and ("india" in country.lower() or not country):
         anchor = REGIONAL_ANCHORS["vasai-virar"]
-        data = {
-            "city": "Vasai-Virar",
-            "state": "Maharashtra",
-            "country": "India",
-            "tagline": anchor["tagline"],
-            "pillars": {
-                "heritage": anchor["spots"],
-                "real_hotels": anchor.get("real_hotels", []),
-                "flavours": anchor["flavours"],
-                "transit": anchor["transit"]
-            }
-        }
+        heritage_spots = anchor["spots"]
+        hotel_list = anchor.get("real_hotels", [])
+        transit_info = anchor["transit"]
+        tagline = anchor["tagline"]
     else:
         loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
         sys_prompt = f"""
@@ -884,13 +859,13 @@ JSON FORMAT:
     "heritage": [
       {{
         "name": "Proper Name of Attraction in {city}",
-        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary",
+        "category": "Historic Bastion / Sacred Pilgrimage / Coastal & Beach / Nature & Scenic / Entertainment & Nightlife",
         "rating": "4.8",
         "detail": "2 factual sentences on why travelers visit.",
         "timing": "09:00 AM – 07:00 PM",
         "entry": "Ticket rate in local currency or Free Public Access",
         "tips": "Practical tip on visiting hours.",
-        "best_transit": "Actual metro line, station name, or tram",
+        "best_transit": "Actual metro line, station name, or taxi route",
         "lat": 0.0,
         "lng": 0.0
       }}
@@ -899,128 +874,45 @@ JSON FORMAT:
       {{
         "tier": "Budget / Value / Comfort (3-4 Star) / 5-Star Luxury",
         "name": "Actual Operational Hotel Name in {city}",
-        "basePrice": 75.0,
-        "rating": "4.7",
+        "basePrice": 65.0,
+        "rating": "4.6",
         "reviews": "2,400",
         "suitability": "Family / Couples / Solo",
         "highlight": "Standout amenity"
       }}
-    ],
-    "flavours": [
-      {{
-        "name": "Iconic regional dish in {city}",
-        "detail": "Culinary description."
-      }}
-    ],
-    "transit": {{
-      "railway": "Main metro line or central train terminal",
-      "bus_depot": "Central bus terminal",
-      "bus_depot_phone": "Official transit agency",
-      "auto_fares": "Taxi or rideshare rules"
-    }}
+    ]
   }}
 }}
-Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in 'real_hotels'.
+Provide exactly 8 genuine landmarks in 'heritage' and 6 real operational hotels in 'real_hotels'.
 """
         data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
+        heritage_spots = data.get("pillars", {}).get("heritage", []) if data else []
+        hotel_list = data.get("pillars", {}).get("real_hotels", []) if data else []
+        tagline = data.get("tagline", f"Explore the finest destinations across {city}.") if data else ""
+        transit_info = {}
 
-    if data and "pillars" in data and "heritage" in data["pillars"]:
-        for spot in data["pillars"]["heritage"]:
-            s_name = spot.get("name", "")
-            if not spot.get("image") or not spot["image"].startswith("http"):
-                wiki_photo = get_verified_landmark_photo(s_name, city)
-                if wiki_photo:
-                    spot["image"] = wiki_photo
-
-    return data
-
-# -------------------------------------------------------------
-# 14. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
-# -------------------------------------------------------------
-@app.post("/api/v1/explore-chat")
-async def explore_chat(request: Request):
-    city = "Vasai-Virar"
-    country = "India"
-    question = ""
-    target_language = "English"
-    chat_history: List[Dict[str, str]] = []
-
-    content_type = request.headers.get("content-type", "").lower()
-    try:
-        if "application/json" in content_type:
-            body = await request.json()
-            city = body.get("city", city)
-            country = body.get("country", country)
-            question = body.get("question", "")
-            target_language = body.get("target_language", target_language)
-            chat_history = body.get("chat_history", [])
-        else:
-            form = await request.form()
-            city = form.get("city", city)
-            country = form.get("country", country)
-            question = form.get("question", "")
-            target_language = form.get("target_language", target_language)
-    except Exception:
-        pass
-
-    clean_q = str(question).strip()
-    lower_q = clean_q.lower().strip("?!., \t")
-    lang_lower = target_language.lower()
-
-    greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
-    if lower_q in greetings:
-        if "marathi" in lang_lower or "मराठी" in lang_lower:
-            greeting_msg = "नमस्कार! ओम्नी टूरिस्टओएस (Omni TouristOS) मध्ये आपले स्वागत आहे. मी आपली काय मदत करू शकतो?"
-        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            greeting_msg = "नमस्ते! ओम्नी टूरिस्टओएस (Omni TouristOS) में आपका स्वागत है। मैं आपकी क्या मदद कर सकता हूँ?"
-        else:
-            greeting_msg = "Hello, welcome to Omni TouristOS, how may I help you?"
-        return {
-            "status": "success",
-            "answer": greeting_msg,
-            "venues": [],
-            "has_document": False
-        }
-
-    if "marathi" in lang_lower or "मराठी" in lang_lower:
-        lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
-    elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-        lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
-    else:
-        lang_instruction = f"Answer clearly in {target_language}."
-
-    concierge_system_prompt = f"""
-You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion.
-{lang_instruction}
-
-CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
-1. COMPLETION GUARANTEE: If the user asks for N days (e.g. 8 days, 7 days, 5 days), you MUST generate and conclude EVERY SINGLE DAY from Day 1 through Day N. Never truncate, stop early, or summarize remaining days.
-2. CONCISE PACING: To ensure all days fit completely without cutoffs:
-   • Keep introductory notes focused and brief.
-   • For each day (e.g. '### Day 1 – Arrival + Orientation'), write punchy, practical bullet points for Morning, Afternoon, and Evening (1-2 sentences each).
-   • Add one short italic *Tip:* per day for pacing, energy, or dining.
-3. STRUCTURE:
-   • **Sentence 1 Summary:** State the trip scope and party balance directly.
-   • '### Important Assumptions & Notes': Bullet points with bold labels (• **Origin:**, • **Transport:**, • **Budget ballpark:**, • **Book ahead:**).
-   • '### Sample Flights': Flight timing, airline names, and economy fares.
-   • '### Day-by-Day Itinerary': Include every single day up to the final departure day.
-   • '### Practical Tips for Your Family': Short concluding bullet points.
-4. NO RAW TABLE PIPES: Use clean bullets and bold headings only.
-"""
-    ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "8 days", "3-day", "5-day", "budget", "flights"])
+    for spot in heritage_spots:
+        s_name = spot.get("name", "")
+        if not spot.get("image") or not spot["image"].startswith("http"):
+            photo = get_verified_landmark_photo(s_name, city)
+            spot["image"] = photo
 
     return {
-        "status": "success",
-        "answer": ans,
-        "venues": [],
-        "has_document": has_document,
-        "pdf_name": f"{city}_Itinerary.pdf",
-        "docx_name": f"{city}_Itinerary.docx",
+        "city": city,
+        "state": state,
+        "country": country,
+        "tagline": tagline,
+        "landmarks": heritage_spots,
+        "hotels": hotel_list,
+        "pillars": {
+            "heritage": heritage_spots,
+            "real_hotels": hotel_list,
+            "transit": transit_info
+        }
     }
 
 # -------------------------------------------------------------
-# 15. SERVER HEALTH & STATUS
+# 14. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1028,7 +920,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "83.0.0",
+        "version": "84.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
