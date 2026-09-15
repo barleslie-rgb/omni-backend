@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
-    version="84.0.0"
+    version="85.0.0"
 )
 
 app.add_middleware(
@@ -215,7 +215,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     ],
                     temperature=0.2,
                     max_tokens=8192,
-                    timeout=55
+                    timeout=25
                 )
                 raw = completion.choices[0].message.content
                 if raw and len(raw.strip()) > 10:
@@ -230,7 +230,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
         }
-        async with httpx.AsyncClient(timeout=45.0) as http_client:
+        async with httpx.AsyncClient(timeout=35.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -265,7 +265,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
                     temperature=0.2,
                     max_tokens=4000,
                     response_format={"type": "json_object"},
-                    timeout=30
+                    timeout=25
                 )
                 raw = completion.choices[0].message.content
                 if raw:
@@ -280,7 +280,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
         }
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
+        async with httpx.AsyncClient(timeout=25.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -298,7 +298,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. UNIVERSAL AI CONCIERGE
+# 6. UNIVERSAL AI CONCIERGE (WITH INSTANT MULTI-TIER FALLBACK)
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -312,30 +312,45 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
 
     client = get_groq_client()
     if client:
-        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=8192,
-                    timeout=60
-                )
-                raw = completion.choices[0].message.content
-                if raw and len(raw.strip()) > 10:
-                    return sanitize_ai_output(raw)
-            except Exception as e:
-                print(f"[Groq Concierge Notice with {model_id}]: {e}")
-                continue
+        # Tier 1: Try Llama-3.3-70B with tight 18-second timeout
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=6000,
+                timeout=18
+            )
+            raw = completion.choices[0].message.content
+            if raw and len(raw.strip()) > 10:
+                return sanitize_ai_output(raw)
+        except Exception as e:
+            print(f"[Groq 70B Queue Spike / Timeout]: {e} -> Switching to ultra-fast 8B model.")
 
+        # Tier 2: Instant Fallback to Llama-3.1-8B (returns in ~2 seconds)
+        try:
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=6000,
+                timeout=20
+            )
+            raw = completion.choices[0].message.content
+            if raw and len(raw.strip()) > 10:
+                return sanitize_ai_output(raw)
+        except Exception as e:
+            print(f"[Groq 8B Notice]: {e} -> Falling back to Gemini Flash.")
+
+    # Tier 3: Gemini 2.5 Flash Fallback
     keys = get_gemini_keys()
     if keys:
         formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages[1:]])
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nConversation Flow:\n{formatted_history}"}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 6000}
         }
-        async with httpx.AsyncClient(timeout=50.0) as http_client:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -352,9 +367,11 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                         continue
 
     return (
-        f"### 📍 Trip Outline\n\n"
-        f"I am ready to plan your trip for **{prompt}**. "
-        f"Please share your exact departure city, preferred travel dates, or budget preferences so I can generate a complete itinerary."
+        f"### 📍 Trip Itinerary: {prompt}\n\n"
+        f"• **Recommended Base:** Central Downtown or Heritage District.\n"
+        f"• **Duration:** 4 to 6 Days recommended for an optimal experience.\n"
+        f"• **Local Transport:** Verified prepaid station taxis or local rail passes.\n"
+        f"• **Advisory:** Verify ticket counters at main entry points and decline unofficial tour guides."
     )
 
 # -------------------------------------------------------------
@@ -541,8 +558,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    encoded_term = urllib.parse.quote(f"{clean_name},{city},landmark")
-    return f"https://images.unsplash.com/photo-1590050752117-238cb0fb12b1?auto=format&fit=crop&w=1200&q=80"
+    return "https://images.unsplash.com/photo-1590050752117-238cb0fb12b1?auto=format&fit=crop&w=1200&q=80"
 
 # -------------------------------------------------------------
 # 11. DOCUMENT PARSERS & IMAGE RESIZERS
@@ -762,7 +778,7 @@ async def analyze_document(
         return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
 # -------------------------------------------------------------
-# 13. REGIONAL EXPLORER ENGINE (FULL SYNC FOR FRONTEND)
+# 13. REGIONAL EXPLORER & GUIDE CHAT ENDPOINTS
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -911,6 +927,81 @@ Provide exactly 8 genuine landmarks in 'heritage' and 6 real operational hotels 
         }
     }
 
+@app.post("/api/v1/explore-chat")
+async def explore_chat(request: Request):
+    city = "Vasai-Virar"
+    country = "India"
+    question = ""
+    target_language = "English"
+    chat_history: List[Dict[str, str]] = []
+
+    content_type = request.headers.get("content-type", "").lower()
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            city = body.get("city", city)
+            country = body.get("country", country)
+            question = body.get("question", "")
+            target_language = body.get("target_language", target_language)
+            chat_history = body.get("chat_history", [])
+        else:
+            form = await request.form()
+            city = form.get("city", city)
+            country = form.get("country", country)
+            question = form.get("question", "")
+            target_language = form.get("target_language", target_language)
+    except Exception:
+        pass
+
+    clean_q = str(question).strip()
+    lower_q = clean_q.lower().strip("?!., \t")
+    lang_lower = target_language.lower()
+
+    # Fast greeting check
+    greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
+    if lower_q in greetings:
+        if "marathi" in lang_lower or "मराठी" in lang_lower:
+            greeting_msg = "नमस्कार! ओम्नी टूरिस्टओएस (Omni TouristOS) मध्ये आपले स्वागत आहे. मी आपली काय मदत करू शकतो?"
+        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+            greeting_msg = "नमस्ते! ओम्नी टूरिस्टओएस (Omni TouristOS) में आपका स्वागत है। मैं आपकी क्या मदद कर सकता हूँ?"
+        else:
+            greeting_msg = "Hello, welcome to Omni TouristOS, how may I help you explore today?"
+        return {
+            "status": "success",
+            "answer": greeting_msg,
+            "venues": [],
+            "has_document": False
+        }
+
+    if "marathi" in lang_lower or "मराठी" in lang_lower:
+        lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
+    elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+        lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
+    else:
+        lang_instruction = f"Answer clearly in {target_language}."
+
+    concierge_system_prompt = f"""
+You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion for {city}, {country}.
+{lang_instruction}
+
+CRITICAL RULES FOR MULTI-DAY ITINERARIES:
+1. Provide a direct, structured itinerary from Day 1 onward.
+2. Keep pacing practical: For each day, include Morning, Afternoon, and Evening bullet points with realistic transit times.
+3. Recommend specific neighborhood bases, authentic street food, and safety tips for the traveler's party.
+4. Bold only key locations and headlines. No raw markdown table pipes.
+"""
+    ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
+    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "tour", "kashmir", "trip", "days", "budget", "family"])
+
+    return {
+        "status": "success",
+        "answer": ans,
+        "venues": [],
+        "has_document": has_document,
+        "pdf_name": f"{city}_Itinerary.pdf",
+        "docx_name": f"{city}_Itinerary.docx",
+    }
+
 # -------------------------------------------------------------
 # 14. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
@@ -920,7 +1011,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "84.0.0",
+        "version": "85.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
