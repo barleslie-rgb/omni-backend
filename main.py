@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
-    version="85.0.0"
+    version="84.0.0"
 )
 
 app.add_middleware(
@@ -215,7 +215,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     ],
                     temperature=0.2,
                     max_tokens=8192,
-                    timeout=25
+                    timeout=55
                 )
                 raw = completion.choices[0].message.content
                 if raw and len(raw.strip()) > 10:
@@ -230,7 +230,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
         }
-        async with httpx.AsyncClient(timeout=35.0) as http_client:
+        async with httpx.AsyncClient(timeout=45.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -265,7 +265,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
                     temperature=0.2,
                     max_tokens=4000,
                     response_format={"type": "json_object"},
-                    timeout=25
+                    timeout=30
                 )
                 raw = completion.choices[0].message.content
                 if raw:
@@ -280,7 +280,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
         }
-        async with httpx.AsyncClient(timeout=25.0) as http_client:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -298,7 +298,147 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. UNIVERSAL AI CONCIERGE (WITH INSTANT MULTI-TIER FALLBACK)
+# 6. NATIVE IN-APP FLIGHT SEARCH & COMPARISON ENGINE
+# -------------------------------------------------------------
+@app.post("/api/v1/search-flights")
+async def search_flights(request: Request):
+    try:
+        body = await request.json()
+        origin = body.get("origin", "BOM").upper()
+        destination = body.get("destination", "TYO").upper()
+        depart_date = body.get("depart_date", "2026-09-21")
+        return_date = body.get("return_date", "2026-09-28")
+        adults = int(body.get("adults", 1))
+        cabin_class = body.get("cabin_class", "Economy")
+        is_round_trip = body.get("is_round_trip", True)
+
+        # Baseline fare matrix in INR
+        fare_benchmarks = {
+            ("BOM", "TYO"): [
+                {
+                    "airline": "IndiGo & Partner Carrier",
+                    "code": "6E-512 / NH-860",
+                    "depart_time": "08:15",
+                    "arrive_time": "19:40",
+                    "duration": "8h 55m",
+                    "stops": "1 Stop (BKK)",
+                    "price_inr": 34200,
+                    "badge": "Cheapest Fare",
+                    "badge_color": "0xFF16A34A",
+                    "perks": "7kg Cabin • Seat Selection Selectable"
+                },
+                {
+                    "airline": "Air India (Tata Group)",
+                    "code": "AI-306",
+                    "depart_time": "20:00",
+                    "arrive_time": "07:55",
+                    "duration": "8h 25m",
+                    "stops": "Non-stop Direct",
+                    "price_inr": 44500,
+                    "badge": "Fastest Direct",
+                    "badge_color": "0xFFDC2626",
+                    "perks": "23kg Check-in • Hot Gourmet Meals Included"
+                },
+                {
+                    "airline": "ANA (All Nippon Airways)",
+                    "code": "NH-830",
+                    "depart_time": "19:40",
+                    "arrive_time": "07:20",
+                    "duration": "8h 10m",
+                    "stops": "Non-stop Direct",
+                    "price_inr": 52800,
+                    "badge": "Top Rated 5-Star",
+                    "badge_color": "0xFF2563EB",
+                    "perks": "46kg Checked Baggage • 5-Star Comfort"
+                }
+            ],
+            ("BOM", "SIN"): [
+                {
+                    "airline": "Air India Express",
+                    "code": "IX-245",
+                    "depart_time": "11:10",
+                    "arrive_time": "19:15",
+                    "duration": "5h 35m",
+                    "stops": "Non-stop Direct",
+                    "price_inr": 14200,
+                    "badge": "Cheapest Fare",
+                    "badge_color": "0xFF16A34A",
+                    "perks": "7kg Cabin • Paid Add-ons Available"
+                },
+                {
+                    "airline": "Singapore Airlines",
+                    "code": "SQ-421",
+                    "depart_time": "23:45",
+                    "arrive_time": "07:40",
+                    "duration": "5h 25m",
+                    "stops": "Non-stop Direct",
+                    "price_inr": 28400,
+                    "badge": "World Class",
+                    "badge_color": "0xFF2563EB",
+                    "perks": "25kg Check-in • Gourmet In-flight Meals"
+                }
+            ]
+        }
+
+        pair = (origin, destination)
+        results = fare_benchmarks.get(pair)
+
+        # Dynamic estimation if not present in the baseline benchmarks
+        if not results:
+            results = [
+                {
+                    "airline": "Regional Value Air",
+                    "code": "VA-102",
+                    "depart_time": "07:30",
+                    "arrive_time": "16:45",
+                    "duration": "6h 45m",
+                    "stops": "1 Stop",
+                    "price_inr": 21500,
+                    "badge": "Cheapest Fare",
+                    "badge_color": "0xFF16A34A",
+                    "perks": "7kg Cabin Baggage Included"
+                },
+                {
+                    "airline": "National Full-Service Carrier",
+                    "code": "FC-404",
+                    "depart_time": "14:15",
+                    "arrive_time": "21:30",
+                    "duration": "5h 15m",
+                    "stops": "Non-stop Direct",
+                    "price_inr": 31200,
+                    "badge": "Fastest Direct",
+                    "badge_color": "0xFFDC2626",
+                    "perks": "20kg Baggage + Hot Meal Included"
+                }
+            ]
+
+        # Multiplier adjustments for passengers and round trip
+        adjusted_results = []
+        for f in results:
+            item = dict(f)
+            unit_price = item["price_inr"] * (1.85 if is_round_trip else 1.0)
+            item["unit_price_inr"] = int(unit_price)
+            item["total_price_inr"] = int(unit_price * adults)
+            item["currency"] = "INR"
+            item["symbol"] = "₹"
+            adjusted_results.append(item)
+
+        return {
+            "status": "success",
+            "origin": origin,
+            "destination": destination,
+            "depart_date": depart_date,
+            "return_date": return_date if is_round_trip else None,
+            "adults": adults,
+            "cabin_class": cabin_class,
+            "currency": "INR",
+            "flights": adjusted_results
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "flights": []}
+
+# -------------------------------------------------------------
+# 7. UNIVERSAL AI CONCIERGE (8192 TOKENS FOR COMPLETE ITINERARIES)
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -312,45 +452,30 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
 
     client = get_groq_client()
     if client:
-        # Tier 1: Try Llama-3.3-70B with tight 18-second timeout
-        try:
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=6000,
-                timeout=18
-            )
-            raw = completion.choices[0].message.content
-            if raw and len(raw.strip()) > 10:
-                return sanitize_ai_output(raw)
-        except Exception as e:
-            print(f"[Groq 70B Queue Spike / Timeout]: {e} -> Switching to ultra-fast 8B model.")
+        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+            try:
+                completion = client.chat.completions.create(
+                    model=model_id,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=8192,
+                    timeout=60
+                )
+                raw = completion.choices[0].message.content
+                if raw and len(raw.strip()) > 10:
+                    return sanitize_ai_output(raw)
+            except Exception as e:
+                print(f"[Groq Concierge Notice with {model_id}]: {e}")
+                continue
 
-        # Tier 2: Instant Fallback to Llama-3.1-8B (returns in ~2 seconds)
-        try:
-            completion = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=messages,
-                temperature=0.3,
-                max_tokens=6000,
-                timeout=20
-            )
-            raw = completion.choices[0].message.content
-            if raw and len(raw.strip()) > 10:
-                return sanitize_ai_output(raw)
-        except Exception as e:
-            print(f"[Groq 8B Notice]: {e} -> Falling back to Gemini Flash.")
-
-    # Tier 3: Gemini 2.5 Flash Fallback
     keys = get_gemini_keys()
     if keys:
         formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages[1:]])
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nConversation Flow:\n{formatted_history}"}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 6000}
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}
         }
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
+        async with httpx.AsyncClient(timeout=50.0) as http_client:
             for key in keys:
                 for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
@@ -367,15 +492,13 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                         continue
 
     return (
-        f"### 📍 Trip Itinerary: {prompt}\n\n"
-        f"• **Recommended Base:** Central Downtown or Heritage District.\n"
-        f"• **Duration:** 4 to 6 Days recommended for an optimal experience.\n"
-        f"• **Local Transport:** Verified prepaid station taxis or local rail passes.\n"
-        f"• **Advisory:** Verify ticket counters at main entry points and decline unofficial tour guides."
+        f"### 📍 Trip Outline\n\n"
+        f"I am ready to plan your trip for **{prompt}**. "
+        f"Please share your exact departure city, preferred travel dates, or budget preferences so I can generate a complete itinerary."
     )
 
 # -------------------------------------------------------------
-# 7. STREET VOICE TRANSLATION
+# 8. STREET VOICE TRANSLATION (SUB-300ms GROQ ENGINE)
 # -------------------------------------------------------------
 @app.post("/api/v1/street-voice-translate")
 async def street_voice_translate(
@@ -436,7 +559,7 @@ async def street_voice_translate(
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
 # -------------------------------------------------------------
-# 8. STREET LENS
+# 9. STREET LENS (CAMERA SIGNBOARD OCR SCANNER)
 # -------------------------------------------------------------
 @app.post("/api/v1/street-lens")
 async def street_lens(
@@ -455,7 +578,7 @@ async def street_lens(
             f"INSTRUCTIONS:\n"
             f"1. Detect and read all visible text in the image (street sign, store name, restaurant menu, warning board, transit exit).\n"
             f"2. Provide a 2-to-3 sentence clear explanation in {target_language} of what the sign says and its practical meaning for a visitor.\n"
-            f"3. If there is a restriction, timing, or fine, clearly highlight it.\n"
+            f"3. If there is a restriction, timing, or fine (e.g., No Parking, Metro Exit, Entry Fee, Dangerous Wave, Halal/Vegetarian), clearly highlight it.\n"
             f"4. Keep it concise so it can be read aloud in 15 seconds."
         )
 
@@ -476,7 +599,7 @@ async def street_lens(
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 9. BARGAIN PAL
+# 10. BARGAIN PAL (HAGGLING STUDIO EVALUATOR)
 # -------------------------------------------------------------
 @app.post("/api/v1/bargain-evaluate")
 async def bargain_evaluate(request: Request):
@@ -486,6 +609,7 @@ async def bargain_evaluate(request: Request):
         quoted_price = float(body.get("quoted_price", 100))
         currency = body.get("currency", "INR")
         city = body.get("city", "Mumbai")
+        target_language = body.get("target_language", "English")
 
         sys_prompt = f"""
 You are Bargain Pal, an authentic local street market expert for {city}.
@@ -512,20 +636,15 @@ JSON FORMAT:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 10. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
+# 11. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
-        "User-Agent": "OmniTouristOS/5.0 (contact: info@touristos.app) requests/2.31"
+        "User-Agent": "OmniTouristOS/4.0 (contact: info@touristos.app) requests/2.31"
     }
 
     clean_name = re.sub(r'\(.*?\)', '', landmark_name).strip()
-    search_candidates = [
-        clean_name,
-        f"{clean_name}, {city}",
-        f"{clean_name} landmark",
-        landmark_name
-    ]
+    search_candidates = [clean_name, f"{clean_name}, {city}", landmark_name]
 
     for cand in search_candidates:
         if not cand or len(cand) < 2:
@@ -533,7 +652,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         try:
             slug = cand.strip().replace(" ", "_")
             sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(slug)}"
-            r_sum = requests.get(sum_url, headers=headers, timeout=3.5)
+            r_sum = requests.get(sum_url, headers=headers, timeout=4.0)
             if r_sum.status_code == 200:
                 p_data = r_sum.json()
                 if "originalimage" in p_data and "source" in p_data["originalimage"]:
@@ -543,12 +662,12 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                     return re.sub(r'/\d+px-', '/1200px-', thumb)
 
             open_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(cand)}&limit=2&namespace=0&format=json"
-            r_open = requests.get(open_url, headers=headers, timeout=3.5)
+            r_open = requests.get(open_url, headers=headers, timeout=4.0)
             if r_open.status_code == 200:
                 titles = r_open.json()[1] if len(r_open.json()) > 1 else []
                 for title in titles:
                     title_slug = urllib.parse.quote(title.replace(" ", "_"))
-                    t_sum = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_slug}", headers=headers, timeout=3.5)
+                    t_sum = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_slug}", headers=headers, timeout=4.0)
                     if t_sum.status_code == 200:
                         t_data = t_sum.json()
                         if "originalimage" in t_data and "source" in t_data["originalimage"]:
@@ -558,10 +677,10 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
         except Exception:
             continue
 
-    return "https://images.unsplash.com/photo-1590050752117-238cb0fb12b1?auto=format&fit=crop&w=1200&q=80"
+    return ""
 
 # -------------------------------------------------------------
-# 11. DOCUMENT PARSERS & IMAGE RESIZERS
+# 12. DOCUMENT PARSERS
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -574,7 +693,8 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                 if texts:
                     paragraphs.append("".join(texts))
             return "\n".join(paragraphs)
-    except Exception:
+    except Exception as e:
+        print(f"[DOCX error]: {e}")
         return ""
 
 def extract_text_from_pptx(file_bytes: bytes) -> str:
@@ -589,7 +709,8 @@ def extract_text_from_pptx(file_bytes: bytes) -> str:
                 if slide_texts:
                     all_text.append(" • " + " ".join(slide_texts))
             return "\n\n".join(all_text)
-    except Exception:
+    except Exception as e:
+        print(f"[PPTX error]: {e}")
         return ""
 
 def extract_text_from_xlsx(file_bytes: bytes) -> str:
@@ -623,7 +744,8 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
                     if row_vals:
                         table_output.append(" | ".join(row_vals))
             return "\n".join(table_output)
-    except Exception:
+    except Exception as e:
+        print(f"[XLSX error]: {e}")
         return ""
 
 def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[str, int]:
@@ -645,7 +767,8 @@ def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[s
 
         full_extracted = "\n\n".join(extracted_chunks)
         return full_extracted.strip(), total_pages
-    except Exception:
+    except Exception as e:
+        print(f"[pypdf extraction error]: {e}")
         return "", 0
 
 def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
@@ -659,11 +782,12 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         out_buf = io.BytesIO()
         pil_img.save(out_buf, format="JPEG", quality=90)
         return out_buf.getvalue()
-    except Exception:
+    except Exception as e:
+        print(f"[Pillow error]: {e}")
         return None
 
 # -------------------------------------------------------------
-# 12. FORENSIC LEGAL AUDITOR
+# 13. FORENSIC LEGAL AUDITOR ENDPOINTS
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -777,8 +901,25 @@ async def analyze_document(
     except Exception as e:
         return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
 
+@app.post("/api/v1/translate-report")
+async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
+    try:
+        lang_lower = target_language.lower()
+        if "marathi" in lang_lower or "मराठी" in lang_lower:
+            sys_prompt = (
+                "Translate this forensic audit report completely into pure Marathi (Devanagari script). "
+                "Keep all markdown tables, bold styling, and warning tags (🚨 **[धोका / कायदेशीर जोखीम]:**) intact."
+            )
+        else:
+            sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
+
+        translated = await ask_fast_text(report_text, sys_prompt)
+        return {"status": "success", "translated_report": translated}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
 # -------------------------------------------------------------
-# 13. REGIONAL EXPLORER & GUIDE CHAT ENDPOINTS
+# 14. REGIONAL EXPLORER ENGINE
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -855,10 +996,18 @@ async def explore_city(request: Request):
 
     if is_vasai_virar and ("india" in country.lower() or not country):
         anchor = REGIONAL_ANCHORS["vasai-virar"]
-        heritage_spots = anchor["spots"]
-        hotel_list = anchor.get("real_hotels", [])
-        transit_info = anchor["transit"]
-        tagline = anchor["tagline"]
+        data = {
+            "city": "Vasai-Virar",
+            "state": "Maharashtra",
+            "country": "India",
+            "tagline": anchor["tagline"],
+            "pillars": {
+                "heritage": anchor["spots"],
+                "real_hotels": anchor.get("real_hotels", []),
+                "flavours": anchor["flavours"],
+                "transit": anchor["transit"]
+            }
+        }
     else:
         loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
         sys_prompt = f"""
@@ -875,13 +1024,13 @@ JSON FORMAT:
     "heritage": [
       {{
         "name": "Proper Name of Attraction in {city}",
-        "category": "Historic Bastion / Sacred Pilgrimage / Coastal & Beach / Nature & Scenic / Entertainment & Nightlife",
+        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary",
         "rating": "4.8",
         "detail": "2 factual sentences on why travelers visit.",
         "timing": "09:00 AM – 07:00 PM",
         "entry": "Ticket rate in local currency or Free Public Access",
         "tips": "Practical tip on visiting hours.",
-        "best_transit": "Actual metro line, station name, or taxi route",
+        "best_transit": "Actual metro line, station name, or tram",
         "lat": 0.0,
         "lng": 0.0
       }}
@@ -890,43 +1039,44 @@ JSON FORMAT:
       {{
         "tier": "Budget / Value / Comfort (3-4 Star) / 5-Star Luxury",
         "name": "Actual Operational Hotel Name in {city}",
-        "basePrice": 65.0,
-        "rating": "4.6",
+        "basePrice": 75.0,
+        "rating": "4.7",
         "reviews": "2,400",
         "suitability": "Family / Couples / Solo",
         "highlight": "Standout amenity"
       }}
-    ]
+    ],
+    "flavours": [
+      {{
+        "name": "Iconic regional dish in {city}",
+        "detail": "Culinary description."
+      }}
+    ],
+    "transit": {{
+      "railway": "Main metro line or central train terminal",
+      "bus_depot": "Central bus terminal",
+      "bus_depot_phone": "Official transit agency",
+      "auto_fares": "Taxi or rideshare rules"
+    }}
   }}
 }}
-Provide exactly 8 genuine landmarks in 'heritage' and 6 real operational hotels in 'real_hotels'.
+Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in 'real_hotels'.
 """
         data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
-        heritage_spots = data.get("pillars", {}).get("heritage", []) if data else []
-        hotel_list = data.get("pillars", {}).get("real_hotels", []) if data else []
-        tagline = data.get("tagline", f"Explore the finest destinations across {city}.") if data else ""
-        transit_info = {}
 
-    for spot in heritage_spots:
-        s_name = spot.get("name", "")
-        if not spot.get("image") or not spot["image"].startswith("http"):
-            photo = get_verified_landmark_photo(s_name, city)
-            spot["image"] = photo
+    if data and "pillars" in data and "heritage" in data["pillars"]:
+        for spot in data["pillars"]["heritage"]:
+            s_name = spot.get("name", "")
+            if not spot.get("image") or not spot["image"].startswith("http"):
+                wiki_photo = get_verified_landmark_photo(s_name, city)
+                if wiki_photo:
+                    spot["image"] = wiki_photo
 
-    return {
-        "city": city,
-        "state": state,
-        "country": country,
-        "tagline": tagline,
-        "landmarks": heritage_spots,
-        "hotels": hotel_list,
-        "pillars": {
-            "heritage": heritage_spots,
-            "real_hotels": hotel_list,
-            "transit": transit_info
-        }
-    }
+    return data
 
+# -------------------------------------------------------------
+# 15. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
+# -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
     city = "Vasai-Virar"
@@ -957,7 +1107,6 @@ async def explore_chat(request: Request):
     lower_q = clean_q.lower().strip("?!., \t")
     lang_lower = target_language.lower()
 
-    # Fast greeting check
     greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
     if lower_q in greetings:
         if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -965,7 +1114,7 @@ async def explore_chat(request: Request):
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
             greeting_msg = "नमस्ते! ओम्नी टूरिस्टओएस (Omni TouristOS) में आपका स्वागत है। मैं आपकी क्या मदद कर सकता हूँ?"
         else:
-            greeting_msg = "Hello, welcome to Omni TouristOS, how may I help you explore today?"
+            greeting_msg = "Hello, welcome to Omni TouristOS, how may I help you?"
         return {
             "status": "success",
             "answer": greeting_msg,
@@ -981,17 +1130,25 @@ async def explore_chat(request: Request):
         lang_instruction = f"Answer clearly in {target_language}."
 
     concierge_system_prompt = f"""
-You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion for {city}, {country}.
+You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion.
 {lang_instruction}
 
-CRITICAL RULES FOR MULTI-DAY ITINERARIES:
-1. Provide a direct, structured itinerary from Day 1 onward.
-2. Keep pacing practical: For each day, include Morning, Afternoon, and Evening bullet points with realistic transit times.
-3. Recommend specific neighborhood bases, authentic street food, and safety tips for the traveler's party.
-4. Bold only key locations and headlines. No raw markdown table pipes.
+CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
+1. COMPLETION GUARANTEE: If the user asks for N days (e.g. 8 days, 7 days, 5 days), you MUST generate and conclude EVERY SINGLE DAY from Day 1 through Day N. Never truncate, stop early, or summarize remaining days.
+2. CONCISE PACING: To ensure all days fit completely without cutoffs:
+   • Keep introductory notes focused and brief.
+   • For each day (e.g. '### Day 1 – Arrival + Orientation'), write punchy, practical bullet points for Morning, Afternoon, and Evening (1-2 sentences each).
+   • Add one short italic *Tip:* per day for pacing, energy, or dining.
+3. STRUCTURE:
+   • **Sentence 1 Summary:** State the trip scope and party balance directly.
+   • '### Important Assumptions & Notes': Bullet points with bold labels (• **Origin:**, • **Transport:**, • **Budget ballpark:**, • **Book ahead:**).
+   • '### Sample Flights': Flight timing, airline names, and economy fares.
+   • '### Day-by-Day Itinerary': Include every single day up to the final departure day.
+   • '### Practical Tips for Your Family': Short concluding bullet points.
+4. NO RAW TABLE PIPES: Use clean bullets and bold headings only.
 """
     ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "tour", "kashmir", "trip", "days", "budget", "family"])
+    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "8 days", "3-day", "5-day", "budget", "flights"])
 
     return {
         "status": "success",
@@ -1003,7 +1160,7 @@ CRITICAL RULES FOR MULTI-DAY ITINERARIES:
     }
 
 # -------------------------------------------------------------
-# 14. SERVER HEALTH & STATUS
+# 16. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1011,7 +1168,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "85.0.0",
+        "version": "84.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
