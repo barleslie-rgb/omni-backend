@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
-    version="85.0.0"
+    version="86.0.0"
 )
 
 app.add_middleware(
@@ -336,8 +336,8 @@ async def ask_question(request: Request):
         lang_instruction = f"Answer clearly and concisely in {target_language}."
 
     sys_prompt = f"""
-You are Paper Pilot's Senior Legal & Anti-Fraud Document Consultant.
-You are assisting an ordinary citizen, farmer, or property buyer who wants plain-language explanations of their legal paperwork.
+You are Paper Pilot's Senior Forensic Land, Legal & Historical Document Auditor.
+You assist ordinary citizens, property buyers, or heritage researchers seeking clarity on legal paperwork and historical artifacts.
 {lang_instruction}
 
 DOCUMENT CONTEXT AUDITED BY FORENSIC SYSTEM:
@@ -345,9 +345,10 @@ DOCUMENT CONTEXT AUDITED BY FORENSIC SYSTEM:
 
 MANDATORY RULES:
 1. Explain in clear, simple everyday words. Avoid unnecessarily complex legal jargon.
-2. If the user asks about rights, explain who actually owns the land/shares.
-3. If there is a risk, scam, mortgage, encumbrance (बोझा), court stay, or fake power of attorney, point it out directly and warn them.
-4. Keep the answer direct and natural so that when read aloud in a warm voice, it sounds clear, patient, and conversational.
+2. If the user asks about land rights, explain who actually owns the land/shares.
+3. If there is a scam, mortgage, encumbrance (बोझा), court stay, or fake power of attorney, point it out directly and warn them.
+4. If it is an inscription or historical document, explain its provenance, era, and historical importance.
+5. Keep the answer direct and natural so that when read aloud in a warm voice, it sounds clear, patient, and conversational.
 """
     ans = await ask_fast_text(clean_q, sys_prompt)
     return {"status": "success", "answer": ans}
@@ -828,7 +829,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 14. FORENSIC LEGAL AUDITOR ENDPOINTS (LAND FRAUD & DEED PROTECTION)
+# 14. FORENSIC LEGAL AUDITOR (DUAL ENGINE: FRAUD + HISTORICAL)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -867,17 +868,21 @@ async def analyze_document(
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
         dual_role_prompt = (
-            f"You are Paper Pilot, an authentic Forensic Land & Legal Auditor protecting citizens from land scams, fraudulent power-of-attorney documents, and bogus agreements.\n"
+            f"You are Paper Pilot, a Dual-Engine Forensic Legal Fraud Auditor and Historical Document Decipherer.\n"
             f"{lang_instruction}\n\n"
-            f"PRESENTATION & AUDIT DIRECTIVES:\n"
-            f"1. Explain in simple, crystal-clear everyday language so that an individual with limited literacy or legal knowledge can immediately understand what this paper means.\n"
-            f"2. CRITICAL: Whenever you identify ANY legal liability, penalty, pending litigation, encumbrance/mortgage (बोझा/कर्ज), fake survey number, or scam risk, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
+            f"DUAL-ENGINE DETECTION DIRECTIVES:\n"
+            f"1. MODERN LAND & LEGAL FRAUD: If analyzing land titles (7/12 Satbara, mutation entries, registry deeds, power of attorney, stamp papers):\n"
+            f"   • Explain plainly what the document is and who holds the rights.\n"
+            f"   • Identify any encumbrances/loans (बोझा/कर्ज), court stays, fake survey numbers, or fraudulent clauses, prefixing with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
+            f"2. HISTORICAL ARTIFACT & ARCHIVAL SCRIPT: If analyzing ancient manuscripts, stone inscriptions, copper plates, or heritage seals:\n"
+            f"   • Decipher the text, script (e.g. Modi, Brahmi, Devanagari, Persian, Latin), historical era, and architectural/royal context.\n"
+            f"   • Highlight missing lines or preservation warnings with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
             f"MANDATORY REPORT STRUCTURE:\n"
-            f"• **1. Plain Meaning & Document Identity (कागदपत्राचा सरळ भाषेत अर्थ):** Exact document type (e.g. 7/12 Satbara, Registered Sale Deed, Power of Attorney, Mutation Entry), issuing authority, official stamp validity, and primary parties.\n"
-            f"• **2. Red Flags & Land Scam Warnings (फसवणूक / धोके):** Disclose any unresolved loans, illegal claims, missing signatures, or dubious land boundaries.\n"
-            f"• **3. Rights & Benefits (हक्क आणि फायदे):** Concrete shares, ownership extent, or entitlements granted.\n"
-            f"• **4. Exclusions & Liabilities (काय समाविष्ट नाही / कायदेशीर बंधने):** Hidden conditions, obligations, or non-transferable rights.\n"
-            f"• **5. Actionable Roadmap (पुढील पडताळणी पावले):** Direct guidance on checking records at the Talathi / Sub-Registrar office.\n\n"
+            f"• **1. Plain Meaning & Document Identity (कागदपत्राचा सरळ भाषेत अर्थ):** Exact document type, issuing authority, dates, and primary parties or provenance.\n"
+            f"• **2. Red Flags & Vulnerabilities (फसवणूक / धोके):** Disclose any loans, dubious claims, missing signatures, or historical damage.\n"
+            f"• **3. Rights, Benefits & Insights (हक्क आणि फायदे):** Ownership rights, land parcels, or historical significance.\n"
+            f"• **4. Exclusions & Liabilities (काय समाविष्ट नाही):** Hidden liabilities or excluded rights.\n"
+            f"• **5. Actionable Roadmap (पुढील पडताळणी पावले):** Direct advice on verifying with the local Talathi/Sub-Registrar or archaeological archive.\n\n"
             f"At the very end of your response, output a single line:\n"
             f"EXPLORE_SUGGESTIONS: [\"Verify survey number at local Talathi office\", \"Check mutation entry (फेरफार) record\", \"Consult property registrar before payment\"]"
         )
@@ -961,7 +966,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 15. REGIONAL EXPLORER ENGINE
+# 15. REGIONAL EXPLORER ENGINE (20+ VERIFIED REAL LOCATIONS)
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -971,32 +976,178 @@ REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
                 "name": "Bassein Fort (Fort Vasai)",
                 "category": "Historic Bastion",
                 "rating": "4.8",
-                "detail": "Vast Indo-Portuguese stone citadel featuring arched ruins, ramparts, watchtowers, and historic chapels overlooking Vasai Creek.",
+                "detail": "Vast 16th-century Indo-Portuguese stone citadel featuring arched ruins, ramparts, watchtowers, and heritage chapels overlooking Vasai Creek.",
                 "timing": "06:00 AM – 06:30 PM",
                 "entry": "Free Public Entry",
-                "tips": "Wear comfortable walking shoes to explore the extensive stone ramparts; carry drinking water.",
+                "tips": "Wear comfortable shoes to explore the extensive ramparts; carry drinking water.",
                 "best_transit": "Auto-Rickshaw / VVMT Bus from Vasai Road Railway Station",
                 "lat": 19.3308,
                 "lng": 72.8149,
                 "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Bassein_Fort_Overview.jpg/1200px-Bassein_Fort_Overview.jpg"
             },
             {
-                "name": "Jivdani Mata Temple",
+                "name": "Jivdani Mata Hill Temple",
                 "category": "Sacred Pilgrimage",
                 "rating": "4.9",
-                "detail": "Venerated hilltop shrine atop Jivdani Hill offering panoramic valley views, accessible by funicular ropeway and paved stairs.",
+                "detail": "Revered ancient hilltop shrine atop Jivdani Hill offering panoramic valley views, accessible by funicular ropeway and paved stairs.",
                 "timing": "05:30 AM – 08:30 PM",
-                "entry": "Free Entry (Funicular ropeway chargeable)",
+                "entry": "Free (Funicular Ropeway Chargeable)",
                 "tips": "Climb early morning to avoid afternoon heat and weekend pilgrimage queues.",
                 "best_transit": "Funicular Ropeway / Auto-Rickshaw from Virar East Station",
                 "lat": 19.4678,
                 "lng": 72.8256,
                 "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Jivdani_temple.jpg/1200px-Jivdani_temple.jpg"
+            },
+            {
+                "name": "Arnala Island Fort",
+                "category": "Historic Bastion",
+                "rating": "4.7",
+                "detail": "Historic sea fortress situated on an island off the Arnala coast, built by the Sultanate of Gujarat and fortified by Marathas.",
+                "timing": "07:00 AM – 06:00 PM (Ferry Dependent)",
+                "entry": "Free (Ferry ₹30)",
+                "tips": "Check ferry timings before crossing.",
+                "best_transit": "Ferry from Arnala Beach / Killa Jetty",
+                "lat": 19.4633,
+                "lng": 72.7347,
+                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f3/Arnala_Fort_Entrance.jpg/1200px-Arnala_Fort_Entrance.jpg"
+            },
+            {
+                "name": "Suruchi Beach & Casuarina Groves",
+                "category": "Coastal & Beach",
+                "rating": "4.6",
+                "detail": "Tranquil sandy coastline sheltered by dense Casuarina (Suru) pine trees, famous for fresh sea breeze and peaceful sunset walks.",
+                "timing": "Open 24 Hours",
+                "entry": "Free",
+                "tips": "Carry snacks as stalls close after dusk.",
+                "best_transit": "Auto-Rickshaw from Vasai West Station",
+                "lat": 19.3496,
+                "lng": 72.7842,
+                "image": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80"
+            },
+            {
+                "name": "Tungareshwar National Wildlife Sanctuary",
+                "category": "Nature & Sanctuary",
+                "rating": "4.7",
+                "detail": "Dense tropical deciduous forest offering scenic trekking trails, seasonal waterfalls, and the ancient Tungareshwar Shiva Temple.",
+                "timing": "07:00 AM – 06:00 PM",
+                "entry": "₹50 Entry Fee",
+                "tips": "Wear hiking boots and carry plenty of water.",
+                "best_transit": "Auto-Rickshaw from Vasai East / Highway Junction",
+                "lat": 19.4182,
+                "lng": 72.9156,
+                "image": "https://images.unsplash.com/photo-1448375240586-882707db888b?auto=format&fit=crop&w=1200&q=80"
+            },
+            {
+                "name": "Bhuigaon Beach",
+                "category": "Coastal & Beach",
+                "rating": "4.5",
+                "detail": "Unspoiled and quiet shoreline with silvery grey sand and gentle waves, surrounded by coconut and betel nut orchards.",
+                "timing": "Open 24 Hours",
+                "entry": "Free",
+                "tips": "Ideal for peaceful morning walks.",
+                "best_transit": "Auto-Rickshaw from Vasai West",
+                "lat": 19.3621,
+                "lng": 72.7844,
+                "image": "https://images.unsplash.com/photo-1519046904884-53103b34b206?auto=format&fit=crop&w=1200&q=80"
+            },
+            {
+                "name": "Vajreshwari Temple & Mineral Hot Springs",
+                "category": "Sacred Pilgrimage",
+                "rating": "4.8",
+                "detail": "Sacred goddess temple surrounded by natural geothermal sulfur hot springs known for curative and therapeutic properties.",
+                "timing": "06:00 AM – 08:30 PM",
+                "entry": "Free",
+                "tips": "Carry an extra towel if bathing in the springs.",
+                "best_transit": "MSRTC Bus or Taxi from Virar or Vasai East",
+                "lat": 19.4892,
+                "lng": 73.0272,
+                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/Vajreshwari_Temple.jpg/1200px-Vajreshwari_Temple.jpg"
+            },
+            {
+                "name": "St. Michael's Church, Purandare",
+                "category": "Historic Bastion",
+                "rating": "4.7",
+                "detail": "One of the oldest surviving Portuguese-era churches built in 1565, featuring colonial stone carvings and an antique bell.",
+                "timing": "08:00 AM – 07:00 PM",
+                "entry": "Free",
+                "tips": "Observe modesty and decorum when visiting.",
+                "best_transit": "Auto-Rickshaw from Vasai Station West",
+                "lat": 19.3615,
+                "lng": 72.8021,
+                "image": "https://images.unsplash.com/photo-1548625361-195fe5786e8a?auto=format&fit=crop&w=1200&q=80"
+            },
+            {
+                "name": "Kalamb Beach",
+                "category": "Coastal & Beach",
+                "rating": "4.6",
+                "detail": "Long, serene beach strip famous for camel rides, water sports, and beachside coconut water shacks.",
+                "timing": "Open 24 Hours",
+                "entry": "Free",
+                "tips": "Great for evening family relaxation.",
+                "best_transit": "Auto-Rickshaw from Nalasopara West",
+                "lat": 19.4124,
+                "lng": 72.7661,
+                "image": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80"
+            },
+            {
+                "name": "Ganeshpuri Nityananda Ashram",
+                "category": "Sacred Pilgrimage",
+                "rating": "4.9",
+                "detail": "Renowned spiritual haven and Samadhi shrine of Bhagawan Nityananda, set in tranquil greenery alongside warm water kunds.",
+                "timing": "06:00 AM – 08:00 PM",
+                "entry": "Free",
+                "tips": "Free community meal (Prasadam) served daily.",
+                "best_transit": "Bus or Auto from Virar Railway Station East",
+                "lat": 19.4921,
+                "lng": 73.0182,
+                "image": "https://images.unsplash.com/photo-1545232979-fbf68fe9b10d?auto=format&fit=crop&w=1200&q=80"
             }
         ],
         "real_hotels": [
-            {"tier": "Comfort (3-4 Star)", "name": "The Golden Chariot Vasai Hotel & Suites", "basePrice": 48.0, "rating": "4.3", "reviews": "1,820", "suitability": "Family & Business", "highlight": "Swimming pool, rooftop dining, located directly on NH-48 highway."},
-            {"tier": "Budget / Value", "name": "Farmhouse Garden Family Resort Vasai", "basePrice": 32.0, "rating": "4.2", "reviews": "1,140", "suitability": "Couples & Family", "highlight": "Lush garden lawns, multi-cuisine seafood restaurant, quiet ambiance."}
+            {
+                "name": "The Golden Chariot Vasai Hotel & Spa",
+                "tier": "4-Star Executive Hotel",
+                "rating": "8.8",
+                "basePrice": 48.0,
+                "reviews": "1,820",
+                "suitability": "Family & Business",
+                "highlight": "Swimming Pool • Rooftop Bar • Located on NH-48 Highway",
+                "lat": 19.3941,
+                "lng": 72.8512
+            },
+            {
+                "name": "The Fern Fayms Resort Naigaon",
+                "tier": "5-Star Luxury Eco Resort",
+                "rating": "9.3",
+                "basePrice": 65.0,
+                "reviews": "1,240",
+                "suitability": "Family & Leisure",
+                "highlight": "Lush Greenery • Fine Dining • Luxury Suites",
+                "lat": 19.3512,
+                "lng": 72.8621
+            },
+            {
+                "name": "Farmhouse Garden Family Resort Vasai",
+                "tier": "Boutique Beach Resort",
+                "rating": "8.5",
+                "basePrice": 32.0,
+                "reviews": "1,140",
+                "suitability": "Couples & Family",
+                "highlight": "Near Vasai Beach • Fresh Seafood • Sprawling Lawns",
+                "lat": 19.3391,
+                "lng": 72.8123
+            },
+            {
+                "name": "Rudra Shelter Business Hotel",
+                "tier": "3-Star Business Stay",
+                "rating": "8.3",
+                "basePrice": 28.0,
+                "reviews": "920",
+                "suitability": "Business & Solo",
+                "highlight": "24h Room Service • Close to Station & Transit",
+                "lat": 19.3821,
+                "lng": 72.8410
+            }
         ],
         "flavours": [
             {
@@ -1066,13 +1217,13 @@ JSON FORMAT:
     "heritage": [
       {{
         "name": "Proper Name of Attraction in {city}",
-        "category": "Historic Bastion / Sacred Pilgrimage / Coastal Shoreline / Nature Sanctuary",
+        "category": "Historic Bastion / Sacred Pilgrimage / Coastal & Beach / Nature & Sanctuary",
         "rating": "4.8",
         "detail": "2 factual sentences on why travelers visit.",
         "timing": "09:00 AM – 07:00 PM",
         "entry": "Ticket rate in local currency or Free Public Access",
         "tips": "Practical tip on visiting hours.",
-        "best_transit": "Actual metro line, station name, or tram",
+        "best_transit": "Actual metro line, station name, or taxi",
         "lat": 0.0,
         "lng": 0.0
       }}
@@ -1085,7 +1236,9 @@ JSON FORMAT:
         "rating": "4.7",
         "reviews": "2,400",
         "suitability": "Family / Couples / Solo",
-        "highlight": "Standout amenity"
+        "highlight": "Standout amenity",
+        "lat": 0.0,
+        "lng": 0.0
       }}
     ],
     "flavours": [
@@ -1102,7 +1255,7 @@ JSON FORMAT:
     }}
   }}
 }}
-Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in 'real_hotels'.
+Provide at least 15 to 20 genuine landmarks in 'heritage' and 8 to 10 real hotels in 'real_hotels' with accurate coordinates.
 """
         data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
 
@@ -1117,7 +1270,7 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     return data
 
 # -------------------------------------------------------------
-# 16. UNIVERSAL AI GUIDE ASSISTANT
+# 16. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1210,7 +1363,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "85.0.0",
+        "version": "86.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
