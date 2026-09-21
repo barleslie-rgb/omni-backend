@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
-    version="84.0.0"
+    version="85.0.0"
 )
 
 app.add_middleware(
@@ -298,7 +298,75 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. NATIVE IN-APP FLIGHT SEARCH & COMPARISON ENGINE
+# 6. INQUIRY & QUESTION ANSWERING (FIXES 404 FOR PAPER PILOT)
+# -------------------------------------------------------------
+@app.post("/api/v1/ask-question")
+async def ask_question(request: Request):
+    question = ""
+    target_language = "English"
+    active_document_context = ""
+
+    content_type = request.headers.get("content-type", "").lower()
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            question = body.get("question", "")
+            target_language = body.get("target_language", "English")
+            active_document_context = body.get("active_document_context", "")
+        else:
+            form = await request.form()
+            question = form.get("question", "")
+            target_language = form.get("target_language", "English")
+            active_document_context = form.get("active_document_context", "")
+    except Exception:
+        pass
+
+    clean_q = str(question).strip()
+    if not clean_q:
+        return {"status": "error", "answer": "Please ask a question regarding the document."}
+
+    lang_lower = target_language.lower()
+    if "marathi" in lang_lower or "मराठी" in lang_lower:
+        lang_instruction = "Answer strictly in clear, reassuring, and easily understandable Marathi (मराठी - Devanagari script)."
+    elif "hindi" in lang_lower or "हिंदी" in lang_lower:
+        lang_instruction = "Answer strictly in clear, reassuring, and easily understandable Hindi (हिंदी - Devanagari script)."
+    elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
+        lang_instruction = "Answer strictly in clear Gujarati (ગુજરાતી script)."
+    else:
+        lang_instruction = f"Answer clearly and concisely in {target_language}."
+
+    sys_prompt = f"""
+You are Paper Pilot's Senior Legal & Anti-Fraud Document Consultant.
+You are assisting an ordinary citizen, farmer, or property buyer who wants plain-language explanations of their legal paperwork.
+{lang_instruction}
+
+DOCUMENT CONTEXT AUDITED BY FORENSIC SYSTEM:
+{active_document_context[:60000]}
+
+MANDATORY RULES:
+1. Explain in clear, simple everyday words. Avoid unnecessarily complex legal jargon.
+2. If the user asks about rights, explain who actually owns the land/shares.
+3. If there is a risk, scam, mortgage, encumbrance (बोझा), court stay, or fake power of attorney, point it out directly and warn them.
+4. Keep the answer direct and natural so that when read aloud in a warm voice, it sounds clear, patient, and conversational.
+"""
+    ans = await ask_fast_text(clean_q, sys_prompt)
+    return {"status": "success", "answer": ans}
+
+@app.post("/api/v1/chat")
+async def general_chat(request: Request):
+    try:
+        body = await request.json()
+        message = body.get("message") or body.get("question") or ""
+        target_language = body.get("target_language", "English")
+        context = body.get("context", "")
+        sys_prompt = f"You are a helpful legal and travel AI companion. Answer concisely in {target_language}.\nContext: {context}"
+        ans = await ask_fast_text(message, sys_prompt)
+        return {"status": "success", "answer": ans, "reply": ans}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -------------------------------------------------------------
+# 7. NATIVE IN-APP FLIGHT SEARCH & COMPARISON ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/search-flights")
 async def search_flights(request: Request):
@@ -312,7 +380,6 @@ async def search_flights(request: Request):
         cabin_class = body.get("cabin_class", "Economy")
         is_round_trip = body.get("is_round_trip", True)
 
-        # Baseline fare matrix in INR
         fare_benchmarks = {
             ("BOM", "TYO"): [
                 {
@@ -338,18 +405,6 @@ async def search_flights(request: Request):
                     "badge": "Fastest Direct",
                     "badge_color": "0xFFDC2626",
                     "perks": "23kg Check-in • Hot Gourmet Meals Included"
-                },
-                {
-                    "airline": "ANA (All Nippon Airways)",
-                    "code": "NH-830",
-                    "depart_time": "19:40",
-                    "arrive_time": "07:20",
-                    "duration": "8h 10m",
-                    "stops": "Non-stop Direct",
-                    "price_inr": 52800,
-                    "badge": "Top Rated 5-Star",
-                    "badge_color": "0xFF2563EB",
-                    "perks": "46kg Checked Baggage • 5-Star Comfort"
                 }
             ],
             ("BOM", "SIN"): [
@@ -364,18 +419,6 @@ async def search_flights(request: Request):
                     "badge": "Cheapest Fare",
                     "badge_color": "0xFF16A34A",
                     "perks": "7kg Cabin • Paid Add-ons Available"
-                },
-                {
-                    "airline": "Singapore Airlines",
-                    "code": "SQ-421",
-                    "depart_time": "23:45",
-                    "arrive_time": "07:40",
-                    "duration": "5h 25m",
-                    "stops": "Non-stop Direct",
-                    "price_inr": 28400,
-                    "badge": "World Class",
-                    "badge_color": "0xFF2563EB",
-                    "perks": "25kg Check-in • Gourmet In-flight Meals"
                 }
             ]
         }
@@ -383,7 +426,6 @@ async def search_flights(request: Request):
         pair = (origin, destination)
         results = fare_benchmarks.get(pair)
 
-        # Dynamic estimation if not present in the baseline benchmarks
         if not results:
             results = [
                 {
@@ -412,7 +454,6 @@ async def search_flights(request: Request):
                 }
             ]
 
-        # Multiplier adjustments for passengers and round trip
         adjusted_results = []
         for f in results:
             item = dict(f)
@@ -438,7 +479,7 @@ async def search_flights(request: Request):
         return {"status": "error", "message": str(e), "flights": []}
 
 # -------------------------------------------------------------
-# 7. UNIVERSAL AI CONCIERGE (8192 TOKENS FOR COMPLETE ITINERARIES)
+# 8. CONCIERGE TEXT & ITINERARIES
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -498,7 +539,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
     )
 
 # -------------------------------------------------------------
-# 8. STREET VOICE TRANSLATION (SUB-300ms GROQ ENGINE)
+# 9. STREET VOICE TRANSLATION
 # -------------------------------------------------------------
 @app.post("/api/v1/street-voice-translate")
 async def street_voice_translate(
@@ -559,7 +600,7 @@ async def street_voice_translate(
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
 # -------------------------------------------------------------
-# 9. STREET LENS (CAMERA SIGNBOARD OCR SCANNER)
+# 10. STREET LENS
 # -------------------------------------------------------------
 @app.post("/api/v1/street-lens")
 async def street_lens(
@@ -599,7 +640,7 @@ async def street_lens(
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 10. BARGAIN PAL (HAGGLING STUDIO EVALUATOR)
+# 11. BARGAIN PAL
 # -------------------------------------------------------------
 @app.post("/api/v1/bargain-evaluate")
 async def bargain_evaluate(request: Request):
@@ -636,7 +677,7 @@ JSON FORMAT:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 11. EXACT ENTITY WIKIPEDIA / WIKIMEDIA PHOTO RESOLVER
+# 12. WIKIPEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
@@ -680,7 +721,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     return ""
 
 # -------------------------------------------------------------
-# 12. DOCUMENT PARSERS
+# 13. DOCUMENT PARSERS & PREPARATION
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -787,7 +828,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 13. FORENSIC LEGAL AUDITOR ENDPOINTS
+# 14. FORENSIC LEGAL AUDITOR ENDPOINTS (LAND FRAUD & DEED PROTECTION)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -820,24 +861,25 @@ async def analyze_document(
             lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
             lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN HINDI (हिंदी - Devanagari script)."
+        elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
+            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN GUJARATI (ગુજરાતી script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
         dual_role_prompt = (
-            f"You are Paper Pilot, an authentic Forensic Legal Auditor.\n"
+            f"You are Paper Pilot, an authentic Forensic Land & Legal Auditor protecting citizens from land scams, fraudulent power-of-attorney documents, and bogus agreements.\n"
             f"{lang_instruction}\n\n"
-            f"PRESENTATION & STYLE RULES:\n"
-            f"1. Make ONLY headlines and key labels bold. Descriptions must be in regular weight.\n"
-            f"2. Any rates, dimensions, schedules, penalties, or numerical comparisons MUST be rendered in a clean Markdown Table.\n"
-            f"3. CRITICAL: Whenever you identify ANY legal liability, penalty, suspicious clause, indemnity risk, or statutory trap, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
-            f"STRUCTURE:\n"
-            f"• **Document Identity:** Type, Issuing Body, Document Date, Parties Involved, Official Seals, and Primary Headline.\n"
-            f"• **Scope & Multi-Page Summary:** Outline legal covenants across sections.\n"
-            f"• **Key Clauses, Tables & Directives:** Bullet points and tables of terms, dates, and covenants.\n"
-            f"• **Liabilities, Traps & Fine Print:** List every risky item with red warning prefixes.\n"
-            f"• **Actionable Roadmap:** Concrete next steps for the citizen, advocate, or signatory.\n\n"
+            f"PRESENTATION & AUDIT DIRECTIVES:\n"
+            f"1. Explain in simple, crystal-clear everyday language so that an individual with limited literacy or legal knowledge can immediately understand what this paper means.\n"
+            f"2. CRITICAL: Whenever you identify ANY legal liability, penalty, pending litigation, encumbrance/mortgage (बोझा/कर्ज), fake survey number, or scam risk, prefix that line with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
+            f"MANDATORY REPORT STRUCTURE:\n"
+            f"• **1. Plain Meaning & Document Identity (कागदपत्राचा सरळ भाषेत अर्थ):** Exact document type (e.g. 7/12 Satbara, Registered Sale Deed, Power of Attorney, Mutation Entry), issuing authority, official stamp validity, and primary parties.\n"
+            f"• **2. Red Flags & Land Scam Warnings (फसवणूक / धोके):** Disclose any unresolved loans, illegal claims, missing signatures, or dubious land boundaries.\n"
+            f"• **3. Rights & Benefits (हक्क आणि फायदे):** Concrete shares, ownership extent, or entitlements granted.\n"
+            f"• **4. Exclusions & Liabilities (काय समाविष्ट नाही / कायदेशीर बंधने):** Hidden conditions, obligations, or non-transferable rights.\n"
+            f"• **5. Actionable Roadmap (पुढील पडताळणी पावले):** Direct guidance on checking records at the Talathi / Sub-Registrar office.\n\n"
             f"At the very end of your response, output a single line:\n"
-            f"EXPLORE_SUGGESTIONS: [\"Verify issuing authority credentials\", \"Examine legal precedents\", \"Save document voucher to Family Travel Vault\"]"
+            f"EXPLORE_SUGGESTIONS: [\"Verify survey number at local Talathi office\", \"Check mutation entry (फेरफार) record\", \"Consult property registrar before payment\"]"
         )
 
         analysis_raw = None
@@ -874,7 +916,7 @@ async def analyze_document(
         suggestions = [
             "Verify official authority contact numbers",
             "Examine legal precedent and historical records",
-            "Save document voucher to Family Travel Vault"
+            "Consult property registrar before payment"
         ]
 
         clean_text = analysis_raw
@@ -919,7 +961,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 14. REGIONAL EXPLORER ENGINE
+# 15. REGIONAL EXPLORER ENGINE
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -1075,7 +1117,7 @@ Provide exactly 6 to 8 genuine landmarks in 'heritage' and 6 to 8 real hotels in
     return data
 
 # -------------------------------------------------------------
-# 15. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
+# 16. UNIVERSAL AI GUIDE ASSISTANT
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1160,7 +1202,7 @@ CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
     }
 
 # -------------------------------------------------------------
-# 16. SERVER HEALTH & STATUS
+# 17. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1168,7 +1210,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "84.0.0",
+        "version": "85.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
