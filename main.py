@@ -32,8 +32,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal & Transit Cloud",
-    version="86.0.0"
+    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Forensic Document Auditor & Transit Cloud",
+    version="87.0.0"
 )
 
 app.add_middleware(
@@ -213,12 +213,12 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.2,
+                    temperature=0.25,
                     max_tokens=8192,
                     timeout=55
                 )
                 raw = completion.choices[0].message.content
-                if raw and len(raw.strip()) > 10:
+                if raw and len(raw.strip()) > 5:
                     return sanitize_ai_output(raw)
             except Exception as e:
                 print(f"[Groq Text Notice with {model_id}]: {e}")
@@ -228,7 +228,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     if keys:
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192}
+            "generationConfig": {"temperature": 0.25, "maxOutputTokens": 8192}
         }
         async with httpx.AsyncClient(timeout=45.0) as http_client:
             for key in keys:
@@ -241,7 +241,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                             if candidates:
                                 parts = candidates[0].get("content", {}).get("parts", [])
                                 ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                                if len(ans) > 10:
+                                if len(ans) > 5:
                                     return sanitize_ai_output(ans)
                     except Exception:
                         continue
@@ -298,7 +298,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. INQUIRY & QUESTION ANSWERING (FIXES 404 FOR PAPER PILOT)
+# 6. UNIVERSAL CONVERSATION & INQUIRY (DUAL MODE: AUDIT + GENERAL)
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(request: Request):
@@ -323,35 +323,48 @@ async def ask_question(request: Request):
 
     clean_q = str(question).strip()
     if not clean_q:
-        return {"status": "error", "answer": "Please ask a question regarding the document."}
+        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your documents or general inquiries."}
 
     lang_lower = target_language.lower()
     if "marathi" in lang_lower or "मराठी" in lang_lower:
-        lang_instruction = "Answer strictly in clear, reassuring, and easily understandable Marathi (मराठी - Devanagari script)."
+        lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
     elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-        lang_instruction = "Answer strictly in clear, reassuring, and easily understandable Hindi (हिंदी - Devanagari script)."
+        lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
     elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
-        lang_instruction = "Answer strictly in clear Gujarati (ગુજરાતી script)."
+        lang_instruction = "Answer strictly in natural Gujarati (ગુજરાતી script)."
     else:
         lang_instruction = f"Answer clearly and concisely in {target_language}."
 
-    sys_prompt = f"""
-You are Paper Pilot's Senior Forensic Land, Legal & Historical Document Auditor.
-You assist ordinary citizens, property buyers, or heritage researchers seeking clarity on legal paperwork and historical artifacts.
+    has_doc = bool(active_document_context and len(active_document_context.strip()) > 30)
+
+    if has_doc:
+        sys_prompt = f"""
+You are Paper Pilot's Senior Forensic Auditor and Universal AI Expert (similar in intelligence and depth to Gemini and Grok).
 {lang_instruction}
 
-DOCUMENT CONTEXT AUDITED BY FORENSIC SYSTEM:
-{active_document_context[:60000]}
+AUDITED DOCUMENT CONTEXT:
+{active_document_context[:65000]}
 
 MANDATORY RULES:
-1. Explain in clear, simple everyday words. Avoid unnecessarily complex legal jargon.
-2. If the user asks about land rights, explain who actually owns the land/shares.
-3. If there is a scam, mortgage, encumbrance (बोझा), court stay, or fake power of attorney, point it out directly and warn them.
-4. If it is an inscription or historical document, explain its provenance, era, and historical importance.
+1. Ground your answer in the document context above. Cite specific clauses, monetary sums, names, and dates where relevant.
+2. If the user asks about land rights, liabilities, or ownership, explain clearly who actually holds rights and what risks exist.
+3. If there is a scam, encumbrance (बोझा), mortgage lien, court stay, or dubious clause, point it out directly and explain the implications.
+4. If the user shifts to a general or procedural inquiry (e.g. calculation, legal procedure, translation, general advice), answer comprehensively using your full reasoning capability.
 5. Keep the answer direct and natural so that when read aloud in a warm voice, it sounds clear, patient, and conversational.
 """
+    else:
+        sys_prompt = f"""
+You are Omni TouristOS Universal Intelligence Guide (acting like Gemini and Grok).
+{lang_instruction}
+
+DIRECTIVES:
+1. Answer the user's inquiry directly, insightfully, and accurately without requiring a document to be uploaded.
+2. You assist with general reasoning, travel tips, math, coding, legal knowledge, translations, and everyday inquiries.
+3. Avoid generic canned setups or robotic disclaimers. Jump straight into the substance of the answer.
+"""
+
     ans = await ask_fast_text(clean_q, sys_prompt)
-    return {"status": "success", "answer": ans}
+    return {"status": "success", "answer": ans, "reply": ans}
 
 @app.post("/api/v1/chat")
 async def general_chat(request: Request):
@@ -360,7 +373,7 @@ async def general_chat(request: Request):
         message = body.get("message") or body.get("question") or ""
         target_language = body.get("target_language", "English")
         context = body.get("context", "")
-        sys_prompt = f"You are a helpful legal and travel AI companion. Answer concisely in {target_language}.\nContext: {context}"
+        sys_prompt = f"You are Omni AI Universal Assistant (like Gemini/Grok). Answer insightfully, warmly, and concisely in {target_language}.\nContext: {context}"
         ans = await ask_fast_text(message, sys_prompt)
         return {"status": "success", "answer": ans, "reply": ans}
     except Exception as e:
@@ -375,8 +388,8 @@ async def search_flights(request: Request):
         body = await request.json()
         origin = body.get("origin", "BOM").upper()
         destination = body.get("destination", "TYO").upper()
-        depart_date = body.get("depart_date", "2026-09-21")
-        return_date = body.get("return_date", "2026-09-28")
+        depart_date = body.get("departure_date") or body.get("depart_date") or "2026-09-21"
+        return_date = body.get("return_date") or "2026-09-28"
         adults = int(body.get("adults", 1))
         cabin_class = body.get("cabin_class", "Economy")
         is_round_trip = body.get("is_round_trip", True)
@@ -455,12 +468,21 @@ async def search_flights(request: Request):
                 }
             ]
 
+        mult = 1.0
+        if cabin_class == "Premium Economy":
+            mult = 1.55
+        elif cabin_class == "Business":
+            mult = 2.85
+        elif cabin_class == "First Class":
+            mult = 4.60
+
         adjusted_results = []
         for f in results:
             item = dict(f)
-            unit_price = item["price_inr"] * (1.85 if is_round_trip else 1.0)
+            unit_price = item["price_inr"] * (1.85 if is_round_trip else 1.0) * mult
             item["unit_price_inr"] = int(unit_price)
             item["total_price_inr"] = int(unit_price * adults)
+            item["price"] = int(unit_price)
             item["currency"] = "INR"
             item["symbol"] = "₹"
             adjusted_results.append(item)
@@ -722,7 +744,7 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     return ""
 
 # -------------------------------------------------------------
-# 13. DOCUMENT PARSERS & PREPARATION
+# 13. DOCUMENT PARSERS & PREPARATION (MULTI-FORMAT)
 # -------------------------------------------------------------
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -819,8 +841,8 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1200:
-            pil_img.thumbnail((1200, 1200), Image.Resampling.BILINEAR)
+        if max(pil_img.size) > 1400:
+            pil_img.thumbnail((1400, 1400), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
         pil_img.save(out_buf, format="JPEG", quality=90)
         return out_buf.getvalue()
@@ -829,7 +851,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 14. FORENSIC LEGAL AUDITOR (DUAL ENGINE: FRAUD + HISTORICAL)
+# 14. FORENSIC LEGAL AUDITOR (GROK & GEMINI DUAL ENGINE AUDIT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -847,7 +869,7 @@ async def analyze_document(
             extracted_text = extract_text_from_docx(file_bytes)
         elif filename.endswith(".pptx"):
             extracted_text = extract_text_from_pptx(file_bytes)
-        elif filename.endswith(".xlsx"):
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
             extracted_text = extract_text_from_xlsx(file_bytes)
         elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md"]):
             try:
@@ -859,40 +881,47 @@ async def analyze_document(
 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN MARATHI (मराठी - Devanagari script)."
+            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire forensic analysis, headings, and tables STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN HINDI (हिंदी - Devanagari script)."
+            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire forensic analysis, headings, and tables STRICTLY IN HINDI (हिंदी - Devanagari script)."
         elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
-            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire analysis, headings, and tables STRICTLY IN GUJARATI (ગુજરાતી script)."
+            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire forensic analysis, headings, and tables STRICTLY IN GUJARATI (ગુજરાતી script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
         dual_role_prompt = (
-            f"You are Paper Pilot, a Dual-Engine Forensic Legal Fraud Auditor and Historical Document Decipherer.\n"
+            f"You are Paper Pilot, an Elite Forensic Legal Fraud Auditor, Financial Investigator, and Historical Document Decipherer (functioning at the benchmark level of Gemini 1.5 Pro and Grok).\n"
             f"{lang_instruction}\n\n"
-            f"DUAL-ENGINE DETECTION DIRECTIVES:\n"
-            f"1. MODERN LAND & LEGAL FRAUD: If analyzing land titles (7/12 Satbara, mutation entries, registry deeds, power of attorney, stamp papers):\n"
-            f"   • Explain plainly what the document is and who holds the rights.\n"
-            f"   • Identify any encumbrances/loans (बोझा/कर्ज), court stays, fake survey numbers, or fraudulent clauses, prefixing with '🚨 **[SUSPICIOUS / RISK]:**'.\n"
-            f"2. HISTORICAL ARTIFACT & ARCHIVAL SCRIPT: If analyzing ancient manuscripts, stone inscriptions, copper plates, or heritage seals:\n"
-            f"   • Decipher the text, script (e.g. Modi, Brahmi, Devanagari, Persian, Latin), historical era, and architectural/royal context.\n"
-            f"   • Highlight missing lines or preservation warnings with '🚨 **[SUSPICIOUS / RISK]:**'.\n\n"
+            f"MISSION DIRECTIVES:\n"
+            f"1. MODERN LAND, CONTRACT & LEGAL FRAUD:\n"
+            f"   • Detail exact document classification, issuing authority, dates, registration numbers, and parties.\n"
+            f"   • Identify any encumbrances, bank loans (बोझा/कर्ज), court stays, fake survey numbers, forfeiture clauses, or ambiguous liabilities.\n"
+            f"   • Highlight every suspicious risk prominently with '🚨 **[CRITICAL RISK / ALERT]:**'.\n"
+            f"2. SPREADSHEETS, INVOICES & FINANCIAL AUDIT:\n"
+            f"   • Extract sums, consideration amounts, stamp duties, GST/tax rates, and penalty terms into a clean tabular layout.\n"
+            f"3. HISTORICAL ARTIFACT & ARCHIVAL SCRIPT:\n"
+            f"   • Decipher the text, script (e.g. Modi, Brahmi, Devanagari, Persian, Latin), historical era, and architectural/royal context.\n\n"
             f"MANDATORY REPORT STRUCTURE:\n"
-            f"• **1. Plain Meaning & Document Identity (कागदपत्राचा सरळ भाषेत अर्थ):** Exact document type, issuing authority, dates, and primary parties or provenance.\n"
-            f"• **2. Red Flags & Vulnerabilities (फसवणूक / धोके):** Disclose any loans, dubious claims, missing signatures, or historical damage.\n"
-            f"• **3. Rights, Benefits & Insights (हक्क आणि फायदे):** Ownership rights, land parcels, or historical significance.\n"
-            f"• **4. Exclusions & Liabilities (काय समाविष्ट नाही):** Hidden liabilities or excluded rights.\n"
-            f"• **5. Actionable Roadmap (पुढील पडताळणी पावले):** Direct advice on verifying with the local Talathi/Sub-Registrar or archaeological archive.\n\n"
+            f"### 1. Document Identity & Executive Summary (कागदपत्राचा सरळ भाषेत अर्थ)\n"
+            f"• Exact document type, issuing authority/notary, registration codes, effective dates, and primary parties.\n\n"
+            f"### 2. Critical Red Flags & Hidden Liabilities (फसवणूक / धोके व जोखीम)\n"
+            f"• Disclose any loans, dubious claims, missing signatures, or tax mismatches prefixed with 🚨 **[CRITICAL RISK / ALERT]:**.\n\n"
+            f"### 3. Financial & Rights Breakdown (हक्क आणि आर्थिक विश्लेषण)\n"
+            f"• Ownership rights, land parcels, shares, consideration amounts, and penalty terms.\n\n"
+            f"### 4. Exclusions & Scope of Authority (काय समाविष्ट नाही)\n"
+            f"• Hidden liabilities or excluded rights.\n\n"
+            f"### 5. Actionable Roadmap & Verification Directives (पुढील पडताळणी पावले)\n"
+            f"• Direct advice on verifying with the local Talathi/Sub-Registrar, bank, or archaeological archive.\n\n"
             f"At the very end of your response, output a single line:\n"
-            f"EXPLORE_SUGGESTIONS: [\"Verify survey number at local Talathi office\", \"Check mutation entry (फेरफार) record\", \"Consult property registrar before payment\"]"
+            f"EXPLORE_SUGGESTIONS: [\"What are the biggest financial risks in this document?\", \"Are there hidden penalty or termination clauses?\", \"How do I verify the authenticity of this record?\"]"
         )
 
         analysis_raw = None
         diagnostic_err = ""
 
         if len(extracted_text.strip()) > 30:
-            doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages: {total_pages_detected})\n\n"
-            truncated_content = extracted_text[:80000]
+            doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages/Sheets: {total_pages_detected})\n\n"
+            truncated_content = extracted_text[:85000]
             analysis_raw = await ask_fast_text(
                 f"{doc_context_header}{truncated_content}\n\nConduct full forensic audit according to your directives.",
                 dual_role_prompt
@@ -906,7 +935,7 @@ async def analyze_document(
                     mime_type="image/jpeg"
                 )
             else:
-                diagnostic_err = "Could not decode this file format. Please ensure it is a valid PDF, Word, Excel, PowerPoint, or Image."
+                diagnostic_err = "Could not decode this file format. Please ensure it is a valid PDF, Word document, Excel spreadsheet, or Image."
 
         del file_bytes
         gc.collect()
@@ -919,9 +948,9 @@ async def analyze_document(
             }
 
         suggestions = [
-            "Verify official authority contact numbers",
-            "Examine legal precedent and historical records",
-            "Consult property registrar before payment"
+            "What are the biggest financial risks in this document?",
+            "Are there hidden penalty or termination clauses?",
+            "How do I verify the authenticity of this record?"
         ]
 
         clean_text = analysis_raw
@@ -1363,7 +1392,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "86.0.0",
+        "version": "87.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
