@@ -1192,18 +1192,23 @@ REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
         }
     }
 }
-
 @app.post("/api/v1/explore-city")
 async def explore_city(request: Request):
     city = "Vasai-Virar"
     state = "Maharashtra"
     country = "India"
+    adults = 2
+    kids = 0
+    target_language = "English"
 
     try:
         body = await request.json()
         city = (body.get("city") or "").strip()
         state = (body.get("state") or "").strip()
         country = (body.get("country") or "").strip()
+        adults = int(body.get("adults", 2))
+        kids = int(body.get("kids", 0))
+        target_language = body.get("target_language", "English")
     except Exception:
         pass
 
@@ -1217,86 +1222,74 @@ async def explore_city(request: Request):
                          for name in ["vasai", "virar", "vasai-virar", "bassein"])
 
     if is_vasai_virar and ("india" in country.lower() or not country):
-        anchor = REGIONAL_ANCHORS["vasai-virar"]
-        data = {
+        anchor = REGIONAL_ANCHORS.get("vasai-virar", {})
+        spots = anchor.get("spots", [])
+        hotels = anchor.get("real_hotels", [])
+        return {
+            "status": "success",
             "city": "Vasai-Virar",
             "state": "Maharashtra",
             "country": "India",
-            "tagline": anchor["tagline"],
-            "pillars": {
-                "heritage": anchor["spots"],
-                "real_hotels": anchor.get("real_hotels", []),
-                "flavours": anchor["flavours"],
-                "transit": anchor["transit"]
-            }
+            "landmarks": spots,
+            "hotels": hotels
         }
-    else:
-        loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
-        sys_prompt = f"""
-You are the authoritative Global Tourism Concierge for '{loc_label}'.
-Output a JSON object ONLY without markdown backticks or commentary.
 
-JSON FORMAT:
+    loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
+
+    sys_prompt = f"""
+You are the authoritative Global Tourism & Hospitality Engine (like MakeMyTrip & Booking.com) for '{loc_label}'.
+Generate a comprehensive, verified catalog of 25 to 30 genuine, distinct attractions and 15 real, operational hotels in '{city}'.
+Output STRICT JSON ONLY matching this schema without markdown fences:
+
 {{
   "city": "{city}",
-  "state": "{state}",
   "country": "{country}",
-  "tagline": "Compelling 1-sentence description capturing what {city} is globally recognized for.",
-  "pillars": {{
-    "heritage": [
-      {{
-        "name": "Proper Name of Attraction in {city}",
-        "category": "Historic Bastion / Sacred Pilgrimage / Coastal & Beach / Nature & Sanctuary",
-        "rating": "4.8",
-        "detail": "2 factual sentences on why travelers visit.",
-        "timing": "09:00 AM – 07:00 PM",
-        "entry": "Ticket rate in local currency or Free Public Access",
-        "tips": "Practical tip on visiting hours.",
-        "best_transit": "Actual metro line, station name, or taxi",
-        "lat": 0.0,
-        "lng": 0.0
-      }}
-    ],
-    "real_hotels": [
-      {{
-        "tier": "Budget / Value / Comfort (3-4 Star) / 5-Star Luxury",
-        "name": "Actual Operational Hotel Name in {city}",
-        "basePrice": 75.0,
-        "rating": "4.7",
-        "reviews": "2,400",
-        "suitability": "Family / Couples / Solo",
-        "highlight": "Standout amenity",
-        "lat": 0.0,
-        "lng": 0.0
-      }}
-    ],
-    "flavours": [
-      {{
-        "name": "Iconic regional dish in {city}",
-        "detail": "Culinary description."
-      }}
-    ],
-    "transit": {{
-      "railway": "Main metro line or central train terminal",
-      "bus_depot": "Central bus terminal",
-      "bus_depot_phone": "Official transit agency",
-      "auto_fares": "Taxi or rideshare rules"
+  "landmarks": [
+    {{
+      "name": "Exact Name of Attraction",
+      "category": "Heritage & Forts / Sacred & Spiritual / Beaches & Coast / Nature & Wildlife / Culinary & Bazaars",
+      "distance": "X.X km from Center",
+      "timing": "09:00 AM – 06:00 PM",
+      "entry": "Entry fee in local currency or Free",
+      "lat": 0.0,
+      "lng": 0.0,
+      "history": "2 informative, accurate sentences on this landmark's background.",
+      "best_food": "Specific local specialty or nearby eatery.",
+      "things_to_do": "Practical activities for visitors.",
+      "best_time": "Optimal time of day or season to visit.",
+      "scams_and_warnings": "Actionable local safety or pricing advice."
     }}
-  }}
+  ],
+  "hotels": [
+    {{
+      "name": "Actual Operational Hotel Name",
+      "tier": "Budget Comfort / 4-Star & Executive / 5-Star Luxury Resort",
+      "rating": "8.7",
+      "reviews": "1,420",
+      "price": 85,
+      "phone": "+1 800 555 0100",
+      "distance": "1.2 km from Center",
+      "amenities": "Free Wi-Fi • Breakfast • Pool",
+      "lat": 0.0,
+      "lng": 0.0
+    }}
+  ]
 }}
-Provide at least 15 to 20 genuine landmarks in 'heritage' and 8 to 10 real hotels in 'real_hotels' with accurate coordinates.
 """
-        data = await ask_fast_json(f"Generate verified travel dossier for {loc_label}.", sys_prompt)
 
-    if data and "pillars" in data and "heritage" in data["pillars"]:
-        for spot in data["pillars"]["heritage"]:
-            s_name = spot.get("name", "")
-            if not spot.get("image") or not spot["image"].startswith("http"):
-                wiki_photo = get_verified_landmark_photo(s_name, city)
-                if wiki_photo:
-                    spot["image"] = wiki_photo
+    data = await ask_fast_json(f"Generate verified attractions and hotels for {loc_label}.", sys_prompt)
 
-    return data
+    if data and "landmarks" in data:
+        return {
+            "status": "success",
+            "city": city,
+            "state": state,
+            "country": country,
+            "landmarks": data.get("landmarks", []),
+            "hotels": data.get("hotels", [])
+        }
+
+    return {"status": "error", "city": city, "landmarks": [], "hotels": []}
 
 # -------------------------------------------------------------
 # 16. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
