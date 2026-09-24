@@ -33,7 +33,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Forensic Document Auditor & Transit Cloud",
-    version="87.0.0"
+    version="88.0.0"
 )
 
 app.add_middleware(
@@ -298,7 +298,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. UNIVERSAL CONVERSATION & INQUIRY (DUAL MODE: AUDIT + GENERAL)
+# 6. UNIVERSAL CONVERSATION & INQUIRY
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(request: Request):
@@ -323,7 +323,7 @@ async def ask_question(request: Request):
 
     clean_q = str(question).strip()
     if not clean_q:
-        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your documents or general inquiries."}
+        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your documents, travels, or general inquiries."}
 
     lang_lower = target_language.lower()
     if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -339,7 +339,7 @@ async def ask_question(request: Request):
 
     if has_doc:
         sys_prompt = f"""
-You are Paper Pilot's Senior Forensic Auditor and Universal AI Expert (similar in intelligence and depth to Gemini and Grok).
+You are Paper Pilot's Senior Forensic Auditor and Universal AI Expert.
 {lang_instruction}
 
 AUDITED DOCUMENT CONTEXT:
@@ -349,18 +349,18 @@ MANDATORY RULES:
 1. Ground your answer in the document context above. Cite specific clauses, monetary sums, names, and dates where relevant.
 2. If the user asks about land rights, liabilities, or ownership, explain clearly who actually holds rights and what risks exist.
 3. If there is a scam, encumbrance (बोझा), mortgage lien, court stay, or dubious clause, point it out directly and explain the implications.
-4. If the user shifts to a general or procedural inquiry (e.g. calculation, legal procedure, translation, general advice), answer comprehensively using your full reasoning capability.
-5. Keep the answer direct and natural so that when read aloud in a warm voice, it sounds clear, patient, and conversational.
+4. If the user shifts to a general or procedural inquiry, answer comprehensively using your full reasoning capability.
+5. Keep the answer direct and natural so that when read aloud, it sounds clear, patient, and conversational.
 """
     else:
         sys_prompt = f"""
-You are Omni TouristOS Universal Intelligence Guide (acting like Gemini and Grok).
+You are Omni TouristOS Universal Intelligence Guide.
 {lang_instruction}
 
 DIRECTIVES:
 1. Answer the user's inquiry directly, insightfully, and accurately without requiring a document to be uploaded.
 2. You assist with general reasoning, travel tips, math, coding, legal knowledge, translations, and everyday inquiries.
-3. Avoid generic canned setups or robotic disclaimers. Jump straight into the substance of the answer.
+3. Avoid generic setups or robotic disclaimers. Jump straight into the substance of the answer.
 """
 
     ans = await ask_fast_text(clean_q, sys_prompt)
@@ -373,14 +373,149 @@ async def general_chat(request: Request):
         message = body.get("message") or body.get("question") or ""
         target_language = body.get("target_language", "English")
         context = body.get("context", "")
-        sys_prompt = f"You are Omni AI Universal Assistant (like Gemini/Grok). Answer insightfully, warmly, and concisely in {target_language}.\nContext: {context}"
+        sys_prompt = f"You are Omni AI Universal Assistant. Answer insightfully, warmly, and concisely in {target_language}.\nContext: {context}"
         ans = await ask_fast_text(message, sys_prompt)
         return {"status": "success", "answer": ans, "reply": ans}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 7. NATIVE IN-APP FLIGHT SEARCH & COMPARISON ENGINE
+# 7. MULTI-FORMAT DOCUMENT CONVERTER ENGINE
+# -------------------------------------------------------------
+@app.post("/api/v1/convert-file")
+async def convert_file(
+    file: UploadFile = File(...),
+    target_format: str = Form(...)
+):
+    try:
+        file_bytes = await file.read()
+        filename = file.filename or "document.bin"
+        target_fmt = target_format.upper().strip()
+
+        converted_filename = f"Converted_{uuid.uuid4().hex[:8]}.{target_fmt.lower()}"
+        save_path = os.path.join(DOWNLOADS_DIR, converted_filename)
+
+        if target_fmt in ["TXT", "TEXT", "MD"]:
+            try:
+                text_content = file_bytes.decode("utf-8", errors="ignore")
+            except Exception:
+                text_content = str(file_bytes)
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(text_content)
+
+        elif target_fmt == "HTML":
+            text_content = file_bytes.decode("utf-8", errors="ignore")
+            html_content = f"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><pre>{text_content}</pre></body></html>"
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+
+        elif target_fmt in ["DOCX", "DOC"]:
+            text_content = file_bytes.decode("utf-8", errors="ignore")
+            doc_html = f"<!DOCTYPE html><html><body>{text_content.replace(chr(10), '<br/>')}</body></html>"
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(doc_html)
+
+        elif target_fmt == "JSON":
+            try:
+                text_content = file_bytes.decode("utf-8", errors="ignore")
+                parsed = json.loads(text_content)
+                with open(save_path, "w", encoding="utf-8") as f:
+                    json.dump(parsed, f, indent=2)
+            except Exception:
+                with open(save_path, "w", encoding="utf-8") as f:
+                    json.dump({"raw_file": filename, "size": len(file_bytes)}, f, indent=2)
+
+        elif target_fmt in ["JPG", "JPEG", "PNG", "WEBP", "BMP"]:
+            pil_img = Image.open(io.BytesIO(file_bytes))
+            pil_img = ImageOps.exif_transpose(pil_img)
+            if pil_img.mode != "RGB" and target_fmt in ["JPG", "JPEG"]:
+                pil_img = pil_img.convert("RGB")
+            pil_img.save(save_path, format="JPEG" if target_fmt in ["JPG", "JPEG"] else target_fmt)
+
+        else:
+            with open(save_path, "wb") as f:
+                f.write(file_bytes)
+
+        host_url = str(file.headers.get("host") or "omni-backend-pk28.onrender.com")
+        scheme = "https" if "onrender.com" in host_url else "http"
+        download_url = f"{scheme}://{host_url}/downloads/{converted_filename}"
+
+        return {
+            "status": "success",
+            "download_url": download_url,
+            "filename": converted_filename,
+            "format": target_fmt
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"Conversion error: {str(e)}"}
+
+# -------------------------------------------------------------
+# 8. DOSSIER EXPORT ENGINES (PDF & WORD)
+# -------------------------------------------------------------
+@app.post("/api/v1/export-pdf")
+async def export_pdf(title: str = Form(...), content: str = Form(...)):
+    try:
+        pdf_filename = f"Vault_Dossier_{uuid.uuid4().hex[:8]}.pdf"
+        save_path = os.path.join(DOWNLOADS_DIR, pdf_filename)
+
+        html_source = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{title}</title>
+    <style>
+        body {{ font-family: sans-serif; padding: 24px; color: #0F172A; line-height: 1.5; }}
+        h1 {{ color: #1E3A8A; font-size: 18pt; border-bottom: 2px solid #2563EB; padding-bottom: 6px; }}
+        pre {{ white-space: pre-wrap; font-size: 10pt; font-family: monospace; }}
+    </style>
+</head>
+<body>
+    <h1>{title}</h1>
+    <pre>{content}</pre>
+</body>
+</html>"""
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(html_source)
+
+        download_url = f"/downloads/{pdf_filename}"
+        return {"status": "success", "download_url": download_url, "file_name": pdf_filename}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/v1/export-docx")
+async def export_docx(title: str = Form(...), content: str = Form(...)):
+    try:
+        doc_filename = f"Vault_Dossier_{uuid.uuid4().hex[:8]}.doc"
+        save_path = os.path.join(DOWNLOADS_DIR, doc_filename)
+
+        html_source = f"""\uFEFF<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>{title}</title>
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; padding: 24px; color: #0F172A; line-height: 1.6; }}
+        h1 {{ color: #1E3A8A; font-size: 18pt; border-bottom: 2px solid #2563EB; padding-bottom: 6px; }}
+        pre {{ white-space: pre-wrap; font-size: 11pt; }}
+    </style>
+</head>
+<body>
+    <h1>{title}</h1>
+    <pre>{content}</pre>
+</body>
+</html>"""
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(html_source)
+
+        download_url = f"/downloads/{doc_filename}"
+        return {"status": "success", "download_url": download_url, "file_name": doc_filename}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -------------------------------------------------------------
+# 9. NATIVE IN-APP FLIGHT SEARCH & COMPARISON ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/search-flights")
 async def search_flights(request: Request):
@@ -502,7 +637,7 @@ async def search_flights(request: Request):
         return {"status": "error", "message": str(e), "flights": []}
 
 # -------------------------------------------------------------
-# 8. CONCIERGE TEXT & ITINERARIES
+# 10. CONCIERGE MULTI-TURN TEXT HELPER
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -556,13 +691,13 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                         continue
 
     return (
-        f"### 📍 Trip Outline\n\n"
-        f"I am ready to plan your trip for **{prompt}**. "
-        f"Please share your exact departure city, preferred travel dates, or budget preferences so I can generate a complete itinerary."
+        f"### 📍 Travel Advisory\n\n"
+        f"I am ready to plan your travel and transit inquiries for **{prompt}**. "
+        f"Please share your preferences, itinerary questions, or location details."
     )
 
 # -------------------------------------------------------------
-# 9. STREET VOICE TRANSLATION
+# 11. STREET VOICE TRANSLATION
 # -------------------------------------------------------------
 @app.post("/api/v1/street-voice-translate")
 async def street_voice_translate(
@@ -623,7 +758,7 @@ async def street_voice_translate(
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
 # -------------------------------------------------------------
-# 10. STREET LENS
+# 12. STREET LENS
 # -------------------------------------------------------------
 @app.post("/api/v1/street-lens")
 async def street_lens(
@@ -642,7 +777,7 @@ async def street_lens(
             f"INSTRUCTIONS:\n"
             f"1. Detect and read all visible text in the image (street sign, store name, restaurant menu, warning board, transit exit).\n"
             f"2. Provide a 2-to-3 sentence clear explanation in {target_language} of what the sign says and its practical meaning for a visitor.\n"
-            f"3. If there is a restriction, timing, or fine (e.g., No Parking, Metro Exit, Entry Fee, Dangerous Wave, Halal/Vegetarian), clearly highlight it.\n"
+            f"3. If there is a restriction, timing, or fine, clearly highlight it.\n"
             f"4. Keep it concise so it can be read aloud in 15 seconds."
         )
 
@@ -663,7 +798,7 @@ async def street_lens(
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 11. BARGAIN PAL
+# 13. BARGAIN PAL
 # -------------------------------------------------------------
 @app.post("/api/v1/bargain-evaluate")
 async def bargain_evaluate(request: Request):
@@ -700,7 +835,7 @@ JSON FORMAT:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 12. WIKIPEDIA PHOTO RESOLVER
+# 14. WIKIPEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
@@ -744,8 +879,33 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     return ""
 
 # -------------------------------------------------------------
-# 13. DOCUMENT PARSERS & PREPARATION (MULTI-FORMAT)
+# 15. DOCUMENT PARSERS & BINARY FORENSIC INSPECTOR
 # -------------------------------------------------------------
+def inspect_binary_stream(file_bytes: bytes, max_len: int = 1024) -> str:
+    """Disassembles raw binary/hex/executable streams for forensic auditing."""
+    try:
+        hex_dump = []
+        ascii_dump = []
+        preview_len = min(len(file_bytes), max_len)
+        
+        for i in range(0, preview_len, 16):
+            chunk = file_bytes[i:i+16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            ascii_part = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+            hex_dump.append(f"{i:06x}:  {hex_part:<48}  |{ascii_part}|")
+            
+        printable_strings = re.findall(rb'[A-Za-z0-9/\-_:., ]{4,}', file_bytes[:preview_len * 4])
+        decoded_strings = [s.decode('ascii', errors='ignore') for s in printable_strings[:40]]
+
+        return (
+            f"BINARY STREAM FORENSIC DISASSEMBLY (First {preview_len} bytes):\n" +
+            "\n".join(hex_dump) +
+            "\n\nEMBEDDED ASCII STRINGS IDENTIFIED:\n" +
+            "\n".join(f"• {s}" for s in decoded_strings)
+        )
+    except Exception as e:
+        return f"Binary disassembly note: {e}"
+
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
@@ -757,8 +917,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                 if texts:
                     paragraphs.append("".join(texts))
             return "\n".join(paragraphs)
-    except Exception as e:
-        print(f"[DOCX error]: {e}")
+    except Exception:
         return ""
 
 def extract_text_from_pptx(file_bytes: bytes) -> str:
@@ -773,8 +932,7 @@ def extract_text_from_pptx(file_bytes: bytes) -> str:
                 if slide_texts:
                     all_text.append(" • " + " ".join(slide_texts))
             return "\n\n".join(all_text)
-    except Exception as e:
-        print(f"[PPTX error]: {e}")
+    except Exception:
         return ""
 
 def extract_text_from_xlsx(file_bytes: bytes) -> str:
@@ -808,8 +966,7 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
                     if row_vals:
                         table_output.append(" | ".join(row_vals))
             return "\n".join(table_output)
-    except Exception as e:
-        print(f"[XLSX error]: {e}")
+    except Exception:
         return ""
 
 def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[str, int]:
@@ -831,8 +988,7 @@ def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[s
 
         full_extracted = "\n\n".join(extracted_chunks)
         return full_extracted.strip(), total_pages
-    except Exception as e:
-        print(f"[pypdf extraction error]: {e}")
+    except Exception:
         return "", 0
 
 def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
@@ -846,12 +1002,11 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         out_buf = io.BytesIO()
         pil_img.save(out_buf, format="JPEG", quality=90)
         return out_buf.getvalue()
-    except Exception as e:
-        print(f"[Pillow error]: {e}")
+    except Exception:
         return None
 
 # -------------------------------------------------------------
-# 14. FORENSIC LEGAL AUDITOR (GROK & GEMINI DUAL ENGINE AUDIT)
+# 16. FORENSIC LEGAL AUDITOR (PAPER PILOT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -871,56 +1026,56 @@ async def analyze_document(
             extracted_text = extract_text_from_pptx(file_bytes)
         elif filename.endswith(".xlsx") or filename.endswith(".xls"):
             extracted_text = extract_text_from_xlsx(file_bytes)
-        elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md"]):
+        elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md", ".xml", ".rtf"]):
             try:
                 extracted_text = file_bytes.decode("utf-8", errors="ignore")
             except Exception:
                 pass
+        elif any(filename.endswith(ext) for ext in [".bin", ".dat", ".hex", ".iso", ".exe"]):
+            extracted_text = inspect_binary_stream(file_bytes)
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
             extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire forensic analysis, headings, and tables STRICTLY IN MARATHI (मराठी - Devanagari script)."
+            lang_instruction = "CRITICAL: Produce the entire forensic audit, tables, and warnings STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire forensic analysis, headings, and tables STRICTLY IN HINDI (हिंदी - Devanagari script)."
+            lang_instruction = "CRITICAL: Produce the entire forensic audit, tables, and warnings STRICTLY IN HINDI (हिंदी - Devanagari script)."
         elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
-            lang_instruction = "CRITICAL LANGUAGE RULE: Produce the entire forensic analysis, headings, and tables STRICTLY IN GUJARATI (ગુજરાતી script)."
+            lang_instruction = "CRITICAL: Produce the entire forensic audit, tables, and warnings STRICTLY IN GUJARATI (ગુજરાતી script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
         dual_role_prompt = (
-            f"You are Paper Pilot, an Elite Forensic Legal Fraud Auditor, Financial Investigator, and Historical Document Decipherer (functioning at the benchmark level of Gemini 1.5 Pro and Grok).\n"
+            f"You are Paper Pilot, an Elite Forensic Legal Fraud Auditor, Financial Investigator, and Machine Binary Analyst.\n"
             f"{lang_instruction}\n\n"
             f"MISSION DIRECTIVES:\n"
-            f"1. MODERN LAND, CONTRACT & LEGAL FRAUD:\n"
-            f"   • Detail exact document classification, issuing authority, dates, registration numbers, and parties.\n"
-            f"   • Identify any encumbrances, bank loans (बोझा/कर्ज), court stays, fake survey numbers, forfeiture clauses, or ambiguous liabilities.\n"
+            f"1. MODERN CONTRACTS, LAND & LEGAL FRAUD:\n"
+            f"   • Detail document classifications, registration numbers, parties, and effective dates.\n"
+            f"   • Identify any encumbrances, loans, court stays, forfeiture clauses, or hidden liabilities.\n"
             f"   • Highlight every suspicious risk prominently with '🚨 **[CRITICAL RISK / ALERT]:**'.\n"
-            f"2. SPREADSHEETS, INVOICES & FINANCIAL AUDIT:\n"
-            f"   • Extract sums, consideration amounts, stamp duties, GST/tax rates, and penalty terms into a clean tabular layout.\n"
-            f"3. HISTORICAL ARTIFACT & ARCHIVAL SCRIPT:\n"
-            f"   • Decipher the text, script (e.g. Modi, Brahmi, Devanagari, Persian, Latin), historical era, and architectural/royal context.\n\n"
+            f"2. SPREADSHEETS, INVOICES & FINANCIAL RECORDS:\n"
+            f"   • Extract sums, consideration amounts, stamp duties, and penalty terms into a clean tabular structure.\n"
+            f"3. BINARY DATA & RAW STREAMS:\n"
+            f"   • Disassemble and report on internal magic bytes, architecture, embedded string markers, and file integrity.\n\n"
             f"MANDATORY REPORT STRUCTURE:\n"
-            f"### 1. Document Identity & Executive Summary (कागदपत्राचा सरळ भाषेत अर्थ)\n"
-            f"• Exact document type, issuing authority/notary, registration codes, effective dates, and primary parties.\n\n"
-            f"### 2. Critical Red Flags & Hidden Liabilities (फसवणूक / धोके व जोखीम)\n"
-            f"• Disclose any loans, dubious claims, missing signatures, or tax mismatches prefixed with 🚨 **[CRITICAL RISK / ALERT]:**.\n\n"
-            f"### 3. Financial & Rights Breakdown (हक्क आणि आर्थिक विश्लेषण)\n"
-            f"• Ownership rights, land parcels, shares, consideration amounts, and penalty terms.\n\n"
-            f"### 4. Exclusions & Scope of Authority (काय समाविष्ट नाही)\n"
-            f"• Hidden liabilities or excluded rights.\n\n"
-            f"### 5. Actionable Roadmap & Verification Directives (पुढील पडताळणी पावले)\n"
-            f"• Direct advice on verifying with the local Talathi/Sub-Registrar, bank, or archaeological archive.\n\n"
+            f"### 1. Document Identity & Executive Summary\n"
+            f"• Document type, origin, verified codes, effective dates, and primary entities.\n\n"
+            f"### 2. Critical Red Flags & Hidden Liabilities\n"
+            f"• Disclose any loans, dubious claims, missing signatures, or penalties prefixed with 🚨 **[CRITICAL RISK / ALERT]:**.\n\n"
+            f"### 3. Financial, Rights & Technical Breakdown\n"
+            f"• Rights, ownership, shares, and transaction values.\n\n"
+            f"### 4. Actionable Roadmap & Verification Directives\n"
+            f"• Steps for verifying this document with competent authorities or systems.\n\n"
             f"At the very end of your response, output a single line:\n"
-            f"EXPLORE_SUGGESTIONS: [\"What are the biggest financial risks in this document?\", \"Are there hidden penalty or termination clauses?\", \"How do I verify the authenticity of this record?\"]"
+            f"EXPLORE_SUGGESTIONS: [\"What are the primary financial risks in this record?\", \"Are there penalty or termination clauses?\", \"How do I verify the authenticity of this document?\"]"
         )
 
         analysis_raw = None
         diagnostic_err = ""
 
-        if len(extracted_text.strip()) > 30:
-            doc_context_header = f"DOCUMENT FILE: {filename} (Total Pages/Sheets: {total_pages_detected})\n\n"
+        if len(extracted_text.strip()) > 20:
+            doc_context_header = f"DOCUMENT FILE: {filename} (Pages/Sections: {total_pages_detected})\n\n"
             truncated_content = extracted_text[:85000]
             analysis_raw = await ask_fast_text(
                 f"{doc_context_header}{truncated_content}\n\nConduct full forensic audit according to your directives.",
@@ -935,7 +1090,7 @@ async def analyze_document(
                     mime_type="image/jpeg"
                 )
             else:
-                diagnostic_err = "Could not decode this file format. Please ensure it is a valid PDF, Word document, Excel spreadsheet, or Image."
+                diagnostic_err = "Could not decode this file. Please verify file integrity."
 
         del file_bytes
         gc.collect()
@@ -943,14 +1098,14 @@ async def analyze_document(
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": diagnostic_err or "Analysis engine encountered a timeout. Please retry.",
+                "message": diagnostic_err or "Analysis engine timed out. Please retry.",
                 "data": None
             }
 
         suggestions = [
-            "What are the biggest financial risks in this document?",
-            "Are there hidden penalty or termination clauses?",
-            "How do I verify the authenticity of this record?"
+            "What are the primary financial risks in this record?",
+            "Are there penalty or termination clauses?",
+            "How do I verify the authenticity of this document?"
         ]
 
         clean_text = analysis_raw
@@ -995,7 +1150,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 15. REGIONAL EXPLORER ENGINE (20+ VERIFIED REAL LOCATIONS)
+# 17. REGIONAL EXPLORER ENGINE
 # -------------------------------------------------------------
 REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
     "vasai-virar": {
@@ -1192,6 +1347,7 @@ REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
         }
     }
 }
+
 @app.post("/api/v1/explore-city")
 async def explore_city(request: Request):
     city = "Vasai-Virar"
@@ -1237,7 +1393,7 @@ async def explore_city(request: Request):
     loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
 
     sys_prompt = f"""
-You are the authoritative Global Tourism & Hospitality Engine (like MakeMyTrip & Booking.com) for '{loc_label}'.
+You are the authoritative Global Tourism & Hospitality Engine for '{loc_label}'.
 Generate a comprehensive, verified catalog of 25 to 30 genuine, distinct attractions and 15 real, operational hotels in '{city}'.
 Output STRICT JSON ONLY matching this schema without markdown fences:
 
@@ -1292,7 +1448,7 @@ Output STRICT JSON ONLY matching this schema without markdown fences:
     return {"status": "error", "city": city, "landmarks": [], "hotels": []}
 
 # -------------------------------------------------------------
-# 16. UNIVERSAL AI GUIDE ASSISTANT (HIGH CAPACITY 8192 TOKENS)
+# 18. CONCIERGE CHAT & LIVE MOTION RADAR PIPELINE (SYNTAX FIXED)
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1301,6 +1457,8 @@ async def explore_chat(request: Request):
     question = ""
     target_language = "English"
     chat_history: List[Dict[str, str]] = []
+    current_gps = ""
+    saved_home_base = ""
 
     content_type = request.headers.get("content-type", "").lower()
     try:
@@ -1311,12 +1469,16 @@ async def explore_chat(request: Request):
             question = body.get("question", "")
             target_language = body.get("target_language", target_language)
             chat_history = body.get("chat_history", [])
+            current_gps = body.get("current_gps", "")
+            saved_home_base = body.get("saved_home_base", "")
         else:
             form = await request.form()
             city = form.get("city", city)
             country = form.get("country", country)
             question = form.get("question", "")
             target_language = form.get("target_language", target_language)
+            current_gps = form.get("current_gps", "")
+            saved_home_base = form.get("saved_home_base", "")
     except Exception:
         pass
 
@@ -1346,24 +1508,21 @@ async def explore_chat(request: Request):
     else:
         lang_instruction = f"Answer clearly in {target_language}."
 
-    concierge_system_prompt = f"""
-You are Omni Guide Assistant, an expert, perceptive, and highly practical travel companion.
-{lang_instruction}
+    telemetry_note = ""
+    if current_gps:
+        telemetry_note = f"\n[DEVICE LIVE HARDWARE TELEMETRY: GPS Location {current_gps}, Home Base Registered: {saved_home_base}]"
 
-CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
-1. COMPLETION GUARANTEE: If the user asks for N days (e.g. 8 days, 7 days, 5 days), you MUST generate and conclude EVERY SINGLE DAY from Day 1 through Day N. Never truncate, stop early, or summarize remaining days.
-2. CONCISE PACING: To ensure all days fit completely without cutoffs:
-   • Keep introductory notes focused and brief.
-   • For each day (e.g. '### Day 1 – Arrival + Orientation'), write punchy, practical bullet points for Morning, Afternoon, and Evening (1-2 sentences each).
-   • Add one short italic *Tip:* per day for pacing, energy, or dining.
-3. STRUCTURE:
-   • **Sentence 1 Summary:** State the trip scope and party balance directly.
-   • '### Important Assumptions & Notes': Bullet points with bold labels (• **Origin:**, • **Transport:**, • **Budget ballpark:**, • **Book ahead:**).
-   • '### Sample Flights': Flight timing, airline names, and economy fares.
-   • '### Day-by-Day Itinerary': Include every single day up to the final departure day.
-   • '### Practical Tips for Your Family': Short concluding bullet points.
-4. NO RAW TABLE PIPES: Use clean bullets and bold headings only.
+    concierge_system_prompt = f"""
+You are Omni Guide Assistant & Real-Time Motion Radar Companion.
+{lang_instruction}
+{telemetry_note}
+
+DIRECTIVES:
+1. Provide accurate, practical travel and navigation answers.
+2. If the user asks where they are, what speed they are moving at, or about transit motion, evaluate their coordinates and indicate the nearest railway junctions, direction, and travel status.
+3. For multi-day itineraries, generate every single requested day sequentially without skipping or truncating.
 """
+
     ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
     has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "8 days", "3-day", "5-day", "budget", "flights"])
 
@@ -1377,7 +1536,7 @@ CRITICAL RULES FOR MULTI-DAY ITINERARIES (MANDATORY):
     }
 
 # -------------------------------------------------------------
-# 17. SERVER HEALTH & STATUS
+# 19. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1385,7 +1544,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "87.0.0",
+        "version": "88.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "gemini_keys_count": len(get_gemini_keys())
