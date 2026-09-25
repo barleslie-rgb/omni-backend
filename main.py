@@ -1555,24 +1555,47 @@ async def railway_inquiry(request: Request):
             form = await request.form()
             query_type = form.get("query_type", form.get("type", "station_board"))
             query_value = form.get("query_value", form.get("query", "BSR")).strip().upper()
-            target_language = form.get("target_language", "English")
+            target_language = body.get("target_language", "English")
     except Exception:
         pass
 
-    if query_type == "pnr":
+    station_names = {
+        "BSR": "Vasai Road Junction",
+        "VR": "Virar",
+        "NAI": "Naigaon",
+        "BYR": "Bhayandar",
+        "BVI": "Borivali",
+        "ADH": "Andheri",
+        "DDR": "Dadar WR",
+        "MMCT": "Mumbai Central",
+        "CCG": "Churchgate",
+        "CSMT": "Mumbai CSMT"
+    }
+    stn_name = station_names.get(query_value, f"Station {query_value}")
+
+    if query_type == "station_board":
+        # Master chronological timetable from morning (03:30 AM) to night (01:00 AM)
+        master_trains = [
+            {"time": "03:45 AM", "timestamp_minutes": 225, "train_no": "90102", "name": "Virar - Churchgate Slow", "service_type": "S", "platform": "3", "status": "On Time"},
+            {"time": "04:12 AM", "timestamp_minutes": 252, "train_no": "90110", "name": "Dahanu Road - Dadar Fast", "service_type": "F", "platform": "1", "status": "On Time"},
+            {"time": "05:05 AM", "timestamp_minutes": 305, "train_no": "90124", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time"},
+            {"time": "08:15 AM", "timestamp_minutes": 495, "train_no": "90302", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "Running 4 min late"},
+            {"time": "11:30 AM", "timestamp_minutes": 690, "train_no": "90412", "name": "Virar - Borivali Slow", "service_type": "S", "platform": "4", "status": "On Time"},
+            {"time": "01:14 PM", "timestamp_minutes": 794, "train_no": "90514", "name": "Virar - Churchgate AC", "service_type": "AC", "platform": "1", "status": "2 min Late • Moderate"},
+            {"time": "02:27 PM", "timestamp_minutes": 867, "train_no": "90508", "name": "Naigaon - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time • Packed"},
+            {"time": "02:34 PM", "timestamp_minutes": 874, "train_no": "90518", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "1", "status": "On Time • Heavy"},
+            {"time": "02:41 PM", "timestamp_minutes": 881, "train_no": "92095", "name": "Virar - Borivali Slow", "service_type": "S", "platform": "3", "status": "Arriving Now • Normal"},
+            {"time": "02:52 PM", "timestamp_minutes": 892, "train_no": "90522", "name": "Dahanu Road - Dadar Fast", "service_type": "F", "platform": "4", "status": "On Time"},
+            {"time": "05:10 PM", "timestamp_minutes": 970, "train_no": "90620", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time"},
+            {"time": "08:40 PM", "timestamp_minutes": 1120, "train_no": "90810", "name": "Virar - Andheri Slow", "service_type": "S", "platform": "3", "status": "On Time"},
+            {"time": "11:55 PM", "timestamp_minutes": 1435, "train_no": "90998", "name": "Virar - Borivali Slow", "service_type": "S", "platform": "3", "status": "Last Night Train"}
+        ]
         return {
             "status": "success",
-            "type": "pnr",
-            "pnr": query_value,
-            "train_no": "12952",
-            "train_name": "Mumbai Rajdhani Express",
-            "boarding_date": "26 Sep 2026",
-            "from_stn": "NDLS",
-            "to_stn": "BOM",
-            "passengers": [
-                {"no": 1, "status": "CNF / B4 / 21 (Confirmed)", "booking": "RAC 12"}
-            ],
-            "chart": "Chart Prepared"
+            "type": "station_board",
+            "station_code": query_value,
+            "station_name": stn_name,
+            "trains": master_trains
         }
     elif query_type == "live_train":
         return {
@@ -1581,54 +1604,14 @@ async def railway_inquiry(request: Request):
             "train_no": query_value,
             "train_name": "Virar - Churchgate Fast Local",
             "current_station": "Naigaon",
-            "next_station": "Bhayandar",
-            "platform": "2",
-            "door_side": "Left",
-            "status_msg": "Running 3 mins late",
-            "crowd": "Moderate"
+            "next_station": "Dadar",
+            "platform": "4",
+            "door_side": "Right",
+            "status_msg": "Approaching destination",
+            "crowd": "High"
         }
-    else:
-        # Structured Station Board for Western / Central Suburban
-        return {
-            "status": "success",
-            "type": "station_board",
-            "station_code": query_value if query_value else "BSR",
-            "station_name": "Vasai Road Junction (Western Line)",
-            "trains": [
-                {
-                    "time": "02:27 PM",
-                    "train_no": "90508",
-                    "name": "Naigaon - Churchgate",
-                    "service_type": "F",
-                    "platform": "2",
-                    "status": "On Time • Packed"
-                },
-                {
-                    "time": "02:34 PM",
-                    "train_no": "90514",
-                    "name": "Virar - Churchgate",
-                    "service_type": "F",
-                    "platform": "1",
-                    "status": "2 min Late • Moderate Crowd"
-                },
-                {
-                    "time": "02:41 PM",
-                    "train_no": "92095",
-                    "name": "Virar - Borivali Slow",
-                    "service_type": "S",
-                    "platform": "3",
-                    "status": "Arriving Now • Normal"
-                },
-                {
-                    "time": "02:52 PM",
-                    "train_no": "90522",
-                    "name": "Dahanu Road - Dadar",
-                    "service_type": "F",
-                    "platform": "4",
-                    "status": "On Time • Heavy"
-                }
-            ]
-        }
+    
+    return {"status": "success", "answer": f"Processed inquiry for {query_value}"}
 # -------------------------------------------------------------
 # 20. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
