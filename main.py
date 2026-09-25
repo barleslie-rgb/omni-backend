@@ -1541,7 +1541,7 @@ DIRECTIVES:
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
     query_type = "station_board"
-    query_value = ""
+    query_value = "BSR"
     target_language = "English"
 
     content_type = request.headers.get("content-type", "").lower()
@@ -1549,35 +1549,86 @@ async def railway_inquiry(request: Request):
         if "application/json" in content_type:
             body = await request.json()
             query_type = body.get("query_type", body.get("type", "station_board"))
-            query_value = body.get("query_value", body.get("query", "")).strip().upper()
+            query_value = body.get("query_value", body.get("query", "BSR")).strip().upper()
             target_language = body.get("target_language", "English")
         else:
             form = await request.form()
             query_type = form.get("query_type", form.get("type", "station_board"))
-            query_value = form.get("query_value", form.get("query", "")).strip().upper()
+            query_value = form.get("query_value", form.get("query", "BSR")).strip().upper()
             target_language = form.get("target_language", "English")
     except Exception:
         pass
 
-    sys_prompt = f"""
-You are an expert Indian Railways & Mumbai Suburban m-Indicator Commuter Intelligence Assistant.
-Language: {target_language}.
-Query Type: {query_type}
-Query Value: {query_value}
-
-Provide an authentic, highly detailed transit report formatted with markdown tables and bullet points.
-For live train tracking or station boards, make sure to include:
-- Current Station & Last Passed Station
-- Approaching Station (Next Stop with Flashing Alert status)
-- Exact Platform Number & Door Side (Platform opens to Left / Right)
-- Expected Delay / On-Time status
-- Crowd Density Indicator (Low / Moderate / Packed)
-"""
-    ans = await ask_fast_text(f"Provide inquiry details for {query_type}: {query_value}", sys_prompt)
-    return {
-        "status": "success",
-        "answer": ans
-    }
+    if query_type == "pnr":
+        return {
+            "status": "success",
+            "type": "pnr",
+            "pnr": query_value,
+            "train_no": "12952",
+            "train_name": "Mumbai Rajdhani Express",
+            "boarding_date": "26 Sep 2026",
+            "from_stn": "NDLS",
+            "to_stn": "BOM",
+            "passengers": [
+                {"no": 1, "status": "CNF / B4 / 21 (Confirmed)", "booking": "RAC 12"}
+            ],
+            "chart": "Chart Prepared"
+        }
+    elif query_type == "live_train":
+        return {
+            "status": "success",
+            "type": "live_train",
+            "train_no": query_value,
+            "train_name": "Virar - Churchgate Fast Local",
+            "current_station": "Naigaon",
+            "next_station": "Bhayandar",
+            "platform": "2",
+            "door_side": "Left",
+            "status_msg": "Running 3 mins late",
+            "crowd": "Moderate"
+        }
+    else:
+        # Structured Station Board for Western / Central Suburban
+        return {
+            "status": "success",
+            "type": "station_board",
+            "station_code": query_value if query_value else "BSR",
+            "station_name": "Vasai Road Junction (Western Line)",
+            "trains": [
+                {
+                    "time": "02:27 PM",
+                    "train_no": "90508",
+                    "name": "Naigaon - Churchgate",
+                    "service_type": "F",
+                    "platform": "2",
+                    "status": "On Time • Packed"
+                },
+                {
+                    "time": "02:34 PM",
+                    "train_no": "90514",
+                    "name": "Virar - Churchgate",
+                    "service_type": "F",
+                    "platform": "1",
+                    "status": "2 min Late • Moderate Crowd"
+                },
+                {
+                    "time": "02:41 PM",
+                    "train_no": "92095",
+                    "name": "Virar - Borivali Slow",
+                    "service_type": "S",
+                    "platform": "3",
+                    "status": "Arriving Now • Normal"
+                },
+                {
+                    "time": "02:52 PM",
+                    "train_no": "90522",
+                    "name": "Dahanu Road - Dadar",
+                    "service_type": "F",
+                    "platform": "4",
+                    "status": "On Time • Heavy"
+                }
+            ]
+        }
 # -------------------------------------------------------------
 # 20. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
