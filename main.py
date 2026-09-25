@@ -14,11 +14,12 @@ import xml.etree.ElementTree as ET
 
 import httpx
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, Request, Query
+from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from groq import Groq
+from supabase import create_client, Client
 
 try:
     from bs4 import BeautifulSoup
@@ -32,8 +33,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Forensic Document Auditor & Transit Cloud",
-    version="88.0.0"
+    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Forensic Document Auditor, Transit Cloud & Community Intelligence",
+    version="90.0.0"
 )
 
 app.add_middleware(
@@ -47,6 +48,13 @@ app.add_middleware(
 DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
+
+# -------------------------------------------------------------
+# 0. SUPABASE CLIENT INITIALIZATION
+# -------------------------------------------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().strip('"').strip("'")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip().strip('"').strip("'")
+supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 # -------------------------------------------------------------
 # 1. LIVE BULLION BENCHMARK ENGINE
@@ -808,7 +816,6 @@ async def bargain_evaluate(request: Request):
         quoted_price = float(body.get("quoted_price", 100))
         currency = body.get("currency", "INR")
         city = body.get("city", "Mumbai")
-        target_language = body.get("target_language", "English")
 
         sys_prompt = f"""
 You are Bargain Pal, an authentic local street market expert for {city}.
@@ -882,21 +889,16 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
 # 15. DOCUMENT PARSERS & BINARY FORENSIC INSPECTOR
 # -------------------------------------------------------------
 def inspect_binary_stream(file_bytes: bytes, max_len: int = 1024) -> str:
-    """Disassembles raw binary/hex/executable streams for forensic auditing."""
     try:
         hex_dump = []
-        ascii_dump = []
         preview_len = min(len(file_bytes), max_len)
-        
         for i in range(0, preview_len, 16):
             chunk = file_bytes[i:i+16]
             hex_part = " ".join(f"{b:02x}" for b in chunk)
             ascii_part = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
             hex_dump.append(f"{i:06x}:  {hex_part:<48}  |{ascii_part}|")
-            
         printable_strings = re.findall(rb'[A-Za-z0-9/\-_:., ]{4,}', file_bytes[:preview_len * 4])
         decoded_strings = [s.decode('ascii', errors='ignore') for s in printable_strings[:40]]
-
         return (
             f"BINARY STREAM FORENSIC DISASSEMBLY (First {preview_len} bytes):\n" +
             "\n".join(hex_dump) +
@@ -1150,305 +1152,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 17. REGIONAL EXPLORER ENGINE
-# -------------------------------------------------------------
-REGIONAL_ANCHORS: Dict[str, Dict[str, Any]] = {
-    "vasai-virar": {
-        "tagline": "A historic coastal realm famed for Portuguese maritime fortresses, hilltop shrines, Casuarina beaches, and East Indian culinary culture.",
-        "spots": [
-            {
-                "name": "Bassein Fort (Fort Vasai)",
-                "category": "Historic Bastion",
-                "rating": "4.8",
-                "detail": "Vast 16th-century Indo-Portuguese stone citadel featuring arched ruins, ramparts, watchtowers, and heritage chapels overlooking Vasai Creek.",
-                "timing": "06:00 AM – 06:30 PM",
-                "entry": "Free Public Entry",
-                "tips": "Wear comfortable shoes to explore the extensive ramparts; carry drinking water.",
-                "best_transit": "Auto-Rickshaw / VVMT Bus from Vasai Road Railway Station",
-                "lat": 19.3308,
-                "lng": 72.8149,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d4/Bassein_Fort_Overview.jpg/1200px-Bassein_Fort_Overview.jpg"
-            },
-            {
-                "name": "Jivdani Mata Hill Temple",
-                "category": "Sacred Pilgrimage",
-                "rating": "4.9",
-                "detail": "Revered ancient hilltop shrine atop Jivdani Hill offering panoramic valley views, accessible by funicular ropeway and paved stairs.",
-                "timing": "05:30 AM – 08:30 PM",
-                "entry": "Free (Funicular Ropeway Chargeable)",
-                "tips": "Climb early morning to avoid afternoon heat and weekend pilgrimage queues.",
-                "best_transit": "Funicular Ropeway / Auto-Rickshaw from Virar East Station",
-                "lat": 19.4678,
-                "lng": 72.8256,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1d/Jivdani_temple.jpg/1200px-Jivdani_temple.jpg"
-            },
-            {
-                "name": "Arnala Island Fort",
-                "category": "Historic Bastion",
-                "rating": "4.7",
-                "detail": "Historic sea fortress situated on an island off the Arnala coast, built by the Sultanate of Gujarat and fortified by Marathas.",
-                "timing": "07:00 AM – 06:00 PM (Ferry Dependent)",
-                "entry": "Free (Ferry ₹30)",
-                "tips": "Check ferry timings before crossing.",
-                "best_transit": "Ferry from Arnala Beach / Killa Jetty",
-                "lat": 19.4633,
-                "lng": 72.7347,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/f/f3/Arnala_Fort_Entrance.jpg/1200px-Arnala_Fort_Entrance.jpg"
-            },
-            {
-                "name": "Suruchi Beach & Casuarina Groves",
-                "category": "Coastal & Beach",
-                "rating": "4.6",
-                "detail": "Tranquil sandy coastline sheltered by dense Casuarina (Suru) pine trees, famous for fresh sea breeze and peaceful sunset walks.",
-                "timing": "Open 24 Hours",
-                "entry": "Free",
-                "tips": "Carry snacks as stalls close after dusk.",
-                "best_transit": "Auto-Rickshaw from Vasai West Station",
-                "lat": 19.3496,
-                "lng": 72.7842,
-                "image": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80"
-            },
-            {
-                "name": "Tungareshwar National Wildlife Sanctuary",
-                "category": "Nature & Sanctuary",
-                "rating": "4.7",
-                "detail": "Dense tropical deciduous forest offering scenic trekking trails, seasonal waterfalls, and the ancient Tungareshwar Shiva Temple.",
-                "timing": "07:00 AM – 06:00 PM",
-                "entry": "₹50 Entry Fee",
-                "tips": "Wear hiking boots and carry plenty of water.",
-                "best_transit": "Auto-Rickshaw from Vasai East / Highway Junction",
-                "lat": 19.4182,
-                "lng": 72.9156,
-                "image": "https://images.unsplash.com/photo-1448375240586-882707db888b?auto=format&fit=crop&w=1200&q=80"
-            },
-            {
-                "name": "Bhuigaon Beach",
-                "category": "Coastal & Beach",
-                "rating": "4.5",
-                "detail": "Unspoiled and quiet shoreline with silvery grey sand and gentle waves, surrounded by coconut and betel nut orchards.",
-                "timing": "Open 24 Hours",
-                "entry": "Free",
-                "tips": "Ideal for peaceful morning walks.",
-                "best_transit": "Auto-Rickshaw from Vasai West",
-                "lat": 19.3621,
-                "lng": 72.7844,
-                "image": "https://images.unsplash.com/photo-1519046904884-53103b34b206?auto=format&fit=crop&w=1200&q=80"
-            },
-            {
-                "name": "Vajreshwari Temple & Mineral Hot Springs",
-                "category": "Sacred Pilgrimage",
-                "rating": "4.8",
-                "detail": "Sacred goddess temple surrounded by natural geothermal sulfur hot springs known for curative and therapeutic properties.",
-                "timing": "06:00 AM – 08:30 PM",
-                "entry": "Free",
-                "tips": "Carry an extra towel if bathing in the springs.",
-                "best_transit": "MSRTC Bus or Taxi from Virar or Vasai East",
-                "lat": 19.4892,
-                "lng": 73.0272,
-                "image": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/Vajreshwari_Temple.jpg/1200px-Vajreshwari_Temple.jpg"
-            },
-            {
-                "name": "St. Michael's Church, Purandare",
-                "category": "Historic Bastion",
-                "rating": "4.7",
-                "detail": "One of the oldest surviving Portuguese-era churches built in 1565, featuring colonial stone carvings and an antique bell.",
-                "timing": "08:00 AM – 07:00 PM",
-                "entry": "Free",
-                "tips": "Observe modesty and decorum when visiting.",
-                "best_transit": "Auto-Rickshaw from Vasai Station West",
-                "lat": 19.3615,
-                "lng": 72.8021,
-                "image": "https://images.unsplash.com/photo-1548625361-195fe5786e8a?auto=format&fit=crop&w=1200&q=80"
-            },
-            {
-                "name": "Kalamb Beach",
-                "category": "Coastal & Beach",
-                "rating": "4.6",
-                "detail": "Long, serene beach strip famous for camel rides, water sports, and beachside coconut water shacks.",
-                "timing": "Open 24 Hours",
-                "entry": "Free",
-                "tips": "Great for evening family relaxation.",
-                "best_transit": "Auto-Rickshaw from Nalasopara West",
-                "lat": 19.4124,
-                "lng": 72.7661,
-                "image": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80"
-            },
-            {
-                "name": "Ganeshpuri Nityananda Ashram",
-                "category": "Sacred Pilgrimage",
-                "rating": "4.9",
-                "detail": "Renowned spiritual haven and Samadhi shrine of Bhagawan Nityananda, set in tranquil greenery alongside warm water kunds.",
-                "timing": "06:00 AM – 08:00 PM",
-                "entry": "Free",
-                "tips": "Free community meal (Prasadam) served daily.",
-                "best_transit": "Bus or Auto from Virar Railway Station East",
-                "lat": 19.4921,
-                "lng": 73.0182,
-                "image": "https://images.unsplash.com/photo-1545232979-fbf68fe9b10d?auto=format&fit=crop&w=1200&q=80"
-            }
-        ],
-        "real_hotels": [
-            {
-                "name": "The Golden Chariot Vasai Hotel & Spa",
-                "tier": "4-Star Executive Hotel",
-                "rating": "8.8",
-                "basePrice": 48.0,
-                "reviews": "1,820",
-                "suitability": "Family & Business",
-                "highlight": "Swimming Pool • Rooftop Bar • Located on NH-48 Highway",
-                "lat": 19.3941,
-                "lng": 72.8512
-            },
-            {
-                "name": "The Fern Fayms Resort Naigaon",
-                "tier": "5-Star Luxury Eco Resort",
-                "rating": "9.3",
-                "basePrice": 65.0,
-                "reviews": "1,240",
-                "suitability": "Family & Leisure",
-                "highlight": "Lush Greenery • Fine Dining • Luxury Suites",
-                "lat": 19.3512,
-                "lng": 72.8621
-            },
-            {
-                "name": "Farmhouse Garden Family Resort Vasai",
-                "tier": "Boutique Beach Resort",
-                "rating": "8.5",
-                "basePrice": 32.0,
-                "reviews": "1,140",
-                "suitability": "Couples & Family",
-                "highlight": "Near Vasai Beach • Fresh Seafood • Sprawling Lawns",
-                "lat": 19.3391,
-                "lng": 72.8123
-            },
-            {
-                "name": "Rudra Shelter Business Hotel",
-                "tier": "3-Star Business Stay",
-                "rating": "8.3",
-                "basePrice": 28.0,
-                "reviews": "920",
-                "suitability": "Business & Solo",
-                "highlight": "24h Room Service • Close to Station & Transit",
-                "lat": 19.3821,
-                "lng": 72.8410
-            }
-        ],
-        "flavours": [
-            {
-                "name": "Vasai Sukeli (Sun-Dried Bananas)",
-                "detail": "Traditional sweet dried Rajeli bananas, a GI-tagged local culinary specialty unique to Vasai-Virar."
-            }
-        ],
-        "transit": {
-            "railway": "Western Railway Mumbai Suburban Network: Vasai Road (BSR) & Virar (VR) Stations",
-            "bus_depot": "VVMT (Vasai-Virar Municipal Transport) & MSRTC State Transport Depot",
-            "bus_depot_phone": "0250-2525105 / Municipal Helpline 1800-233-4353",
-            "auto_fares": "Regulated metered and share-rickshaw services available 24/7 across all station exits."
-        }
-    }
-}
-
-@app.post("/api/v1/explore-city")
-async def explore_city(request: Request):
-    city = "Vasai-Virar"
-    state = "Maharashtra"
-    country = "India"
-    adults = 2
-    kids = 0
-    target_language = "English"
-
-    try:
-        body = await request.json()
-        city = (body.get("city") or "").strip()
-        state = (body.get("state") or "").strip()
-        country = (body.get("country") or "").strip()
-        adults = int(body.get("adults", 2))
-        kids = int(body.get("kids", 0))
-        target_language = body.get("target_language", "English")
-    except Exception:
-        pass
-
-    if not city:
-        city = "Vasai-Virar"
-    if not country:
-        country = "India"
-
-    city_clean = city.lower()
-    is_vasai_virar = any(city_clean == name or city_clean.startswith(f"{name}-") or city_clean.startswith(f"{name} ")
-                         for name in ["vasai", "virar", "vasai-virar", "bassein"])
-
-    if is_vasai_virar and ("india" in country.lower() or not country):
-        anchor = REGIONAL_ANCHORS.get("vasai-virar", {})
-        spots = anchor.get("spots", [])
-        hotels = anchor.get("real_hotels", [])
-        return {
-            "status": "success",
-            "city": "Vasai-Virar",
-            "state": "Maharashtra",
-            "country": "India",
-            "landmarks": spots,
-            "hotels": hotels
-        }
-
-    loc_label = f"{city}, {state}, {country}".replace(", ,", ",").strip(", ")
-
-    sys_prompt = f"""
-You are the authoritative Global Tourism & Hospitality Engine for '{loc_label}'.
-Generate a comprehensive, verified catalog of 25 to 30 genuine, distinct attractions and 15 real, operational hotels in '{city}'.
-Output STRICT JSON ONLY matching this schema without markdown fences:
-
-{{
-  "city": "{city}",
-  "country": "{country}",
-  "landmarks": [
-    {{
-      "name": "Exact Name of Attraction",
-      "category": "Heritage & Forts / Sacred & Spiritual / Beaches & Coast / Nature & Wildlife / Culinary & Bazaars",
-      "distance": "X.X km from Center",
-      "timing": "09:00 AM – 06:00 PM",
-      "entry": "Entry fee in local currency or Free",
-      "lat": 0.0,
-      "lng": 0.0,
-      "history": "2 informative, accurate sentences on this landmark's background.",
-      "best_food": "Specific local specialty or nearby eatery.",
-      "things_to_do": "Practical activities for visitors.",
-      "best_time": "Optimal time of day or season to visit.",
-      "scams_and_warnings": "Actionable local safety or pricing advice."
-    }}
-  ],
-  "hotels": [
-    {{
-      "name": "Actual Operational Hotel Name",
-      "tier": "Budget Comfort / 4-Star & Executive / 5-Star Luxury Resort",
-      "rating": "8.7",
-      "reviews": "1,420",
-      "price": 85,
-      "phone": "+1 800 555 0100",
-      "distance": "1.2 km from Center",
-      "amenities": "Free Wi-Fi • Breakfast • Pool",
-      "lat": 0.0,
-      "lng": 0.0
-    }}
-  ]
-}}
-"""
-
-    data = await ask_fast_json(f"Generate verified attractions and hotels for {loc_label}.", sys_prompt)
-
-    if data and "landmarks" in data:
-        return {
-            "status": "success",
-            "city": city,
-            "state": state,
-            "country": country,
-            "landmarks": data.get("landmarks", []),
-            "hotels": data.get("hotels", [])
-        }
-
-    return {"status": "error", "city": city, "landmarks": [], "hotels": []}
-
-# -------------------------------------------------------------
-# 18. CONCIERGE CHAT & LIVE MOTION RADAR PIPELINE (SYNTAX FIXED)
+# 17. CONCIERGE CHAT & LIVE MOTION RADAR PIPELINE
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -1536,6 +1240,56 @@ DIRECTIVES:
     }
 
 # -------------------------------------------------------------
+# 18. COMMUNITY GEM & CHAT ENDPOINTS (SUPABASE INTEGRATION)
+# -------------------------------------------------------------
+@app.get("/api/v1/community/feed")
+async def get_community_feed(community_id: str = Query("vasai-virar")):
+    """Fetches active gems and pulse updates for the community hub from Supabase."""
+    if not supabase:
+        return {"status": "success", "gems": [], "pulse": []}
+    try:
+        gems_res = supabase.table("gems").select("*").eq("community_id", community_id).order("created_at", desc=True).limit(20).execute()
+        pulse_res = supabase.table("pulse_updates").select("*").eq("community_id", community_id).order("created_at", desc=True).limit(10).execute()
+        return {
+            "status": "success",
+            "gems": gems_res.data,
+            "pulse": pulse_res.data
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "gems": [], "pulse": []}
+
+@app.post("/api/v1/gems/create")
+async def create_gem(request: Request):
+    """Inserts a new structured Community Gem into Supabase."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured on server.")
+    try:
+        body = await request.json()
+        response = supabase.table("gems").insert({
+            "community_id": body.get("community_id", "vasai-virar"),
+            "creator_id": body.get("creator_id"),
+            "title": body.get("title"),
+            "category": body.get("category", "Markets"),
+            "description": body.get("description"),
+            "location_string": body.get("location_string"),
+            "status": "New"
+        }).execute()
+        return {"status": "success", "gem": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/community/messages")
+async def get_community_messages(community_id: str = Query("vasai-virar")):
+    """Fetches paginated chat messages for the community chat screen."""
+    if not supabase:
+        return {"status": "success", "messages": []}
+    try:
+        res = supabase.table("messages").select("*, users(display_name, avatar_url, role)").eq("community_id", community_id).order("created_at", desc=False).limit(50).execute()
+        return {"status": "success", "messages": res.data}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "messages": []}
+
+# -------------------------------------------------------------
 # 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
@@ -1555,7 +1309,7 @@ async def railway_inquiry(request: Request):
             form = await request.form()
             query_type = form.get("query_type", form.get("type", "station_board"))
             query_value = form.get("query_value", form.get("query", "BSR")).strip().upper()
-            target_language = body.get("target_language", "English")
+            target_language = form.get("target_language", "English")
     except Exception:
         pass
 
@@ -1574,7 +1328,6 @@ async def railway_inquiry(request: Request):
     stn_name = station_names.get(query_value, f"Station {query_value}")
 
     if query_type == "station_board":
-        # Master chronological timetable from morning (03:30 AM) to night (01:00 AM)
         master_trains = [
             {"time": "03:45 AM", "timestamp_minutes": 225, "train_no": "90102", "name": "Virar - Churchgate Slow", "service_type": "S", "platform": "3", "status": "On Time"},
             {"time": "04:12 AM", "timestamp_minutes": 252, "train_no": "90110", "name": "Dahanu Road - Dadar Fast", "service_type": "F", "platform": "1", "status": "On Time"},
@@ -1612,8 +1365,56 @@ async def railway_inquiry(request: Request):
         }
     
     return {"status": "success", "answer": f"Processed inquiry for {query_value}"}
+
 # -------------------------------------------------------------
-# 20. SERVER HEALTH & STATUS
+# 20. WEBSOCKET REALTIME ROUTER FOR COMMUNITY CHAT
+# -------------------------------------------------------------
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, community_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if community_id not in self.active_connections:
+            self.active_connections[community_id] = []
+        self.active_connections[community_id].append(websocket)
+
+    def disconnect(self, community_id: str, websocket: WebSocket):
+        if community_id in self.active_connections:
+            self.active_connections[community_id].remove(websocket)
+            if not self.active_connections[community_id]:
+                del self.active_connections[community_id]
+
+    async def broadcast(self, community_id: str, message: dict):
+        if community_id in self.active_connections:
+            for connection in self.active_connections[community_id]:
+                await connection.send_json(message)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/community/{community_id}")
+async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
+    await manager.connect(community_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if supabase and "text" in data:
+                try:
+                    supabase.table("messages").insert({
+                        "community_id": community_id,
+                        "sender_id": data.get("sender_id"),
+                        "text": data.get("text"),
+                        "type": data.get("type", "text")
+                    }).execute()
+                except Exception:
+                    pass
+            await manager.broadcast(community_id, data)
+    except WebSocketDisconnect:
+        manager.disconnect(community_id, websocket)
+        await manager.broadcast(community_id, {"type": "system", "text": "A user disconnected."})
+
+# -------------------------------------------------------------
+# 21. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -1621,8 +1422,9 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "88.0.0",
+        "version": "90.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
+        "supabase_connected": bool(supabase),
         "gemini_keys_count": len(get_gemini_keys())
     }
