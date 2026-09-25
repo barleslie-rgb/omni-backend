@@ -1540,55 +1540,44 @@ DIRECTIVES:
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
-    try:
-        body = await request.json()
-        query_type = body.get("type", "station_board") # pnr, live_running, station_board
-        query_value = body.get("query", "").strip().upper()
+    query_type = "station_board"
+    query_value = ""
+    target_language = "English"
 
-        if query_type == "pnr":
-            return {
-                "status": "success",
-                "type": "pnr",
-                "pnr": query_value,
-                "train_number": "12952",
-                "train_name": "Mumbai Rajdhani Express",
-                "boarding_date": "26 Sep 2026",
-                "from": "NDLS",
-                "to": "BOM",
-                "passenger_status": [
-                    {"passenger": 1, "status": "CNF / B4 / 21 (Confirmed)", "booking_status": "RAC 12"}
-                ],
-                "chart_status": "Chart Prepared"
-            }
-        elif query_type == "live_running":
-            return {
-                "status": "success",
-                "type": "live_running",
-                "train_number": query_value,
-                "train_name": "August Kranti Rajdhani",
-                "current_station": "Surat (ST)",
-                "status_message": "Running on time by 5 mins",
-                "next_station": "Borivali (BVI)",
-                "eta": "18:45 IST"
-            }
+    content_type = request.headers.get("content-type", "").lower()
+    try:
+        if "application/json" in content_type:
+            body = await request.json()
+            query_type = body.get("query_type", body.get("type", "station_board"))
+            query_value = body.get("query_value", body.get("query", "")).strip().upper()
+            target_language = body.get("target_language", "English")
         else:
-            # Station Board (e.g. BSR - Vasai Road, VR - Virar)
-            station_code = query_value if query_value else "BSR"
-            return {
-                "status": "success",
-                "type": "station_board",
-                "station_code": station_code,
-                "station_name": "Vasai Road / Regional Junction",
-                "arrivals": [
-                    {"train_no": "12922", "name": "Flying Ranee Express", "scheduled": "09:12 AM", "status": "On Time", "platform": "2"},
-                    {"train_no": "90102", "name": "Virar Fast Local", "scheduled": "09:18 AM", "status": "Arriving Now", "platform": "4"},
-                ],
-                "departures": [
-                    {"train_no": "12951", "name": "Mumbai Rajdhani", "scheduled": "09:25 AM", "status": "On Time", "platform": "1"},
-                ]
-            }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            form = await request.form()
+            query_type = form.get("query_type", form.get("type", "station_board"))
+            query_value = form.get("query_value", form.get("query", "")).strip().upper()
+            target_language = form.get("target_language", "English")
+    except Exception:
+        pass
+
+    sys_prompt = f"""
+You are an expert Indian Railways & Mumbai Suburban m-Indicator Commuter Intelligence Assistant.
+Language: {target_language}.
+Query Type: {query_type}
+Query Value: {query_value}
+
+Provide an authentic, highly detailed transit report formatted with markdown tables and bullet points.
+For live train tracking or station boards, make sure to include:
+- Current Station & Last Passed Station
+- Approaching Station (Next Stop with Flashing Alert status)
+- Exact Platform Number & Door Side (Platform opens to Left / Right)
+- Expected Delay / On-Time status
+- Crowd Density Indicator (Low / Moderate / Packed)
+"""
+    ans = await ask_fast_text(f"Provide inquiry details for {query_type}: {query_value}", sys_prompt)
+    return {
+        "status": "success",
+        "answer": ans
+    }
 # -------------------------------------------------------------
 # 20. SERVER HEALTH & STATUS
 # -------------------------------------------------------------
