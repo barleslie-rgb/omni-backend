@@ -33,8 +33,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Forensic Document Auditor, Transit Cloud & Community Intelligence",
-    version="90.0.0"
+    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Grok-Style Universal Document Auditor, Transit Cloud & Community Intelligence",
+    version="91.0.0"
 )
 
 app.add_middleware(
@@ -169,7 +169,7 @@ async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str 
             }
         ],
         "generationConfig": {
-            "temperature": 0.2,
+            "temperature": 0.3,
             "maxOutputTokens": 4096
         }
     }
@@ -221,7 +221,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.25,
+                    temperature=0.3,
                     max_tokens=8192,
                     timeout=55
                 )
@@ -236,7 +236,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     if keys:
         payload = {
             "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
-            "generationConfig": {"temperature": 0.25, "maxOutputTokens": 8192}
+            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}
         }
         async with httpx.AsyncClient(timeout=45.0) as http_client:
             for key in keys:
@@ -254,7 +254,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     except Exception:
                         continue
 
-    return "Response generated. Let me know if you would like deeper details on this."
+    return "Response generated successfully. Let me know if you need any further assistance."
 
 # -------------------------------------------------------------
 # 5. FAST JSON ENGINE
@@ -306,7 +306,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 6. UNIVERSAL CONVERSATION & INQUIRY
+# 6. UNIVERSAL CONVERSATION & PAPER PILOT PERSISTENT CHAT
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(request: Request):
@@ -331,7 +331,7 @@ async def ask_question(request: Request):
 
     clean_q = str(question).strip()
     if not clean_q:
-        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your documents, travels, or general inquiries."}
+        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your uploaded files, travels, or personal inquiries."}
 
     lang_lower = target_language.lower()
     if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -340,6 +340,30 @@ async def ask_question(request: Request):
         lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
     elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
         lang_instruction = "Answer strictly in natural Gujarati (ગુજરાતી script)."
+    elif "tamil" in lang_lower or "தமிழ்" in lang_lower:
+        lang_instruction = "Answer strictly in natural Tamil (தமிழ் script)."
+    elif "telugu" in lang_lower or "తెలుగు" in lang_lower:
+        lang_instruction = "Answer strictly in natural Telugu (తెలుగు script)."
+    elif "bengali" in lang_lower or "বাংলা" in lang_lower:
+        lang_instruction = "Answer strictly in natural Bengali (বাংলা script)."
+    elif "kannada" in lang_lower or "ಕನ್ನಡ" in lang_lower:
+        lang_instruction = "Answer strictly in natural Kannada (ಕನ್ನಡ script)."
+    elif "malayalam" in lang_lower or "മലയാളം" in lang_lower:
+        lang_instruction = "Answer strictly in natural Malayalam (മലയാളം script)."
+    elif "punjabi" in lang_lower or "ਪੰਜਾਬੀ" in lang_lower:
+        lang_instruction = "Answer strictly in natural Punjabi (ਪੰਜਾਬੀ script)."
+    elif "odia" in lang_lower or "ଓଡ଼ିଆ" in lang_lower:
+        lang_instruction = "Answer strictly in natural Odia (ଓଡ଼ିଆ script)."
+    elif "arabic" in lang_lower or "العربية" in lang_lower:
+        lang_instruction = "Answer strictly in natural Arabic (العربية script)."
+    elif "persian" in lang_lower or "فارسی" in lang_lower:
+        lang_instruction = "Answer strictly in natural Persian (فارسی script)."
+    elif "french" in lang_lower or "français" in lang_lower:
+        lang_instruction = "Answer strictly in natural French."
+    elif "german" in lang_lower or "deutsch" in lang_lower:
+        lang_instruction = "Answer strictly in natural German."
+    elif "spanish" in lang_lower or "español" in lang_lower:
+        lang_instruction = "Answer strictly in natural Spanish."
     else:
         lang_instruction = f"Answer clearly and concisely in {target_language}."
 
@@ -347,28 +371,26 @@ async def ask_question(request: Request):
 
     if has_doc:
         sys_prompt = f"""
-You are Paper Pilot's Senior Forensic Auditor and Universal AI Expert.
+You are Paper Pilot, a warm, supportive, and brilliant Grok-style AI Companion and Document Auditor.
 {lang_instruction}
 
-AUDITED DOCUMENT CONTEXT:
+UPLOADED DOCUMENT CONTEXT:
 {active_document_context[:65000]}
 
 MANDATORY RULES:
-1. Ground your answer in the document context above. Cite specific clauses, monetary sums, names, and dates where relevant.
-2. If the user asks about land rights, liabilities, or ownership, explain clearly who actually holds rights and what risks exist.
-3. If there is a scam, encumbrance (बोझा), mortgage lien, court stay, or dubious clause, point it out directly and explain the implications.
-4. If the user shifts to a general or procedural inquiry, answer comprehensively using your full reasoning capability.
-5. Keep the answer direct and natural so that when read aloud, it sounds clear, patient, and conversational.
+1. Ground your answers in the uploaded document context above when the user asks about specific file details, clauses, sums, or data.
+2. If the user asks general or personal lifestyle queries, travel advice, or personal support questions, answer with warm, witty, supportive Grok-style wisdom.
+3. Maintain conversational continuity and guide the user patiently and clearly.
 """
     else:
         sys_prompt = f"""
-You are Omni TouristOS Universal Intelligence Guide.
+You are Paper Pilot, a warm, witty, and deeply knowledgeable Grok-style AI Assistant and Personal Companion.
 {lang_instruction}
 
 DIRECTIVES:
-1. Answer the user's inquiry directly, insightfully, and accurately without requiring a document to be uploaded.
-2. You assist with general reasoning, travel tips, math, coding, legal knowledge, translations, and everyday inquiries.
-3. Avoid generic setups or robotic disclaimers. Jump straight into the substance of the answer.
+1. Respond to the user with warmth, intelligence, and helpfulness, exactly like Grok.
+2. Assist with general reasoning, travel guidance, daily planning, coding, personal queries, and explanations.
+3. Keep the tone engaging, conversational, and direct.
 """
 
     ans = await ask_fast_text(clean_q, sys_prompt)
@@ -381,7 +403,7 @@ async def general_chat(request: Request):
         message = body.get("message") or body.get("question") or ""
         target_language = body.get("target_language", "English")
         context = body.get("context", "")
-        sys_prompt = f"You are Omni AI Universal Assistant. Answer insightfully, warmly, and concisely in {target_language}.\nContext: {context}"
+        sys_prompt = f"You are Paper Pilot Grok-style Assistant. Answer warmly, intelligently, and concisely in {target_language}.\nContext: {context}"
         ans = await ask_fast_text(message, sys_prompt)
         return {"status": "success", "answer": ans, "reply": ans}
     except Exception as e:
@@ -1008,7 +1030,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 16. FORENSIC LEGAL AUDITOR (PAPER PILOT)
+# 16. GROK-STYLE UNIVERSAL DOCUMENT AUDITOR (PAPER PILOT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -1033,61 +1055,63 @@ async def analyze_document(
                 extracted_text = file_bytes.decode("utf-8", errors="ignore")
             except Exception:
                 pass
-        elif any(filename.endswith(ext) for ext in [".bin", ".dat", ".hex", ".iso", ".exe"]):
+        elif any(filename.endswith(ext) for ext in [".bin", ".dat", ".hex", ".iso", ".exe", ".mp4", ".mov", ".avi", ".mkv", ".mp3", ".wav"]):
             extracted_text = inspect_binary_stream(file_bytes)
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
             extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire forensic audit, tables, and warnings STRICTLY IN MARATHI (मराठी - Devanagari script)."
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire forensic audit, tables, and warnings STRICTLY IN HINDI (हिंदी - Devanagari script)."
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN HINDI (हिंदी - Devanagari script)."
         elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire forensic audit, tables, and warnings STRICTLY IN GUJARATI (ગુજરાતી script)."
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN GUJARATI (ગુજરાતી script)."
+        elif "tamil" in lang_lower or "தமிழ்" in lang_lower:
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN TAMIL (தமிழ் script)."
+        elif "telugu" in lang_lower or "తెలుగు" in lang_lower:
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN TELUGU (తెలుగు script)."
+        elif "bengali" in lang_lower or "বাংলা" in lang_lower:
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN BENGALI (বাংলা script)."
+        elif "kannada" in lang_lower or "ಕನ್ನಡ" in lang_lower:
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN KANNADA (ಕನ್ನಡ script)."
+        elif "malayalam" in lang_lower or "മലയാളം" in lang_lower:
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN MALAYALAM (മലയാളം script)."
+        elif "arabic" in lang_lower or "العربية" in lang_lower:
+            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN ARABIC (العربية script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
-        dual_role_prompt = (
-            f"You are Paper Pilot, an Elite Forensic Legal Fraud Auditor, Financial Investigator, and Machine Binary Analyst.\n"
+        grok_style_prompt = (
+            f"You are Paper Pilot, an elite Grok-style Document Analyst and Intelligence Auditor.\n"
             f"{lang_instruction}\n\n"
-            f"MISSION DIRECTIVES:\n"
-            f"1. MODERN CONTRACTS, LAND & LEGAL FRAUD:\n"
-            f"   • Detail document classifications, registration numbers, parties, and effective dates.\n"
-            f"   • Identify any encumbrances, loans, court stays, forfeiture clauses, or hidden liabilities.\n"
-            f"   • Highlight every suspicious risk prominently with '🚨 **[CRITICAL RISK / ALERT]:**'.\n"
-            f"2. SPREADSHEETS, INVOICES & FINANCIAL RECORDS:\n"
-            f"   • Extract sums, consideration amounts, stamp duties, and penalty terms into a clean tabular structure.\n"
-            f"3. BINARY DATA & RAW STREAMS:\n"
-            f"   • Disassemble and report on internal magic bytes, architecture, embedded string markers, and file integrity.\n\n"
-            f"MANDATORY REPORT STRUCTURE:\n"
-            f"### 1. Document Identity & Executive Summary\n"
-            f"• Document type, origin, verified codes, effective dates, and primary entities.\n\n"
-            f"### 2. Critical Red Flags & Hidden Liabilities\n"
-            f"• Disclose any loans, dubious claims, missing signatures, or penalties prefixed with 🚨 **[CRITICAL RISK / ALERT]:**.\n\n"
-            f"### 3. Financial, Rights & Technical Breakdown\n"
-            f"• Rights, ownership, shares, and transaction values.\n\n"
-            f"### 4. Actionable Roadmap & Verification Directives\n"
-            f"• Steps for verifying this document with competent authorities or systems.\n\n"
+            f"STYLE GUIDELINES (GROK STYLE):\n"
+            f"1. Keep summaries clean, elegant, structured, and easy to scan.\n"
+            f"2. Use clear section headers and bullet points.\n"
+            f"3. Structure the output into:\n"
+            f"   • **Summary of the Document**: Overview, core purpose, and key entities.\n"
+            f"   • **Key Highlights / Breakdown**: Bulleted chronological or categorical highlights.\n"
+            f"   • **Financial / Numerical Ballpark**: Costs, budgets, or metric breakdowns if applicable.\n"
+            f"   • **Actionable Recommendations & Next Steps**: Practical advice for the user.\n\n"
             f"At the very end of your response, output a single line:\n"
-            f"EXPLORE_SUGGESTIONS: [\"What are the primary financial risks in this record?\", \"Are there penalty or termination clauses?\", \"How do I verify the authenticity of this document?\"]"
+            f"EXPLORE_SUGGESTIONS: [\"What are the primary financial details here?\", \"Are there hidden liabilities or terms?\", \"How do I verify this record?\"]"
         )
 
         analysis_raw = None
         diagnostic_err = ""
 
         if len(extracted_text.strip()) > 20:
-            doc_context_header = f"DOCUMENT FILE: {filename} (Pages/Sections: {total_pages_detected})\n\n"
+            doc_context_header = f"DOCUMENT FILE: {filename} (Sections/Pages: {total_pages_detected})\n\n"
             truncated_content = extracted_text[:85000]
             analysis_raw = await ask_fast_text(
-                f"{doc_context_header}{truncated_content}\n\nConduct full forensic audit according to your directives.",
-                dual_role_prompt
+                f"{doc_context_header}{truncated_content}\n\nConduct comprehensive Grok-style document audit.",
+                grok_style_prompt
             )
         else:
             img_bytes = prepare_image_bytes(file_bytes)
             if img_bytes:
                 analysis_raw, diagnostic_err = await call_gemini_rest_vision(
-                    prompt=dual_role_prompt,
+                    prompt=grok_style_prompt,
                     img_bytes=img_bytes,
                     mime_type="image/jpeg"
                 )
@@ -1105,9 +1129,9 @@ async def analyze_document(
             }
 
         suggestions = [
-            "What are the primary financial risks in this record?",
-            "Are there penalty or termination clauses?",
-            "How do I verify the authenticity of this document?"
+            "What are the primary financial details here?",
+            "Are there hidden liabilities or terms?",
+            "How do I verify this record?"
         ]
 
         clean_text = analysis_raw
@@ -1124,7 +1148,7 @@ async def analyze_document(
         return {
             "status": "success",
             "data": {
-                "document_title": f"Forensic Audit ({filename})",
+                "document_title": f"Document Audit ({filename})",
                 "actionable_advisory": clean_text,
                 "detected_destination": None,
                 "suggestions": suggestions
@@ -1140,11 +1164,11 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
             sys_prompt = (
-                "Translate this forensic audit report completely into pure Marathi (Devanagari script). "
-                "Keep all markdown tables, bold styling, and warning tags (🚨 **[धोका / कायदेशीर जोखीम]:**) intact."
+                "Translate this report completely into pure Marathi (Devanagari script). "
+                "Keep all markdown tables, bold styling, and formatting intact."
             )
         else:
-            sys_prompt = f"Translate the forensic report into {target_language}. Retain bold labels, markdown tables, and red alerts."
+            sys_prompt = f"Translate the report into {target_language}. Retain bold labels and formatting."
 
         translated = await ask_fast_text(report_text, sys_prompt)
         return {"status": "success", "translated_report": translated}
@@ -1422,7 +1446,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "90.0.0",
+        "version": "91.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "supabase_connected": bool(supabase),
