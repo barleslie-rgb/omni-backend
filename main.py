@@ -142,7 +142,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     if not client:
         raise HTTPException(status_code=500, detail="Groq API key not configured on backend.")
     
-    for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
+    for model_id in ["llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it"]:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -161,7 +161,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             print(f"[Groq Text Error with {model_id}]: {e}")
             continue
 
-    raise HTTPException(status_code=500, detail="Groq API request failed across all models.")
+    raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
 
 # -------------------------------------------------------------
 # 4. FAST JSON ENGINE VIA GROK
@@ -170,7 +170,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
     if not client:
         return None
-    for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+    for model_id in ["llama3-70b-8192", "llama3-8b-8192"]:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -256,6 +256,9 @@ RULES:
     ans = await ask_fast_text(clean_q, sys_prompt)
     return {"status": "success", "answer": ans, "reply": ans}
 
+# -------------------------------------------------------------
+# 6. MULTI-TURN GENERAL CHAT ENGINE
+# -------------------------------------------------------------
 @app.post("/api/v1/chat")
 async def general_chat(request: Request):
     try:
@@ -485,7 +488,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
 
     client = get_groq_client()
     if client:
-        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+        for model_id in ["llama3-70b-8192", "llama3-8b-8192"]:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
@@ -526,7 +529,7 @@ async def street_voice_translate(
     if client:
         try:
             comp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama3-8b-8192",
                 messages=[
                     {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": clean_text}
