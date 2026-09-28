@@ -135,57 +135,60 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# 3. FAST TEXT ENGINE EXCLUSIVELY VIA GROK
+# 3. FAST TEXT ENGINE EXCLUSIVELY VIA GROK (EXTENDED TIMEOUTS)
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
-    if client:
-        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
-            try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.3,
-                    max_tokens=8192,
-                    timeout=55
-                )
-                raw = completion.choices[0].message.content
-                if raw and len(raw.strip()) > 5:
-                    return sanitize_ai_output(raw)
-            except Exception as e:
-                print(f"[Groq Text Notice with {model_id}]: {e}")
-                continue
+    if not client:
+        raise HTTPException(status_code=500, detail="Groq API key not configured on backend.")
+    
+    for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=8192,
+                timeout=90
+            )
+            raw = completion.choices[0].message.content
+            if raw and len(raw.strip()) > 0:
+                return sanitize_ai_output(raw)
+        except Exception as e:
+            print(f"[Groq Text Error with {model_id}]: {e}")
+            continue
 
-    return "Response generated successfully by Grok. Let me know if you need further assistance."
+    raise HTTPException(status_code=500, detail="Groq API request failed across all models.")
 
 # -------------------------------------------------------------
 # 4. FAST JSON ENGINE VIA GROK
 # -------------------------------------------------------------
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
-    if client:
-        for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-            try:
-                completion = client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.2,
-                    max_tokens=4000,
-                    response_format={"type": "json_object"},
-                    timeout=30
-                )
-                raw = completion.choices[0].message.content
-                if raw:
-                    return json.loads(sanitize_ai_output(raw))
-            except Exception as e:
-                print(f"[Groq JSON Notice with {model_id}]: {e}")
-                continue
+    if not client:
+        return None
+    for model_id in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
+        try:
+            completion = client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=4000,
+                response_format={"type": "json_object"},
+                timeout=45
+            )
+            raw = completion.choices[0].message.content
+            if raw:
+                return json.loads(sanitize_ai_output(raw))
+        except Exception as e:
+            print(f"[Groq JSON Error with {model_id}]: {e}")
+            continue
     return None
 
 # -------------------------------------------------------------
@@ -214,56 +217,40 @@ async def ask_question(request: Request):
 
     clean_q = str(question).strip()
     if not clean_q:
-        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your files, travels, or personal inquiries."}
+        return {"status": "error", "answer": "How can I assist you today?"}
+
+    if clean_q.lower() in ["hi", "hello", "hey", "greetings"]:
+        return {"status": "success", "answer": "Hello!", "reply": "Hello!"}
 
     lang_lower = target_language.lower()
     if "marathi" in lang_lower or "मराठी" in lang_lower:
         lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
     elif "hindi" in lang_lower or "हिंदी" in lang_lower:
         lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
-    elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
-        lang_instruction = "Answer strictly in natural Gujarati (ગુજરાતી script)."
-    elif "tamil" in lang_lower or "தமிழ்" in lang_lower:
-        lang_instruction = "Answer strictly in natural Tamil (தமிழ் script)."
-    elif "telugu" in lang_lower or "తెలుగు" in lang_lower:
-        lang_instruction = "Answer strictly in natural Telugu (తెలుగు script)."
-    elif "bengali" in lang_lower or "বাংলা" in lang_lower:
-        lang_instruction = "Answer strictly in natural Bengali (বাংলা script)."
-    elif "kannada" in lang_lower or "ಕನ್ನಡ" in lang_lower:
-        lang_instruction = "Answer strictly in natural Kannada (ಕನ್ನಡ script)."
-    elif "malayalam" in lang_lower or "മലയാളം" in lang_lower:
-        lang_instruction = "Answer strictly in natural Malayalam (മലയാളം script)."
-    elif "punjabi" in lang_lower or "ਪੰਜਾਬੀ" in lang_lower:
-        lang_instruction = "Answer strictly in natural Punjabi (ਪੰਜਾਬੀ script)."
-    elif "arabic" in lang_lower or "العربية" in lang_lower:
-        lang_instruction = "Answer strictly in natural Arabic (العربية script)."
     else:
         lang_instruction = f"Answer clearly and concisely in {target_language}."
 
-    has_doc = bool(active_document_context and len(active_document_context.strip()) > 30)
+    has_doc = bool(active_document_context and len(active_document_context.strip()) > 10)
 
     if has_doc:
         sys_prompt = f"""
-You are Paper Pilot, a warm, supportive, and brilliant Grok-style AI Companion and Document Auditor.
+You are Paper Pilot, a precise AI Document Auditor.
 {lang_instruction}
 
 UPLOADED DOCUMENT CONTEXT:
-{active_document_context[:65000]}
+{active_document_context[:95000]}
 
-MANDATORY RULES:
-1. Ground your answers in the uploaded document context above when the user asks about specific file details, clauses, sums, or data.
-2. If the user asks general or personal lifestyle queries, travel advice, or personal support questions, answer with warm, witty, supportive Grok-style wisdom.
-3. Maintain conversational continuity and guide the user patiently and clearly.
+RULES:
+1. Answer the user's specific question strictly using the document context above.
+2. Be direct, factual, and concise. Do not give general commentary.
 """
     else:
         sys_prompt = f"""
-You are Paper Pilot, a warm, witty, and deeply knowledgeable Grok-style AI Assistant and Personal Companion.
+You are Paper Pilot, an AI assistant.
 {lang_instruction}
 
-DIRECTIVES:
-1. Respond to the user with warmth, intelligence, and helpfulness, exactly like Grok.
-2. Assist with general reasoning, travel guidance, daily planning, coding, personal queries, and explanations.
-3. Keep the tone engaging, conversational, and direct.
+RULES:
+1. Answer the user's query directly, accurately, and concisely.
 """
 
     ans = await ask_fast_text(clean_q, sys_prompt)
@@ -276,7 +263,11 @@ async def general_chat(request: Request):
         message = body.get("message") or body.get("question") or ""
         target_language = body.get("target_language", "English")
         context = body.get("context", "")
-        sys_prompt = f"You are Paper Pilot Grok-style Assistant. Answer warmly, intelligently, and concisely in {target_language}.\nContext: {context}"
+        
+        if message.strip().lower() in ["hi", "hello", "hey"]:
+            return {"status": "success", "answer": "Hello!", "reply": "Hello!"}
+
+        sys_prompt = f"You are Paper Pilot Assistant. Answer directly and concisely in {target_language}.\nContext: {context}"
         ans = await ask_fast_text(message, sys_prompt)
         return {"status": "success", "answer": ans, "reply": ans}
     except Exception as e:
@@ -299,42 +290,20 @@ async def convert_file(
         save_path = os.path.join(DOWNLOADS_DIR, converted_filename)
 
         if target_fmt in ["TXT", "TEXT", "MD"]:
-            try:
-                text_content = file_bytes.decode("utf-8", errors="ignore")
-            except Exception:
-                text_content = str(file_bytes)
+            text_content = file_bytes.decode("utf-8", errors="ignore")
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(text_content)
-
         elif target_fmt == "HTML":
             text_content = file_bytes.decode("utf-8", errors="ignore")
             html_content = f"<!DOCTYPE html><html><head><meta charset='utf-8'></head><body><pre>{text_content}</pre></body></html>"
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(html_content)
-
-        elif target_fmt in ["DOCX", "DOC"]:
-            text_content = file_bytes.decode("utf-8", errors="ignore")
-            doc_html = f"<!DOCTYPE html><html><body>{text_content.replace(chr(10), '<br/>')}</body></html>"
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write(doc_html)
-
-        elif target_fmt == "JSON":
-            try:
-                text_content = file_bytes.decode("utf-8", errors="ignore")
-                parsed = json.loads(text_content)
-                with open(save_path, "w", encoding="utf-8") as f:
-                    json.dump(parsed, f, indent=2)
-            except Exception:
-                with open(save_path, "w", encoding="utf-8") as f:
-                    json.dump({"raw_file": filename, "size": len(file_bytes)}, f, indent=2)
-
         elif target_fmt in ["JPG", "JPEG", "PNG", "WEBP", "BMP"]:
             pil_img = Image.open(io.BytesIO(file_bytes))
             pil_img = ImageOps.exif_transpose(pil_img)
             if pil_img.mode != "RGB" and target_fmt in ["JPG", "JPEG"]:
                 pil_img = pil_img.convert("RGB")
             pil_img.save(save_path, format="JPEG" if target_fmt in ["JPG", "JPEG"] else target_fmt)
-
         else:
             with open(save_path, "wb") as f:
                 f.write(file_bytes)
@@ -360,29 +329,10 @@ async def export_pdf(title: str = Form(...), content: str = Form(...)):
     try:
         pdf_filename = f"Vault_Dossier_{uuid.uuid4().hex[:8]}.pdf"
         save_path = os.path.join(DOWNLOADS_DIR, pdf_filename)
-
-        html_source = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>{title}</title>
-    <style>
-        body {{ font-family: sans-serif; padding: 24px; color: #0F172A; line-height: 1.5; }}
-        h1 {{ color: #1E3A8A; font-size: 18pt; border-bottom: 2px solid #2563EB; padding-bottom: 6px; }}
-        pre {{ white-space: pre-wrap; font-size: 10pt; font-family: monospace; }}
-    </style>
-</head>
-<body>
-    <h1>{title}</h1>
-    <pre>{content}</pre>
-</body>
-</html>"""
-
+        html_source = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>{title}</title></head><body><h1>{title}</h1><pre>{content}</pre></body></html>"""
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(html_source)
-
-        download_url = f"/downloads/{pdf_filename}"
-        return {"status": "success", "download_url": download_url, "file_name": pdf_filename}
+        return {"status": "success", "download_url": f"/downloads/{pdf_filename}", "file_name": pdf_filename}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -391,29 +341,10 @@ async def export_docx(title: str = Form(...), content: str = Form(...)):
     try:
         doc_filename = f"Vault_Dossier_{uuid.uuid4().hex[:8]}.doc"
         save_path = os.path.join(DOWNLOADS_DIR, doc_filename)
-
-        html_source = f"""\uFEFF<!DOCTYPE html>
-<html>
-<head>
-    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>{title}</title>
-    <style>
-        body {{ font-family: 'Segoe UI', Arial, sans-serif; padding: 24px; color: #0F172A; line-height: 1.6; }}
-        h1 {{ color: #1E3A8A; font-size: 18pt; border-bottom: 2px solid #2563EB; padding-bottom: 6px; }}
-        pre {{ white-space: pre-wrap; font-size: 11pt; }}
-    </style>
-</head>
-<body>
-    <h1>{title}</h1>
-    <pre>{content}</pre>
-</body>
-</html>"""
-
+        html_source = f"""\uFEFF<!DOCTYPE html><html><head><meta charset="utf-8"><title>{title}</title></head><body><h1>{title}</h1><pre>{content}</pre></body></html>"""
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(html_source)
-
-        download_url = f"/downloads/{doc_filename}"
-        return {"status": "success", "download_url": download_url, "file_name": doc_filename}
+        return {"status": "success", "download_url": f"/downloads/{doc_filename}", "file_name": doc_filename}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -561,20 +492,15 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                     messages=messages,
                     temperature=0.3,
                     max_tokens=8192,
-                    timeout=60
+                    timeout=90
                 )
                 raw = completion.choices[0].message.content
-                if raw and len(raw.strip()) > 10:
+                if raw and len(raw.strip()) > 0:
                     return sanitize_ai_output(raw)
             except Exception as e:
-                print(f"[Groq Concierge Notice with {model_id}]: {e}")
+                print(f"[Groq Concierge Error with {model_id}]: {e}")
                 continue
-
-    return (
-        f"### 📍 Travel Advisory\n\n"
-        f"I am ready to plan your travel and transit inquiries for **{prompt}**. "
-        f"Please share your preferences, itinerary questions, or location details."
-    )
+    return f"Advisory for {prompt}"
 
 # -------------------------------------------------------------
 # 11. STREET VOICE TRANSLATION
@@ -607,7 +533,7 @@ async def street_voice_translate(
                 ],
                 temperature=0.1,
                 max_tokens=500,
-                timeout=8
+                timeout=15
             )
             raw_ans = comp.choices[0].message.content.strip().strip('"')
             if raw_ans:
@@ -629,67 +555,19 @@ async def street_lens(
         file_bytes = await file.read()
         img_bytes = prepare_image_bytes(file_bytes)
         if not img_bytes:
-            return {"status": "error", "message": "Could not decode this photo."}
-
-        lens_prompt = (
-            f"You are Omni Street Lens, an instant camera visual translator for travelers on the move.\n"
-            f"Target Language: {target_language}.\n\n"
-            f"INSTRUCTIONS:\n"
-            f"1. Detect and read all visible text in the image (street sign, store name, restaurant menu, warning board, transit exit).\n"
-            f"2. Provide a 2-to-3 sentence clear explanation in {target_language} of what the sign says and its practical meaning for a visitor.\n"
-            f"3. If there is a restriction, timing, or fine, clearly highlight it.\n"
-            f"4. Keep it concise so it can be read aloud in 15 seconds."
-        )
-
-        analysis = await ask_fast_text(lens_prompt, "You are a visual assistant.")
+            return {"status": "error", "message": "Could not decode photo."}
+        analysis = await ask_fast_text("Interpret this sign and its meaning for a traveler.", "You are a visual assistant.")
         return {"status": "success", "interpretation": analysis}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 13. BARGAIN PAL
-# -------------------------------------------------------------
-@app.post("/api/v1/bargain-evaluate")
-async def bargain_evaluate(request: Request):
-    try:
-        body = await request.json()
-        item_name = body.get("item_name", "Souvenir")
-        quoted_price = float(body.get("quoted_price", 100))
-        currency = body.get("currency", "INR")
-        city = body.get("city", "Mumbai")
-
-        sys_prompt = f"""
-You are Bargain Pal, an authentic local street market expert for {city}.
-Evaluate the quoted price for '{item_name}' ({quoted_price} {currency}).
-Return STRICT JSON ONLY without markdown backticks.
-
-JSON FORMAT:
-{{
-  "verdict": "Fair Price / Mild Markup / Tourist Trap",
-  "rating_color": "green / yellow / red",
-  "estimated_fair_price": 0.0,
-  "suggested_counter_offer": 0.0,
-  "advice": "1 practical sentence on local bargaining etiquette for this item.",
-  "polite_counter_phrase": "Polite phrase in native script to negotiate",
-  "phonetic": "Pronunciation in English letters",
-  "phrase_translation": "English meaning of phrase"
-}}
-"""
-        res = await ask_fast_json(f"Evaluate street price for {item_name}", sys_prompt)
-        if res:
-            return {"status": "success", "data": res}
-        return {"status": "error", "message": "Evaluation timed out"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# -------------------------------------------------------------
-# 14. WIKIPEDIA PHOTO RESOLVER
+# 13. WIKIPEDIA PHOTO RESOLVER
 # -------------------------------------------------------------
 def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
     headers = {
-        "User-Agent": "OmniTouristOS/4.0 (contact: info@touristos.app) requests/2.31"
+        "User-Agent": "OmniTouristOS/4.0 requests/2.31"
     }
-
     clean_name = re.sub(r'\(.*?\)', '', landmark_name).strip()
     search_candidates = [clean_name, f"{clean_name}, {city}", landmark_name]
 
@@ -705,23 +583,22 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                 if "originalimage" in p_data and "source" in p_data["originalimage"]:
                     return p_data["originalimage"]["source"]
                 if "thumbnail" in p_data and "source" in p_data["thumbnail"]:
-                    thumb = p_data["thumbnail"]["source"]
-                    return re.sub(r'/\d+px-', '/1200px-', thumb)
+                    return re.sub(r'/\d+px-', '/1200px-', p_data["thumbnail"]["source"])
         except Exception:
             continue
     return ""
 
 # -------------------------------------------------------------
-# 15. DOCUMENT PARSERS & BINARY FORENSIC INSPECTOR
+# 14. DOCUMENT PARSERS & BINARY FORENSIC INSPECTOR
 # -------------------------------------------------------------
-def inspect_binary_stream(file_bytes: bytes, max_len: int = 1024) -> str:
+def inspect_binary_stream(file_bytes: bytes, max_len: int = 2048) -> str:
     try:
         preview_len = min(len(file_bytes), max_len)
         printable_strings = re.findall(rb'[A-Za-z0-9/\-_:., ]{4,}', file_bytes[:preview_len * 4])
-        decoded_strings = [s.decode('ascii', errors='ignore') for s in printable_strings[:60]]
-        return "EMBEDDED STREAM DATA & STRINGS:\n" + "\n".join(f"• {s}" for s in decoded_strings)
+        decoded_strings = [s.decode('ascii', errors='ignore') for s in printable_strings[:100]]
+        return "EXTRACTED STREAM DATA:\n" + "\n".join(f"• {s}" for s in decoded_strings)
     except Exception as e:
-        return f"Stream note: {e}"
+        return f"Stream error: {e}"
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -742,28 +619,22 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             shared_strings = []
             if "xl/sharedStrings.xml" in zf.namelist():
-                ss_xml = zf.read("xl/sharedStrings.xml")
-                tree = ET.fromstring(ss_xml)
+                tree = ET.fromstring(zf.read("xl/sharedStrings.xml"))
                 for si in tree.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}si'):
                     t_nodes = [node.text for node in si.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t') if node.text]
                     shared_strings.append("".join(t_nodes))
-
             sheets = sorted([n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")])
             table_output = []
             for s_name in sheets:
-                xml_content = zf.read(s_name)
-                tree = ET.fromstring(xml_content)
+                tree = ET.fromstring(zf.read(s_name))
                 for row in tree.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
                     row_vals = []
                     for c in row.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
-                        cell_type = c.attrib.get('t')
                         v_node = c.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
                         if v_node is not None and v_node.text:
                             val = v_node.text
-                            if cell_type == 's' and val.isdigit():
-                                idx = int(val)
-                                if idx < len(shared_strings):
-                                    val = shared_strings[idx]
+                            if c.attrib.get('t') == 's' and val.isdigit() and int(val) < len(shared_strings):
+                                val = shared_strings[int(val)]
                             row_vals.append(val)
                     if row_vals:
                         table_output.append(" | ".join(row_vals))
@@ -771,14 +642,13 @@ def extract_text_from_xlsx(file_bytes: bytes) -> str:
     except Exception:
         return ""
 
-def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[str, int]:
+def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 500) -> Tuple[str, int]:
     if PdfReader is None:
         return inspect_binary_stream(file_bytes), 1
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         total_pages = len(reader.pages)
         pages_to_read = min(total_pages, max_pages)
-
         extracted_chunks = []
         for i in range(pages_to_read):
             try:
@@ -787,7 +657,6 @@ def extract_massive_pdf_text(file_bytes: bytes, max_pages: int = 250) -> Tuple[s
                     extracted_chunks.append(f"--- [PAGE {i+1} OF {total_pages}] ---\n{page_text.strip()}")
             except Exception:
                 continue
-
         full_extracted = "\n\n".join(extracted_chunks)
         if not full_extracted.strip():
             full_extracted = inspect_binary_stream(file_bytes)
@@ -801,16 +670,16 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1400:
-            pil_img.thumbnail((1400, 1400), Image.Resampling.BILINEAR)
+        if max(pil_img.size) > 1600:
+            pil_img.thumbnail((1600, 1600), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        pil_img.save(out_buf, format="JPEG", quality=90)
+        pil_img.save(out_buf, format="JPEG", quality=92)
         return out_buf.getvalue()
     except Exception:
         return None
 
 # -------------------------------------------------------------
-# 16. GROK-EXCLUSIVE UNIVERSAL DOCUMENT AUDITOR (PAPER PILOT)
+# 15. GROK-EXCLUSIVE UNIVERSAL DOCUMENT AUDITOR (PAPER PILOT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -834,14 +703,14 @@ async def analyze_document(
             except Exception:
                 pass
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
-            extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
+            extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=500)
         else:
             try:
                 extracted_text = file_bytes.decode("utf-8", errors="ignore")
             except Exception:
                 extracted_text = inspect_binary_stream(file_bytes)
 
-        if not extracted_text or len(extracted_text.strip()) < 10:
+        if not extracted_text or len(extracted_text.strip()) < 5:
             extracted_text = inspect_binary_stream(file_bytes)
 
         lang_lower = target_language.lower()
@@ -849,47 +718,25 @@ async def analyze_document(
             lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
             lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN HINDI (हिंदी - Devanagari script)."
-        elif "gujarati" in lang_lower or "ગુજરાતી" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN GUJARATI (ગુજરાતી script)."
-        elif "tamil" in lang_lower or "தமிழ்" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN TAMIL (தமிழ் script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
         grok_style_prompt = (
-            f"You are Paper Pilot, an elite Grok-style Document Analyst and Intelligence Auditor.\n"
+            f"You are Paper Pilot, an elite Document Analyst and Intelligence Auditor.\n"
             f"{lang_instruction}\n\n"
-            f"STYLE GUIDELINES (GROK STYLE):\n"
-            f"1. Keep summaries clean, elegant, structured, and easy to scan.\n"
-            f"2. Use clear section headers and bullet points.\n"
-            f"3. Structure the output into:\n"
-            f"   • **Summary of the Document**: Overview, core purpose, and key entities.\n"
-            f"   • **Key Highlights / Breakdown**: Bulleted chronological or categorical highlights.\n"
-            f"   • **Financial / Numerical Ballpark**: Costs, budgets, or metric breakdowns if applicable.\n"
-            f"   • **Actionable Recommendations & Next Steps**: Practical advice for the user.\n\n"
-            f"At the very end of your response, output a single line:\n"
-            f"EXPLORE_SUGGESTIONS: [\"What are the primary financial details here?\", \"Are there hidden liabilities or terms?\", \"How do I verify this record?\"]"
+            f"GUIDELINES:\n"
+            f"1. Provide a comprehensive, rigorous forensic audit of the document contents below.\n"
+            f"2. Structure into clear sections: • Executive Summary • Key Breakdown / Clauses • Financial / Numerical Data • Actionable Recommendations.\n"
+            f"3. At the very end, output: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
         )
 
         analysis_raw = await ask_fast_text(
-            f"DOCUMENT FILE: {filename} (Sections/Pages: {total_pages_detected})\n\nEXTRACTED CONTENT:\n{extracted_text[:85000]}",
+            f"DOCUMENT FILE: {filename} (Pages: {total_pages_detected})\n\nCONTENT:\n{extracted_text[:95000]}",
             grok_style_prompt
         )
 
         del file_bytes
         gc.collect()
-
-        if not analysis_raw or "Response generated successfully by Grok" in analysis_raw:
-            analysis_raw = (
-                f"### 📋 Forensic Audit Report: {filename}\n\n"
-                f"**Document Overview:**\n"
-                f"Successfully parsed document containing {total_pages_detected} section(s). The file structure was analyzed for compliance, key travel/itinerary markers, and operational details.\n\n"
-                f"**Key Highlights:**\n"
-                f"• Verified document title and payload integrity.\n"
-                f"• Extracted text stream length: {len(extracted_text)} characters.\n\n"
-                f"**Actionable Recommendations:**\n"
-                f"Review specific line items or ask follow-up questions below for a deeper line-by-line breakdown."
-            )
 
         suggestions = [
             "What are the primary financial details here?",
@@ -919,24 +766,23 @@ async def analyze_document(
             "raw_text": clean_text
         }
     except Exception as e:
-        return {"status": "error", "message": f"Scan error: {str(e)}", "data": None}
+        raise HTTPException(status_code=500, detail=f"Audit error: {str(e)}")
 
 @app.post("/api/v1/translate-report")
 async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
     try:
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            sys_prompt = "Translate this report completely into pure Marathi (Devanagari script). Keep all markdown tables and formatting intact."
+            sys_prompt = "Translate this report completely into pure Marathi (Devanagari script). Keep all formatting intact."
         else:
             sys_prompt = f"Translate the report into {target_language}. Retain formatting."
-
         translated = await ask_fast_text(report_text, sys_prompt)
         return {"status": "success", "translated_report": translated}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 17. CONCIERGE CHAT & LIVE MOTION RADAR PIPELINE
+# 16. CONCIERGE CHAT & LIVE MOTION RADAR PIPELINE
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -977,7 +823,7 @@ async def explore_chat(request: Request):
     }
 
 # -------------------------------------------------------------
-# 18. COMMUNITY GEM & CHAT ENDPOINTS (SUPABASE INTEGRATION)
+# 17. COMMUNITY GEM & CHAT ENDPOINTS (SUPABASE INTEGRATION)
 # -------------------------------------------------------------
 @app.get("/api/v1/community/feed")
 async def get_community_feed(community_id: str = Query("vasai-virar")):
@@ -1020,7 +866,7 @@ async def get_community_messages(community_id: str = Query("vasai-virar")):
         return {"status": "error", "message": str(e), "messages": []}
 
 # -------------------------------------------------------------
-# 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
+# 18. INDIAN RAILWAYS TRANSIT & PNR ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
@@ -1035,7 +881,7 @@ async def railway_inquiry(request: Request):
     }
 
 # -------------------------------------------------------------
-# 20. WEBSOCKET REALTIME ROUTER FOR COMMUNITY CHAT
+# 19. WEBSOCKET REALTIME ROUTER FOR COMMUNITY CHAT
 # -------------------------------------------------------------
 class ConnectionManager:
     def __init__(self):
@@ -1080,6 +926,42 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
     except WebSocketDisconnect:
         manager.disconnect(community_id, websocket)
         await manager.broadcast(community_id, {"type": "system", "text": "A user disconnected."})
+
+# -------------------------------------------------------------
+# 20. BARGAIN PAL
+# -------------------------------------------------------------
+@app.post("/api/v1/bargain-evaluate")
+async def bargain_evaluate(request: Request):
+    try:
+        body = await request.json()
+        item_name = body.get("item_name", "Souvenir")
+        quoted_price = float(body.get("quoted_price", 100))
+        currency = body.get("currency", "INR")
+        city = body.get("city", "Mumbai")
+
+        sys_prompt = f"""
+You are Bargain Pal, an authentic local street market expert for {city}.
+Evaluate the quoted price for '{item_name}' ({quoted_price} {currency}).
+Return STRICT JSON ONLY without markdown backticks.
+
+JSON FORMAT:
+{{
+  "verdict": "Fair Price / Mild Markup / Tourist Trap",
+  "rating_color": "green / yellow / red",
+  "estimated_fair_price": 0.0,
+  "suggested_counter_offer": 0.0,
+  "advice": "1 practical sentence on local bargaining etiquette for this item.",
+  "polite_counter_phrase": "Polite phrase in native script to negotiate",
+  "phonetic": "Pronunciation in English letters",
+  "phrase_translation": "English meaning of phrase"
+}}
+"""
+        res = await ask_fast_json(f"Evaluate street price for {item_name}", sys_prompt)
+        if res:
+            return {"status": "success", "data": res}
+        return {"status": "error", "message": "Evaluation timed out"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
 # 21. SERVER HEALTH & STATUS
