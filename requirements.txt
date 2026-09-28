@@ -42,6 +42,4 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 urllib3==2.7.0
 uvicorn==0.52.4
-websockets==16.1.1
 xlsxwriter==3.2.9
-supabase==2.31.0
