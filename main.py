@@ -124,7 +124,7 @@ def get_bullion_rates(city: str = Query("mumbai")):
     return fetch_domestic_bullion_mumbai()
 
 # -------------------------------------------------------------
-# 2. CREDENTIAL MANAGEMENT & GROK EXCLUSIVE CLIENT
+# 2. CREDENTIAL MANAGEMENT & GROQ CLIENT
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     raw = os.environ.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
@@ -135,14 +135,16 @@ def sanitize_ai_output(text: str) -> str:
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# 3. FAST TEXT ENGINE EXCLUSIVELY VIA GROK (EXTENDED TIMEOUTS)
+# 3. FAST TEXT ENGINE VIA ACTIVE GROQ MODELS
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
     if not client:
         raise HTTPException(status_code=500, detail="Groq API key not configured on backend.")
     
-    for model_id in ["llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it"]:
+    # Active, stable model IDs on Groq
+    candidate_models = ["llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it"]
+    for model_id in candidate_models:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -151,7 +153,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=8192,
+                max_tokens=8000,
                 timeout=90
             )
             raw = completion.choices[0].message.content
@@ -164,7 +166,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
 
 # -------------------------------------------------------------
-# 4. FAST JSON ENGINE VIA GROK
+# 4. FAST JSON ENGINE VIA GROQ
 # -------------------------------------------------------------
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
@@ -192,7 +194,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     return None
 
 # -------------------------------------------------------------
-# 5. PAPER PILOT PERSISTENT CHAT & UNIVERSAL INQUIRY
+# 5. PAPER PILOT PERSISTENT CHAT & DIRECT QUERY HANDLER
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(request: Request):
@@ -219,6 +221,7 @@ async def ask_question(request: Request):
     if not clean_q:
         return {"status": "error", "answer": "How can I assist you today?"}
 
+    # Strict intent check: If user sends a greeting, answer strictly with a greeting
     if clean_q.lower() in ["hi", "hello", "hey", "greetings"]:
         return {"status": "success", "answer": "Hello!", "reply": "Hello!"}
 
@@ -234,15 +237,15 @@ async def ask_question(request: Request):
 
     if has_doc:
         sys_prompt = f"""
-You are Paper Pilot, a precise AI Document Auditor.
+You are Paper Pilot, an AI Document Auditor.
 {lang_instruction}
 
 UPLOADED DOCUMENT CONTEXT:
 {active_document_context[:95000]}
 
 RULES:
-1. Answer the user's specific question strictly using the document context above.
-2. Be direct, factual, and concise. Do not give general commentary.
+1. Answer the user's specific query strictly using the document context above.
+2. Be direct, accurate, and concise. Omit unnecessary preamble.
 """
     else:
         sys_prompt = f"""
@@ -250,14 +253,14 @@ You are Paper Pilot, an AI assistant.
 {lang_instruction}
 
 RULES:
-1. Answer the user's query directly, accurately, and concisely.
+1. Answer the user's query directly and accurately.
 """
 
     ans = await ask_fast_text(clean_q, sys_prompt)
     return {"status": "success", "answer": ans, "reply": ans}
 
 # -------------------------------------------------------------
-# 6. MULTI-TURN GENERAL CHAT ENGINE
+# 6. GENERAL CONVERSATION ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/chat")
 async def general_chat(request: Request):
@@ -494,7 +497,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                     model=model_id,
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=8192,
+                    max_tokens=8000,
                     timeout=90
                 )
                 raw = completion.choices[0].message.content
@@ -559,7 +562,7 @@ async def street_lens(
         img_bytes = prepare_image_bytes(file_bytes)
         if not img_bytes:
             return {"status": "error", "message": "Could not decode photo."}
-        analysis = await ask_fast_text("Interpret this sign and its meaning for a traveler.", "You are a visual assistant.")
+        analysis = await ask_fast_text("Interpret this sign and its practical meaning for a traveler.", "You are a visual assistant.")
         return {"status": "success", "interpretation": analysis}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -682,7 +685,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 15. GROK-EXCLUSIVE UNIVERSAL DOCUMENT AUDITOR (PAPER PILOT)
+# 15. PAPER PILOT UNIVERSAL DOCUMENT AUDITOR
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -718,9 +721,9 @@ async def analyze_document(
 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN MARATHI (मराठी - Devanagari script)."
+            lang_instruction = "CRITICAL: Produce the entire audit summary STRICTLY IN MARATHI (मराठी - Devanagari script)."
         elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN HINDI (हिंदी - Devanagari script)."
+            lang_instruction = "CRITICAL: Produce the entire audit summary STRICTLY IN HINDI (हिंदी - Devanagari script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
@@ -771,6 +774,9 @@ async def analyze_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audit error: {str(e)}")
 
+# -------------------------------------------------------------
+# 16. REPORT TRANSLATOR
+# -------------------------------------------------------------
 @app.post("/api/v1/translate-report")
 async def translate_report(report_text: str = Form(...), target_language: str = Form("Marathi")):
     try:
@@ -785,7 +791,7 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 16. CONCIERGE CHAT & LIVE MOTION RADAR PIPELINE
+# 17. CONCIERGE CHAT & LIVE RADAR PIPELINE
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
@@ -826,7 +832,7 @@ async def explore_chat(request: Request):
     }
 
 # -------------------------------------------------------------
-# 17. COMMUNITY GEM & CHAT ENDPOINTS (SUPABASE INTEGRATION)
+# 18. COMMUNITY GEM & CHAT ENDPOINTS (SUPABASE INTEGRATION)
 # -------------------------------------------------------------
 @app.get("/api/v1/community/feed")
 async def get_community_feed(community_id: str = Query("vasai-virar")):
@@ -869,7 +875,7 @@ async def get_community_messages(community_id: str = Query("vasai-virar")):
         return {"status": "error", "message": str(e), "messages": []}
 
 # -------------------------------------------------------------
-# 18. INDIAN RAILWAYS TRANSIT & PNR ENGINE
+# 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
@@ -884,7 +890,43 @@ async def railway_inquiry(request: Request):
     }
 
 # -------------------------------------------------------------
-# 19. WEBSOCKET REALTIME ROUTER FOR COMMUNITY CHAT
+# 20. BARGAIN PAL (PRICE EVALUATOR)
+# -------------------------------------------------------------
+@app.post("/api/v1/bargain-evaluate")
+async def bargain_evaluate(request: Request):
+    try:
+        body = await request.json()
+        item_name = body.get("item_name", "Souvenir")
+        quoted_price = float(body.get("quoted_price", 100))
+        currency = body.get("currency", "INR")
+        city = body.get("city", "Mumbai")
+
+        sys_prompt = f"""
+You are Bargain Pal, an authentic local street market expert for {city}.
+Evaluate the quoted price for '{item_name}' ({quoted_price} {currency}).
+Return STRICT JSON ONLY without markdown backticks.
+
+JSON FORMAT:
+{{
+  "verdict": "Fair Price / Mild Markup / Tourist Trap",
+  "rating_color": "green / yellow / red",
+  "estimated_fair_price": 0.0,
+  "suggested_counter_offer": 0.0,
+  "advice": "1 practical sentence on local bargaining etiquette for this item.",
+  "polite_counter_phrase": "Polite phrase in native script to negotiate",
+  "phonetic": "Pronunciation in English letters",
+  "phrase_translation": "English meaning of phrase"
+}}
+"""
+        res = await ask_fast_json(f"Evaluate street price for {item_name}", sys_prompt)
+        if res:
+            return {"status": "success", "data": res}
+        return {"status": "error", "message": "Evaluation timed out"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# -------------------------------------------------------------
+# 21. WEBSOCKET REALTIME ROUTER & SERVER HEALTH
 # -------------------------------------------------------------
 class ConnectionManager:
     def __init__(self):
@@ -930,45 +972,6 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
         manager.disconnect(community_id, websocket)
         await manager.broadcast(community_id, {"type": "system", "text": "A user disconnected."})
 
-# -------------------------------------------------------------
-# 20. BARGAIN PAL
-# -------------------------------------------------------------
-@app.post("/api/v1/bargain-evaluate")
-async def bargain_evaluate(request: Request):
-    try:
-        body = await request.json()
-        item_name = body.get("item_name", "Souvenir")
-        quoted_price = float(body.get("quoted_price", 100))
-        currency = body.get("currency", "INR")
-        city = body.get("city", "Mumbai")
-
-        sys_prompt = f"""
-You are Bargain Pal, an authentic local street market expert for {city}.
-Evaluate the quoted price for '{item_name}' ({quoted_price} {currency}).
-Return STRICT JSON ONLY without markdown backticks.
-
-JSON FORMAT:
-{{
-  "verdict": "Fair Price / Mild Markup / Tourist Trap",
-  "rating_color": "green / yellow / red",
-  "estimated_fair_price": 0.0,
-  "suggested_counter_offer": 0.0,
-  "advice": "1 practical sentence on local bargaining etiquette for this item.",
-  "polite_counter_phrase": "Polite phrase in native script to negotiate",
-  "phonetic": "Pronunciation in English letters",
-  "phrase_translation": "English meaning of phrase"
-}}
-"""
-        res = await ask_fast_json(f"Evaluate street price for {item_name}", sys_prompt)
-        if res:
-            return {"status": "success", "data": res}
-        return {"status": "error", "message": "Evaluation timed out"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# -------------------------------------------------------------
-# 21. SERVER HEALTH & STATUS
-# -------------------------------------------------------------
 @app.get("/api/v1/wake")
 @app.get("/")
 def wake():
