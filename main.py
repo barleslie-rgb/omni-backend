@@ -33,7 +33,7 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Grok-Only Universal Document Auditor, Transit Cloud & Community Intelligence",
+    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Universal Document Auditor, Transit Cloud & Community Intelligence",
     version="92.0.0"
 )
 
@@ -134,16 +134,42 @@ def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
+# Dynamic Model Resolution to eliminate decommissioned model errors
+_active_groq_models: List[str] = []
+_models_last_fetched: float = 0.0
+
+def get_live_groq_models(client: Groq) -> List[str]:
+    global _active_groq_models, _models_last_fetched
+    now = time.time()
+    if _active_groq_models and (now - _models_last_fetched < 1800):
+        return _active_groq_models
+
+    try:
+        model_list = client.models.list()
+        all_ids = [m.id for m in model_list.data if m.active]
+        print(f"[Groq Live Available Models]: {all_ids}")
+        
+        # Sort so primary chat models come first, avoiding whisper audio models
+        chat_models = [m for m in all_ids if not any(x in m.lower() for x in ["whisper", "tts", "embedding"])]
+        if chat_models:
+            _active_groq_models = chat_models
+            _models_last_fetched = now
+            return _active_groq_models
+    except Exception as e:
+        print(f"[Groq Model Registry Notice]: {e}")
+
+    # Fallback to standard Groq model IDs
+    return ["llama-3.3-70b-specdec", "llama-3.2-11b-vision-preview", "llama-3.2-3b-preview", "llama-3.2-1b-preview", "qwen-2.5-32b"]
+
 # -------------------------------------------------------------
-# 3. FAST TEXT ENGINE VIA ACTIVE GROQ MODELS
+# 3. FAST TEXT ENGINE VIA DYNAMIC ACTIVE GROQ MODELS
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
     if not client:
         raise HTTPException(status_code=500, detail="Groq API key not configured on backend.")
     
-    # Active, stable model IDs on Groq
-    candidate_models = ["llama3-70b-8192", "llama3-8b-8192", "gemma2-9b-it"]
+    candidate_models = get_live_groq_models(client)
     for model_id in candidate_models:
         try:
             completion = client.chat.completions.create(
@@ -160,7 +186,7 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             if raw and len(raw.strip()) > 0:
                 return sanitize_ai_output(raw)
         except Exception as e:
-            print(f"[Groq Text Error with {model_id}]: {e}")
+            print(f"[Groq Text Notice with {model_id}]: {e}")
             continue
 
     raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
@@ -172,7 +198,9 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
     if not client:
         return None
-    for model_id in ["llama3-70b-8192", "llama3-8b-8192"]:
+    
+    candidate_models = get_live_groq_models(client)
+    for model_id in candidate_models:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -189,7 +217,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
             if raw:
                 return json.loads(sanitize_ai_output(raw))
         except Exception as e:
-            print(f"[Groq JSON Error with {model_id}]: {e}")
+            print(f"[Groq JSON Notice with {model_id}]: {e}")
             continue
     return None
 
@@ -221,7 +249,6 @@ async def ask_question(request: Request):
     if not clean_q:
         return {"status": "error", "answer": "How can I assist you today?"}
 
-    # Strict intent check: If user sends a greeting, answer strictly with a greeting
     if clean_q.lower() in ["hi", "hello", "hey", "greetings"]:
         return {"status": "success", "answer": "Hello!", "reply": "Hello!"}
 
@@ -491,7 +518,8 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
 
     client = get_groq_client()
     if client:
-        for model_id in ["llama3-70b-8192", "llama3-8b-8192"]:
+        candidate_models = get_live_groq_models(client)
+        for model_id in candidate_models:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
@@ -504,7 +532,7 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                 if raw and len(raw.strip()) > 0:
                     return sanitize_ai_output(raw)
             except Exception as e:
-                print(f"[Groq Concierge Error with {model_id}]: {e}")
+                print(f"[Groq Concierge Notice with {model_id}]: {e}")
                 continue
     return f"Advisory for {prompt}"
 
@@ -530,22 +558,25 @@ async def street_voice_translate(
 
     client = get_groq_client()
     if client:
-        try:
-            comp = client.chat.completions.create(
-                model="llama3-8b-8192",
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": clean_text}
-                ],
-                temperature=0.1,
-                max_tokens=500,
-                timeout=15
-            )
-            raw_ans = comp.choices[0].message.content.strip().strip('"')
-            if raw_ans:
-                return {"status": "success", "translation": sanitize_ai_output(raw_ans)}
-        except Exception as e:
-            print(f"[Street Voice Groq Notice]: {e}")
+        candidate_models = get_live_groq_models(client)
+        for model_id in candidate_models:
+            try:
+                comp = client.chat.completions.create(
+                    model=model_id,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": clean_text}
+                    ],
+                    temperature=0.1,
+                    max_tokens=500,
+                    timeout=15
+                )
+                raw_ans = comp.choices[0].message.content.strip().strip('"')
+                if raw_ans:
+                    return {"status": "success", "translation": sanitize_ai_output(raw_ans)}
+            except Exception as e:
+                print(f"[Street Voice Notice with {model_id}]: {e}")
+                continue
 
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
@@ -727,7 +758,7 @@ async def analyze_document(
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
-        grok_style_prompt = (
+        audit_prompt = (
             f"You are Paper Pilot, an elite Document Analyst and Intelligence Auditor.\n"
             f"{lang_instruction}\n\n"
             f"GUIDELINES:\n"
@@ -738,7 +769,7 @@ async def analyze_document(
 
         analysis_raw = await ask_fast_text(
             f"DOCUMENT FILE: {filename} (Pages: {total_pages_detected})\n\nCONTENT:\n{extracted_text[:95000]}",
-            grok_style_prompt
+            audit_prompt
         )
 
         del file_bytes
