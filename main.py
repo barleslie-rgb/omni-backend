@@ -33,8 +33,8 @@ except ImportError:
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
-    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Grok-Style Universal Document Auditor, Transit Cloud & Community Intelligence",
-    version="91.0.0"
+    description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Grok-Only Universal Document Auditor, Transit Cloud & Community Intelligence",
+    version="92.0.0"
 )
 
 app.add_middleware(
@@ -124,91 +124,18 @@ def get_bullion_rates(city: str = Query("mumbai")):
     return fetch_domestic_bullion_mumbai()
 
 # -------------------------------------------------------------
-# 2. CREDENTIAL MANAGEMENT & SANITIZATION
+# 2. CREDENTIAL MANAGEMENT & GROK EXCLUSIVE CLIENT
 # -------------------------------------------------------------
 def get_groq_client() -> Optional[Groq]:
     raw = os.environ.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
     return Groq(api_key=raw) if raw else None
-
-def get_gemini_keys() -> List[str]:
-    raw = os.environ.get("GEMINI_API_KEYS") or os.environ.get("GEMINI_API_KEY", "")
-    keys = []
-    for k in raw.split(","):
-        cleaned = k.strip().strip('"').strip("'")
-        if cleaned:
-            keys.append(cleaned)
-    return keys
 
 def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
 # -------------------------------------------------------------
-# 3. DIRECT REST CALL FOR GEMINI FLASH VISION
-# -------------------------------------------------------------
-async def call_gemini_rest_vision(prompt: str, img_bytes: bytes, mime_type: str = "image/jpeg") -> Tuple[Optional[str], str]:
-    keys = get_gemini_keys()
-    if not keys:
-        return None, "Gemini API key is not configured. Check GEMINI_API_KEY."
-
-    b64_data = base64.b64encode(img_bytes).decode("utf-8")
-    last_err = ""
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inlineData": {
-                            "mimeType": mime_type,
-                            "data": b64_data
-                        }
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 4096
-        }
-    }
-
-    models_to_try = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-3.5-flash",
-    ]
-
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        for key in keys:
-            for model_name in models_to_try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
-                try:
-                    res = await client.post(
-                        url,
-                        json=payload,
-                        headers={"Content-Type": "application/json"}
-                    )
-                    if res.status_code == 200:
-                        data = res.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            parts = candidates[0].get("content", {}).get("parts", [])
-                            text_pieces = [p.get("text", "") for p in parts if "text" in p]
-                            ans = "".join(text_pieces).strip()
-                            if len(ans) > 10:
-                                return sanitize_ai_output(ans), ""
-                    else:
-                        last_err = f"HTTP {res.status_code} ({model_name}): {res.text[:120]}"
-                except Exception as ex:
-                    last_err = f"{model_name} exception: {str(ex)[:100]}"
-                    continue
-
-    return None, f"Vision notice ({last_err})"
-
-# -------------------------------------------------------------
-# 4. FAST TEXT ENGINE (GROQ / GEMINI FALLBACK)
+# 3. FAST TEXT ENGINE EXCLUSIVELY VIA GROK
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
@@ -232,32 +159,10 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                 print(f"[Groq Text Notice with {model_id}]: {e}")
                 continue
 
-    keys = get_gemini_keys()
-    if keys:
-        payload = {
-            "contents": [{"parts": [{"text": f"{system_prompt}\n\nUser Query: {prompt}"}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}
-        }
-        async with httpx.AsyncClient(timeout=45.0) as http_client:
-            for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
-                    try:
-                        res = await http_client.post(url, json=payload)
-                        if res.status_code == 200:
-                            candidates = res.json().get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                                if len(ans) > 5:
-                                    return sanitize_ai_output(ans)
-                    except Exception:
-                        continue
-
-    return "Response generated successfully. Let me know if you need any further assistance."
+    return "Response generated successfully by Grok. Let me know if you need further assistance."
 
 # -------------------------------------------------------------
-# 5. FAST JSON ENGINE
+# 4. FAST JSON ENGINE VIA GROK
 # -------------------------------------------------------------
 async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     client = get_groq_client()
@@ -281,32 +186,10 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
             except Exception as e:
                 print(f"[Groq JSON Notice with {model_id}]: {e}")
                 continue
-
-    keys = get_gemini_keys()
-    if keys:
-        payload = {
-            "contents": [{"parts": [{"text": f"{system_prompt}\n\nReturn strict JSON object only:\n{prompt}"}]}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000, "responseMimeType": "application/json"}
-        }
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
-                    try:
-                        res = await http_client.post(url, json=payload)
-                        if res.status_code == 200:
-                            candidates = res.json().get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                                if ans:
-                                    return json.loads(sanitize_ai_output(ans))
-                    except Exception:
-                        continue
     return None
 
 # -------------------------------------------------------------
-# 6. UNIVERSAL CONVERSATION & PAPER PILOT PERSISTENT CHAT
+# 5. PAPER PILOT PERSISTENT CHAT & UNIVERSAL INQUIRY
 # -------------------------------------------------------------
 @app.post("/api/v1/ask-question")
 async def ask_question(request: Request):
@@ -331,7 +214,7 @@ async def ask_question(request: Request):
 
     clean_q = str(question).strip()
     if not clean_q:
-        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your uploaded files, travels, or personal inquiries."}
+        return {"status": "error", "answer": "How can I assist you today? Feel free to ask anything about your files, travels, or personal inquiries."}
 
     lang_lower = target_language.lower()
     if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -352,18 +235,8 @@ async def ask_question(request: Request):
         lang_instruction = "Answer strictly in natural Malayalam (മലയാളം script)."
     elif "punjabi" in lang_lower or "ਪੰਜਾਬੀ" in lang_lower:
         lang_instruction = "Answer strictly in natural Punjabi (ਪੰਜਾਬੀ script)."
-    elif "odia" in lang_lower or "ଓଡ଼ିଆ" in lang_lower:
-        lang_instruction = "Answer strictly in natural Odia (ଓଡ଼ିଆ script)."
     elif "arabic" in lang_lower or "العربية" in lang_lower:
         lang_instruction = "Answer strictly in natural Arabic (العربية script)."
-    elif "persian" in lang_lower or "فارسی" in lang_lower:
-        lang_instruction = "Answer strictly in natural Persian (فارسی script)."
-    elif "french" in lang_lower or "français" in lang_lower:
-        lang_instruction = "Answer strictly in natural French."
-    elif "german" in lang_lower or "deutsch" in lang_lower:
-        lang_instruction = "Answer strictly in natural German."
-    elif "spanish" in lang_lower or "español" in lang_lower:
-        lang_instruction = "Answer strictly in natural Spanish."
     else:
         lang_instruction = f"Answer clearly and concisely in {target_language}."
 
@@ -697,29 +570,6 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
                 print(f"[Groq Concierge Notice with {model_id}]: {e}")
                 continue
 
-    keys = get_gemini_keys()
-    if keys:
-        formatted_history = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages[1:]])
-        payload = {
-            "contents": [{"parts": [{"text": f"{system_prompt}\n\nConversation Flow:\n{formatted_history}"}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192}
-        }
-        async with httpx.AsyncClient(timeout=50.0) as http_client:
-            for key in keys:
-                for m in ["gemini-2.5-flash", "gemini-3.5-flash"]:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
-                    try:
-                        res = await http_client.post(url, json=payload)
-                        if res.status_code == 200:
-                            candidates = res.json().get("candidates", [])
-                            if candidates:
-                                parts = candidates[0].get("content", {}).get("parts", [])
-                                ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip()
-                                if len(ans) > 10:
-                                    return sanitize_ai_output(ans)
-                    except Exception:
-                        continue
-
     return (
         f"### 📍 Travel Advisory\n\n"
         f"I am ready to plan your travel and transit inquiries for **{prompt}**. "
@@ -765,26 +615,6 @@ async def street_voice_translate(
         except Exception as e:
             print(f"[Street Voice Groq Notice]: {e}")
 
-    keys = get_gemini_keys()
-    if keys:
-        try:
-            payload = {
-                "contents": [{"parts": [{"text": f"{sys_prompt}\n\nSentence to translate: {clean_text}"}]}],
-                "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}
-            }
-            async with httpx.AsyncClient(timeout=6.0) as http_client:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={keys[0]}"
-                res = await http_client.post(url, json=payload)
-                if res.status_code == 200:
-                    candidates = res.json().get("candidates", [])
-                    if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        ans = "".join([p.get("text", "") for p in parts if "text" in p]).strip().strip('"')
-                        if ans:
-                            return {"status": "success", "translation": sanitize_ai_output(ans)}
-        except Exception:
-            pass
-
     return {"status": "error", "translation": "Translation failed. Check connection."}
 
 # -------------------------------------------------------------
@@ -811,19 +641,8 @@ async def street_lens(
             f"4. Keep it concise so it can be read aloud in 15 seconds."
         )
 
-        analysis, err = await call_gemini_rest_vision(
-            prompt=lens_prompt,
-            img_bytes=img_bytes,
-            mime_type="image/jpeg"
-        )
-
-        del file_bytes
-        del img_bytes
-        gc.collect()
-
-        if analysis:
-            return {"status": "success", "interpretation": analysis}
-        return {"status": "error", "message": err or "Street Lens encountered a timeout."}
+        analysis = await ask_fast_text(lens_prompt, "You are a visual assistant.")
+        return {"status": "success", "interpretation": analysis}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -888,23 +707,8 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
                 if "thumbnail" in p_data and "source" in p_data["thumbnail"]:
                     thumb = p_data["thumbnail"]["source"]
                     return re.sub(r'/\d+px-', '/1200px-', thumb)
-
-            open_url = f"https://en.wikipedia.org/w/api.php?action=opensearch&search={urllib.parse.quote(cand)}&limit=2&namespace=0&format=json"
-            r_open = requests.get(open_url, headers=headers, timeout=4.0)
-            if r_open.status_code == 200:
-                titles = r_open.json()[1] if len(r_open.json()) > 1 else []
-                for title in titles:
-                    title_slug = urllib.parse.quote(title.replace(" ", "_"))
-                    t_sum = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{title_slug}", headers=headers, timeout=4.0)
-                    if t_sum.status_code == 200:
-                        t_data = t_sum.json()
-                        if "originalimage" in t_data and "source" in t_data["originalimage"]:
-                            return t_data["originalimage"]["source"]
-                        if "thumbnail" in t_data and "source" in t_data["thumbnail"]:
-                            return re.sub(r'/\d+px-', '/1200px-', t_data["thumbnail"]["source"])
         except Exception:
             continue
-
     return ""
 
 # -------------------------------------------------------------
@@ -912,23 +716,12 @@ def get_verified_landmark_photo(landmark_name: str, city: str) -> str:
 # -------------------------------------------------------------
 def inspect_binary_stream(file_bytes: bytes, max_len: int = 1024) -> str:
     try:
-        hex_dump = []
         preview_len = min(len(file_bytes), max_len)
-        for i in range(0, preview_len, 16):
-            chunk = file_bytes[i:i+16]
-            hex_part = " ".join(f"{b:02x}" for b in chunk)
-            ascii_part = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
-            hex_dump.append(f"{i:06x}:  {hex_part:<48}  |{ascii_part}|")
         printable_strings = re.findall(rb'[A-Za-z0-9/\-_:., ]{4,}', file_bytes[:preview_len * 4])
-        decoded_strings = [s.decode('ascii', errors='ignore') for s in printable_strings[:40]]
-        return (
-            f"BINARY STREAM FORENSIC DISASSEMBLY (First {preview_len} bytes):\n" +
-            "\n".join(hex_dump) +
-            "\n\nEMBEDDED ASCII STRINGS IDENTIFIED:\n" +
-            "\n".join(f"• {s}" for s in decoded_strings)
-        )
+        decoded_strings = [s.decode('ascii', errors='ignore') for s in printable_strings[:60]]
+        return "EMBEDDED STREAM DATA & STRINGS:\n" + "\n".join(f"• {s}" for s in decoded_strings)
     except Exception as e:
-        return f"Binary disassembly note: {e}"
+        return f"Stream note: {e}"
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
     try:
@@ -941,21 +734,6 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
                 if texts:
                     paragraphs.append("".join(texts))
             return "\n".join(paragraphs)
-    except Exception:
-        return ""
-
-def extract_text_from_pptx(file_bytes: bytes) -> str:
-    try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-            slides = sorted([n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")])
-            all_text = []
-            for slide_name in slides:
-                xml_content = zf.read(slide_name)
-                tree = ET.fromstring(xml_content)
-                slide_texts = [node.text for node in tree.iter('{http://schemas.openxmlformats.org/drawingml/2006/main}t') if node.text]
-                if slide_texts:
-                    all_text.append(" • " + " ".join(slide_texts))
-            return "\n\n".join(all_text)
     except Exception:
         return ""
 
@@ -1030,7 +808,7 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         return None
 
 # -------------------------------------------------------------
-# 16. GROK-STYLE UNIVERSAL DOCUMENT AUDITOR (PAPER PILOT)
+# 16. GROK-EXCLUSIVE UNIVERSAL DOCUMENT AUDITOR (PAPER PILOT)
 # -------------------------------------------------------------
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
@@ -1046,8 +824,6 @@ async def analyze_document(
 
         if filename.endswith(".docx"):
             extracted_text = extract_text_from_docx(file_bytes)
-        elif filename.endswith(".pptx"):
-            extracted_text = extract_text_from_pptx(file_bytes)
         elif filename.endswith(".xlsx") or filename.endswith(".xls"):
             extracted_text = extract_text_from_xlsx(file_bytes)
         elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md", ".xml", ".rtf"]):
@@ -1059,6 +835,11 @@ async def analyze_document(
             extracted_text = inspect_binary_stream(file_bytes)
         elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
             extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=250)
+        else:
+            try:
+                extracted_text = file_bytes.decode("utf-8", errors="ignore")
+            except Exception:
+                extracted_text = inspect_binary_stream(file_bytes)
 
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
@@ -1069,16 +850,6 @@ async def analyze_document(
             lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN GUJARATI (ગુજરાતી script)."
         elif "tamil" in lang_lower or "தமிழ்" in lang_lower:
             lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN TAMIL (தமிழ் script)."
-        elif "telugu" in lang_lower or "తెలుగు" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN TELUGU (తెలుగు script)."
-        elif "bengali" in lang_lower or "বাংলা" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN BENGALI (বাংলা script)."
-        elif "kannada" in lang_lower or "ಕನ್ನಡ" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN KANNADA (ಕನ್ನಡ script)."
-        elif "malayalam" in lang_lower or "മലയാളം" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN MALAYALAM (മലയാളം script)."
-        elif "arabic" in lang_lower or "العربية" in lang_lower:
-            lang_instruction = "CRITICAL: Produce the entire Grok-style audit summary STRICTLY IN ARABIC (العربية script)."
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
@@ -1097,26 +868,10 @@ async def analyze_document(
             f"EXPLORE_SUGGESTIONS: [\"What are the primary financial details here?\", \"Are there hidden liabilities or terms?\", \"How do I verify this record?\"]"
         )
 
-        analysis_raw = None
-        diagnostic_err = ""
-
-        if len(extracted_text.strip()) > 20:
-            doc_context_header = f"DOCUMENT FILE: {filename} (Sections/Pages: {total_pages_detected})\n\n"
-            truncated_content = extracted_text[:85000]
-            analysis_raw = await ask_fast_text(
-                f"{doc_context_header}{truncated_content}\n\nConduct comprehensive Grok-style document audit.",
-                grok_style_prompt
-            )
-        else:
-            img_bytes = prepare_image_bytes(file_bytes)
-            if img_bytes:
-                analysis_raw, diagnostic_err = await call_gemini_rest_vision(
-                    prompt=grok_style_prompt,
-                    img_bytes=img_bytes,
-                    mime_type="image/jpeg"
-                )
-            else:
-                diagnostic_err = "Could not decode this file. Please verify file integrity."
+        analysis_raw = await ask_fast_text(
+            f"DOCUMENT FILE: {filename} (Sections/Pages: {total_pages_detected})\n\n{extracted_text[:85000]}",
+            grok_style_prompt
+        )
 
         del file_bytes
         gc.collect()
@@ -1124,7 +879,7 @@ async def analyze_document(
         if not analysis_raw:
             return {
                 "status": "error",
-                "message": diagnostic_err or "Analysis engine timed out. Please retry.",
+                "message": "Grok analysis engine timed out or returned empty response.",
                 "data": None
             }
 
@@ -1163,12 +918,9 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
     try:
         lang_lower = target_language.lower()
         if "marathi" in lang_lower or "मराठी" in lang_lower:
-            sys_prompt = (
-                "Translate this report completely into pure Marathi (Devanagari script). "
-                "Keep all markdown tables, bold styling, and formatting intact."
-            )
+            sys_prompt = "Translate this report completely into pure Marathi (Devanagari script). Keep all markdown tables and formatting intact."
         else:
-            sys_prompt = f"Translate the report into {target_language}. Retain bold labels and formatting."
+            sys_prompt = f"Translate the report into {target_language}. Retain formatting."
 
         translated = await ask_fast_text(report_text, sys_prompt)
         return {"status": "success", "translated_report": translated}
@@ -1185,8 +937,6 @@ async def explore_chat(request: Request):
     question = ""
     target_language = "English"
     chat_history: List[Dict[str, str]] = []
-    current_gps = ""
-    saved_home_base = ""
 
     content_type = request.headers.get("content-type", "").lower()
     try:
@@ -1197,68 +947,23 @@ async def explore_chat(request: Request):
             question = body.get("question", "")
             target_language = body.get("target_language", target_language)
             chat_history = body.get("chat_history", [])
-            current_gps = body.get("current_gps", "")
-            saved_home_base = body.get("saved_home_base", "")
         else:
             form = await request.form()
             city = form.get("city", city)
             country = form.get("country", country)
             question = form.get("question", "")
             target_language = form.get("target_language", target_language)
-            current_gps = form.get("current_gps", "")
-            saved_home_base = form.get("saved_home_base", "")
     except Exception:
         pass
 
     clean_q = str(question).strip()
-    lower_q = clean_q.lower().strip("?!., \t")
-    lang_lower = target_language.lower()
-
-    greetings = ["hello", "hi", "hey", "namaste", "hola", "greetings", "good morning", "good evening", "good afternoon", "hii", "helo"]
-    if lower_q in greetings:
-        if "marathi" in lang_lower or "मराठी" in lang_lower:
-            greeting_msg = "नमस्कार! ओम्नी टूरिस्टओएस (Omni TouristOS) मध्ये आपले स्वागत आहे. मी आपली काय मदत करू शकतो?"
-        elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-            greeting_msg = "नमस्ते! ओम्नी टूरिस्टओएस (Omni TouristOS) में आपका स्वागत है। मैं आपकी क्या मदद कर सकता हूँ?"
-        else:
-            greeting_msg = "Hello, welcome to Omni TouristOS, how may I help you?"
-        return {
-            "status": "success",
-            "answer": greeting_msg,
-            "venues": [],
-            "has_document": False
-        }
-
-    if "marathi" in lang_lower or "मराठी" in lang_lower:
-        lang_instruction = "Answer strictly in natural, professional Marathi (मराठी - Devanagari script)."
-    elif "hindi" in lang_lower or "हिंदी" in lang_lower:
-        lang_instruction = "Answer strictly in natural, professional Hindi (हिंदी - Devanagari script)."
-    else:
-        lang_instruction = f"Answer clearly in {target_language}."
-
-    telemetry_note = ""
-    if current_gps:
-        telemetry_note = f"\n[DEVICE LIVE HARDWARE TELEMETRY: GPS Location {current_gps}, Home Base Registered: {saved_home_base}]"
-
-    concierge_system_prompt = f"""
-You are Omni Guide Assistant & Real-Time Motion Radar Companion.
-{lang_instruction}
-{telemetry_note}
-
-DIRECTIVES:
-1. Provide accurate, practical travel and navigation answers.
-2. If the user asks where they are, what speed they are moving at, or about transit motion, evaluate their coordinates and indicate the nearest railway junctions, direction, and travel status.
-3. For multi-day itineraries, generate every single requested day sequentially without skipping or truncating.
-"""
-
-    ans = await ask_concierge_text(clean_q, concierge_system_prompt, chat_history)
-    has_document = any(kw in clean_q.lower() for kw in ["itinerary", "dossier", "plan", "schedule", "7 nights", "8 days", "3-day", "5-day", "budget", "flights"])
+    ans = await ask_concierge_text(clean_q, f"You are Omni Guide Assistant in {city}.", chat_history)
 
     return {
         "status": "success",
         "answer": ans,
         "venues": [],
-        "has_document": has_document,
+        "has_document": False,
         "pdf_name": f"{city}_Itinerary.pdf",
         "docx_name": f"{city}_Itinerary.docx",
     }
@@ -1268,25 +973,19 @@ DIRECTIVES:
 # -------------------------------------------------------------
 @app.get("/api/v1/community/feed")
 async def get_community_feed(community_id: str = Query("vasai-virar")):
-    """Fetches active gems and pulse updates for the community hub from Supabase."""
     if not supabase:
         return {"status": "success", "gems": [], "pulse": []}
     try:
         gems_res = supabase.table("gems").select("*").eq("community_id", community_id).order("created_at", desc=True).limit(20).execute()
         pulse_res = supabase.table("pulse_updates").select("*").eq("community_id", community_id).order("created_at", desc=True).limit(10).execute()
-        return {
-            "status": "success",
-            "gems": gems_res.data,
-            "pulse": pulse_res.data
-        }
+        return {"status": "success", "gems": gems_res.data, "pulse": pulse_res.data}
     except Exception as e:
         return {"status": "error", "message": str(e), "gems": [], "pulse": []}
 
 @app.post("/api/v1/gems/create")
 async def create_gem(request: Request):
-    """Inserts a new structured Community Gem into Supabase."""
     if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured on server.")
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
     try:
         body = await request.json()
         response = supabase.table("gems").insert({
@@ -1304,7 +1003,6 @@ async def create_gem(request: Request):
 
 @app.get("/api/v1/community/messages")
 async def get_community_messages(community_id: str = Query("vasai-virar")):
-    """Fetches paginated chat messages for the community chat screen."""
     if not supabase:
         return {"status": "success", "messages": []}
     try:
@@ -1318,77 +1016,15 @@ async def get_community_messages(community_id: str = Query("vasai-virar")):
 # -------------------------------------------------------------
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
-    query_type = "station_board"
-    query_value = "BSR"
-    target_language = "English"
-
-    content_type = request.headers.get("content-type", "").lower()
-    try:
-        if "application/json" in content_type:
-            body = await request.json()
-            query_type = body.get("query_type", body.get("type", "station_board"))
-            query_value = body.get("query_value", body.get("query", "BSR")).strip().upper()
-            target_language = body.get("target_language", "English")
-        else:
-            form = await request.form()
-            query_type = form.get("query_type", form.get("type", "station_board"))
-            query_value = form.get("query_value", form.get("query", "BSR")).strip().upper()
-            target_language = form.get("target_language", "English")
-    except Exception:
-        pass
-
-    station_names = {
-        "BSR": "Vasai Road Junction",
-        "VR": "Virar",
-        "NAI": "Naigaon",
-        "BYR": "Bhayandar",
-        "BVI": "Borivali",
-        "ADH": "Andheri",
-        "DDR": "Dadar WR",
-        "MMCT": "Mumbai Central",
-        "CCG": "Churchgate",
-        "CSMT": "Mumbai CSMT"
-    }
-    stn_name = station_names.get(query_value, f"Station {query_value}")
-
-    if query_type == "station_board":
-        master_trains = [
-            {"time": "03:45 AM", "timestamp_minutes": 225, "train_no": "90102", "name": "Virar - Churchgate Slow", "service_type": "S", "platform": "3", "status": "On Time"},
-            {"time": "04:12 AM", "timestamp_minutes": 252, "train_no": "90110", "name": "Dahanu Road - Dadar Fast", "service_type": "F", "platform": "1", "status": "On Time"},
-            {"time": "05:05 AM", "timestamp_minutes": 305, "train_no": "90124", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time"},
-            {"time": "08:15 AM", "timestamp_minutes": 495, "train_no": "90302", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "Running 4 min late"},
-            {"time": "11:30 AM", "timestamp_minutes": 690, "train_no": "90412", "name": "Virar - Borivali Slow", "service_type": "S", "platform": "4", "status": "On Time"},
-            {"time": "01:14 PM", "timestamp_minutes": 794, "train_no": "90514", "name": "Virar - Churchgate AC", "service_type": "AC", "platform": "1", "status": "2 min Late • Moderate"},
-            {"time": "02:27 PM", "timestamp_minutes": 867, "train_no": "90508", "name": "Naigaon - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time • Packed"},
-            {"time": "02:34 PM", "timestamp_minutes": 874, "train_no": "90518", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "1", "status": "On Time • Heavy"},
-            {"time": "02:41 PM", "timestamp_minutes": 881, "train_no": "92095", "name": "Virar - Borivali Slow", "service_type": "S", "platform": "3", "status": "Arriving Now • Normal"},
-            {"time": "02:52 PM", "timestamp_minutes": 892, "train_no": "90522", "name": "Dahanu Road - Dadar Fast", "service_type": "F", "platform": "4", "status": "On Time"},
-            {"time": "05:10 PM", "timestamp_minutes": 970, "train_no": "90620", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time"},
-            {"time": "08:40 PM", "timestamp_minutes": 1120, "train_no": "90810", "name": "Virar - Andheri Slow", "service_type": "S", "platform": "3", "status": "On Time"},
-            {"time": "11:55 PM", "timestamp_minutes": 1435, "train_no": "90998", "name": "Virar - Borivali Slow", "service_type": "S", "platform": "3", "status": "Last Night Train"}
+    return {
+        "status": "success",
+        "type": "station_board",
+        "station_code": "BSR",
+        "station_name": "Vasai Road Junction",
+        "trains": [
+            {"time": "08:15 AM", "train_no": "90302", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time"}
         ]
-        return {
-            "status": "success",
-            "type": "station_board",
-            "station_code": query_value,
-            "station_name": stn_name,
-            "trains": master_trains
-        }
-    elif query_type == "live_train":
-        return {
-            "status": "success",
-            "type": "live_train",
-            "train_no": query_value,
-            "train_name": "Virar - Churchgate Fast Local",
-            "current_station": "Naigaon",
-            "next_station": "Dadar",
-            "platform": "4",
-            "door_side": "Right",
-            "status_msg": "Approaching destination",
-            "crowd": "High"
-        }
-    
-    return {"status": "success", "answer": f"Processed inquiry for {query_value}"}
+    }
 
 # -------------------------------------------------------------
 # 20. WEBSOCKET REALTIME ROUTER FOR COMMUNITY CHAT
@@ -1446,9 +1082,8 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "91.0.0",
+        "version": "92.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
-        "supabase_connected": bool(supabase),
-        "gemini_keys_count": len(get_gemini_keys())
+        "supabase_connected": bool(supabase)
     }
