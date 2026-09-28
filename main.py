@@ -134,43 +134,21 @@ def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
-# Dynamic Model Resolution to eliminate decommissioned model errors
-_active_groq_models: List[str] = []
-_models_last_fetched: float = 0.0
-
-def get_live_groq_models(client: Groq) -> List[str]:
-    global _active_groq_models, _models_last_fetched
-    now = time.time()
-    if _active_groq_models and (now - _models_last_fetched < 1800):
-        return _active_groq_models
-
-    try:
-        model_list = client.models.list()
-        all_ids = [m.id for m in model_list.data if m.active]
-        print(f"[Groq Live Available Models]: {all_ids}")
-        
-        # Sort so primary chat models come first, avoiding whisper audio models
-        chat_models = [m for m in all_ids if not any(x in m.lower() for x in ["whisper", "tts", "embedding"])]
-        if chat_models:
-            _active_groq_models = chat_models
-            _models_last_fetched = now
-            return _active_groq_models
-    except Exception as e:
-        print(f"[Groq Model Registry Notice]: {e}")
-
-    # Fallback to standard Groq model IDs
-    return ["llama-3.3-70b-specdec", "llama-3.2-11b-vision-preview", "llama-3.2-3b-preview", "llama-3.2-1b-preview", "qwen-2.5-32b"]
+# Target your organization's active production models identified from logs
+ACTIVE_TEXT_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b"
+]
 
 # -------------------------------------------------------------
-# 3. FAST TEXT ENGINE VIA DYNAMIC ACTIVE GROQ MODELS
+# 3. FAST TEXT ENGINE VIA ACTIVE GROQ MODELS
 # -------------------------------------------------------------
 async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     client = get_groq_client()
     if not client:
         raise HTTPException(status_code=500, detail="Groq API key not configured on backend.")
     
-    candidate_models = get_live_groq_models(client)
-    for model_id in candidate_models:
+    for model_id in ACTIVE_TEXT_MODELS:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -179,8 +157,8 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=8000,
-                timeout=90
+                max_tokens=2048,
+                timeout=60
             )
             raw = completion.choices[0].message.content
             if raw and len(raw.strip()) > 0:
@@ -199,8 +177,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
     if not client:
         return None
     
-    candidate_models = get_live_groq_models(client)
-    for model_id in candidate_models:
+    for model_id in ACTIVE_TEXT_MODELS:
         try:
             completion = client.chat.completions.create(
                 model=model_id,
@@ -209,7 +186,7 @@ async def ask_fast_json(prompt: str, system_prompt: str) -> Optional[dict]:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=4000,
+                max_tokens=2048,
                 response_format={"type": "json_object"},
                 timeout=45
             )
@@ -518,15 +495,14 @@ async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[
 
     client = get_groq_client()
     if client:
-        candidate_models = get_live_groq_models(client)
-        for model_id in candidate_models:
+        for model_id in ACTIVE_TEXT_MODELS:
             try:
                 completion = client.chat.completions.create(
                     model=model_id,
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=8000,
-                    timeout=90
+                    max_tokens=2048,
+                    timeout=60
                 )
                 raw = completion.choices[0].message.content
                 if raw and len(raw.strip()) > 0:
@@ -558,8 +534,7 @@ async def street_voice_translate(
 
     client = get_groq_client()
     if client:
-        candidate_models = get_live_groq_models(client)
-        for model_id in candidate_models:
+        for model_id in ACTIVE_TEXT_MODELS:
             try:
                 comp = client.chat.completions.create(
                     model=model_id,
@@ -568,7 +543,7 @@ async def street_voice_translate(
                         {"role": "user", "content": clean_text}
                     ],
                     temperature=0.1,
-                    max_tokens=500,
+                    max_tokens=256,
                     timeout=15
                 )
                 raw_ans = comp.choices[0].message.content.strip().strip('"')
