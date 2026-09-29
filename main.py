@@ -8,7 +8,7 @@ import uuid
 import base64
 import zipfile
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
 
@@ -34,7 +34,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Universal Document Auditor, Transit Cloud & Community Intelligence",
-    version="92.0.0"
+    version="92.1.0"
 )
 
 app.add_middleware(
@@ -134,7 +134,6 @@ def sanitize_ai_output(text: str) -> str:
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
 
-# Target your organization's active production models identified from logs
 ACTIVE_TEXT_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b"
@@ -838,8 +837,29 @@ async def explore_chat(request: Request):
     }
 
 # -------------------------------------------------------------
-# 18. COMMUNITY GEM & CHAT ENDPOINTS (SUPABASE INTEGRATION)
+# 18. COMMUNITY INTELLIGENCE, MODERATION & 1-ON-1 SUITE
 # -------------------------------------------------------------
+def verify_admin_privileges(user_id: str):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not connected.")
+    try:
+        res = supabase.table("users").select("role, is_banned").eq("id", user_id).single().execute()
+        if not res.data or res.data.get("role") not in ["admin", "supervisor"] or res.data.get("is_banned"):
+            raise HTTPException(status_code=403, detail="Unauthorized: Administrator or Supervisor role required.")
+    except Exception:
+        raise HTTPException(status_code=403, detail="Unauthorized: Verification failed.")
+
+def evaluate_supervisor_bot_flag(text: str) -> Optional[str]:
+    lower_t = text.lower()
+    # Spam/Scam/Illegal heuristics
+    if re.search(r"(http[s]?://|t\.me/|wa\.me/|bit\.ly)", lower_t):
+        return "Unauthorized external link / solicitation"
+    if any(k in lower_t for k in ["cheap rate gold", "crypto", "unregulated deal", "wire cash", "paytm scam", "telegram me"]):
+        return "High-risk financial solicitation or manipulation"
+    if any(k in lower_t for k in ["abuse", "scammer", "fraud", "kill", "threat"]):
+        return "Hostile conduct or prohibited language"
+    return None
+
 @app.get("/api/v1/community/feed")
 async def get_community_feed(community_id: str = Query("vasai-virar")):
     if not supabase:
@@ -857,9 +877,17 @@ async def create_gem(request: Request):
         raise HTTPException(status_code=500, detail="Supabase not configured.")
     try:
         body = await request.json()
+        creator_id = body.get("creator_id")
+        
+        # Check if creator is banned
+        if creator_id:
+            chk = supabase.table("users").select("is_banned").eq("id", creator_id).single().execute()
+            if chk.data and chk.data.get("is_banned"):
+                raise HTTPException(status_code=403, detail="Banned accounts cannot add gems.")
+
         response = supabase.table("gems").insert({
             "community_id": body.get("community_id", "vasai-virar"),
-            "creator_id": body.get("creator_id"),
+            "creator_id": creator_id,
             "title": body.get("title"),
             "category": body.get("category", "Markets"),
             "description": body.get("description"),
@@ -875,10 +903,185 @@ async def get_community_messages(community_id: str = Query("vasai-virar")):
     if not supabase:
         return {"status": "success", "messages": []}
     try:
-        res = supabase.table("messages").select("*, users(display_name, avatar_url, role)").eq("community_id", community_id).order("created_at", desc=False).limit(50).execute()
+        # Exclude soft-deleted messages
+        res = supabase.table("messages") \
+            .select("*, users(display_name, avatar_url, role)") \
+            .eq("community_id", community_id) \
+            .neq("is_deleted", True) \
+            .order("created_at", desc=False) \
+            .limit(50) \
+            .execute()
         return {"status": "success", "messages": res.data}
     except Exception as e:
         return {"status": "error", "message": str(e), "messages": []}
+
+@app.post("/api/v1/community/report")
+async def report_community_item(request: Request):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
+    try:
+        body = await request.json()
+        reporter_id = body.get("reporter_id")
+        offender_id = body.get("offender_id")
+        message_id = body.get("message_id")
+        community_id = body.get("community_id", "vasai-virar")
+        reason = body.get("reason", "Spam or Scam")
+        details = body.get("details", "")
+
+        report_res = supabase.table("community_reports").insert({
+            "reporter_id": reporter_id,
+            "offender_id": offender_id,
+            "message_id": message_id,
+            "community_id": community_id,
+            "reason": reason,
+            "details": details,
+            "status": "pending"
+        }).execute()
+
+        # Update flag count on message
+        if message_id:
+            try:
+                m = supabase.table("messages").select("flag_count").eq("id", message_id).single().execute()
+                curr_count = (m.data.get("flag_count") or 0) + 1 if m.data else 1
+                supabase.table("messages").update({"flag_count": curr_count}).eq("id", message_id).execute()
+            except Exception:
+                pass
+
+        return {"status": "success", "message": "Report logged for admin review."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/admin/reports")
+async def get_admin_reports(admin_id: str = Query(...)):
+    verify_admin_privileges(admin_id)
+    try:
+        reports = supabase.table("community_reports") \
+            .select("*, reporter:reporter_id(display_name), offender:offender_id(display_name, role, is_banned), message:message_id(text, created_at)") \
+            .eq("status", "pending") \
+            .order("created_at", desc=True) \
+            .execute()
+        return {"status": "success", "reports": reports.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/admin/moderate")
+async def moderate_community_incident(request: Request):
+    try:
+        body = await request.json()
+        admin_id = body.get("admin_id")
+        report_id = body.get("report_id")
+        action = body.get("action")  # 'ban', 'mute_24h', 'purge_message', 'dismiss'
+        offender_id = body.get("offender_id")
+        message_id = body.get("message_id")
+        community_id = body.get("community_id", "vasai-virar")
+
+        verify_admin_privileges(admin_id)
+
+        # 1. Action: Ban User
+        if action == "ban" and offender_id:
+            supabase.table("users").update({"is_banned": True}).eq("id", offender_id).execute()
+            await manager.broadcast(community_id, {
+                "type": "admin_disconnect_user",
+                "user_id": offender_id,
+                "reason": "Account banned for community violation."
+            })
+
+        # 2. Action: Mute 24h
+        elif action == "mute_24h" and offender_id:
+            mute_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+            supabase.table("users").update({"muted_until": mute_until}).eq("id", offender_id).execute()
+
+        # 3. Action: Purge Message
+        if (action in ["purge_message", "ban"]) and message_id:
+            supabase.table("messages").update({"is_deleted": True}).eq("id", message_id).execute()
+            await manager.broadcast(community_id, {
+                "type": "delete_message",
+                "message_id": message_id
+            })
+
+        # Update report status
+        if report_id:
+            supabase.table("community_reports").update({
+                "status": "resolved" if action != "dismiss" else "dismissed",
+                "action_taken": action,
+                "reviewed_by": admin_id,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", report_id).execute()
+
+        # Log to audit ledger
+        supabase.table("admin_audit_logs").insert({
+            "admin_id": admin_id,
+            "target_user_id": offender_id,
+            "action": action,
+            "reason": body.get("notes", "Administrator enforcement action")
+        }).execute()
+
+        return {"status": "success", "action_applied": action}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 1-on-1 Direct Chat & Consent Endpoints
+@app.post("/api/v1/direct/invite")
+async def invite_direct_chat(request: Request):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
+    try:
+        body = await request.json()
+        requester_id = body.get("requester_id")
+        recipient_id = body.get("recipient_id")
+        initial_note = body.get("initial_note", "Hi, I would like to connect about local recommendations.")
+
+        # Check existing conversation or invite
+        existing = supabase.table("direct_conversations") \
+            .select("*") \
+            .or_(f"and(user_a.eq.{requester_id},user_b.eq.{recipient_id}),and(user_a.eq.{recipient_id},user_b.eq.{requester_id})") \
+            .execute()
+
+        if existing.data and len(existing.data) > 0:
+            return {"status": "success", "conversation": existing.data[0]}
+
+        new_conv = supabase.table("direct_conversations").insert({
+            "user_a": requester_id,
+            "user_b": recipient_id,
+            "status": "pending",  # 'pending', 'accepted', 'rejected'
+            "initial_note": initial_note
+        }).execute()
+
+        return {"status": "success", "conversation": new_conv.data[0]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/direct/respond")
+async def respond_direct_chat(request: Request):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
+    try:
+        body = await request.json()
+        conversation_id = body.get("conversation_id")
+        action = body.get("action")  # 'accept' or 'reject'
+        status_val = "accepted" if action == "accept" else "rejected"
+
+        upd = supabase.table("direct_conversations").update({
+            "status": status_val,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", conversation_id).execute()
+
+        return {"status": "success", "status_val": status_val}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/direct/delete")
+async def delete_direct_conversation(request: Request):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured.")
+    try:
+        body = await request.json()
+        conversation_id = body.get("conversation_id")
+        # Soft delete or archive conversation
+        supabase.table("direct_conversations").update({"status": "archived"}).eq("id", conversation_id).execute()
+        return {"status": "success", "message": "Conversation purged successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------------------------------------------
 # 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
@@ -932,28 +1135,31 @@ JSON FORMAT:
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 21. WEBSOCKET REALTIME ROUTER & SERVER HEALTH
+# 21. WEBSOCKET REALTIME ROUTER, BOT SUPERVISOR & SERVER HEALTH
 # -------------------------------------------------------------
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, List[WebSocket]] = {}
 
-    async def connect(self, community_id: str, websocket: WebSocket):
+    async def connect(self, room_id: str, websocket: WebSocket):
         await websocket.accept()
-        if community_id not in self.active_connections:
-            self.active_connections[community_id] = []
-        self.active_connections[community_id].append(websocket)
+        if room_id not in self.active_connections:
+            self.active_connections[room_id] = []
+        self.active_connections[room_id].append(websocket)
 
-    def disconnect(self, community_id: str, websocket: WebSocket):
-        if community_id in self.active_connections:
-            self.active_connections[community_id].remove(websocket)
-            if not self.active_connections[community_id]:
-                del self.active_connections[community_id]
+    def disconnect(self, room_id: str, websocket: WebSocket):
+        if room_id in self.active_connections:
+            self.active_connections[room_id].remove(websocket)
+            if not self.active_connections[room_id]:
+                del self.active_connections[room_id]
 
-    async def broadcast(self, community_id: str, message: dict):
-        if community_id in self.active_connections:
-            for connection in self.active_connections[community_id]:
-                await connection.send_json(message)
+    async def broadcast(self, room_id: str, message: dict):
+        if room_id in self.active_connections:
+            for connection in self.active_connections[room_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception:
+                    pass
 
 manager = ConnectionManager()
 
@@ -963,20 +1169,80 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
     try:
         while True:
             data = await websocket.receive_json()
-            if supabase and "text" in data:
+            sender_id = data.get("sender_id")
+            raw_text = (data.get("text") or "").strip()
+
+            # 1. Enforcement Check: Banned or Muted
+            if supabase and sender_id:
                 try:
-                    supabase.table("messages").insert({
-                        "community_id": community_id,
-                        "sender_id": data.get("sender_id"),
-                        "text": data.get("text"),
-                        "type": data.get("type", "text")
-                    }).execute()
+                    user_row = supabase.table("users").select("is_banned, muted_until").eq("id", sender_id).single().execute()
+                    if user_row.data:
+                        if user_row.data.get("is_banned"):
+                            await websocket.send_json({"type": "error", "message": "Account banned for community violations."})
+                            continue
+                        muted_until = user_row.data.get("muted_until")
+                        if muted_until and datetime.fromisoformat(muted_until.replace("Z", "+00:00")) > datetime.utcnow().replace(tzinfo=datetime.utcnow().astimezone().tzinfo):
+                            await websocket.send_json({"type": "error", "message": "Account temporarily muted."})
+                            continue
                 except Exception:
                     pass
+
+            # 2. Automated Supervisor Bot Inspection
+            bot_violation = evaluate_supervisor_bot_flag(raw_text) if raw_text else None
+            if bot_violation:
+                await websocket.send_json({
+                    "type": "bot_warning",
+                    "text": f"Message blocked by Supervisor Bot: {bot_violation}."
+                })
+                # Log incident automatically
+                if supabase and sender_id:
+                    try:
+                        supabase.table("community_reports").insert({
+                            "reporter_id": None,
+                            "offender_id": sender_id,
+                            "community_id": community_id,
+                            "reason": "Supervisor Bot Auto-Flag",
+                            "details": f"Flagged Content: '{raw_text}' | Issue: {bot_violation}",
+                            "status": "pending"
+                        }).execute()
+                    except Exception:
+                        pass
+                continue
+
+            # 3. Handle Message Deletion
+            if data.get("type") == "delete_message":
+                msg_id = data.get("message_id")
+                if supabase and msg_id:
+                    try:
+                        supabase.table("messages").update({"is_deleted": True}).eq("id", msg_id).execute()
+                    except Exception:
+                        pass
+                await manager.broadcast(community_id, {
+                    "type": "delete_message",
+                    "message_id": msg_id
+                })
+                continue
+
+            # 4. Standard Message Insertion & Broadcast
+            if supabase and raw_text:
+                try:
+                    ins_res = supabase.table("messages").insert({
+                        "community_id": community_id,
+                        "sender_id": sender_id,
+                        "text": raw_text,
+                        "type": data.get("type", "text"),
+                        "gem_id": data.get("gem_id")
+                    }).execute()
+                    if ins_res.data and len(ins_res.data) > 0:
+                        data["id"] = ins_res.data[0].get("id")
+                        data["created_at"] = ins_res.data[0].get("created_at")
+                except Exception as e:
+                    print(f"[Supabase WS Insert Notice]: {e}")
+
             await manager.broadcast(community_id, data)
     except WebSocketDisconnect:
         manager.disconnect(community_id, websocket)
-        await manager.broadcast(community_id, {"type": "system", "text": "A user disconnected."})
+        await manager.broadcast(community_id, {"type": "system", "text": "A scout disconnected."})
 
 @app.get("/api/v1/wake")
 @app.get("/")
@@ -984,7 +1250,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "92.0.0",
+        "version": "92.1.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "supabase_connected": bool(supabase)
