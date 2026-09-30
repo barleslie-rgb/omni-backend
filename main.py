@@ -34,7 +34,7 @@ except ImportError:
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Universal Document Auditor, Transit Cloud & Community Intelligence",
-    version="92.1.0"
+    version="93.0.0"
 )
 
 app.add_middleware(
@@ -851,7 +851,6 @@ def verify_admin_privileges(user_id: str):
 
 def evaluate_supervisor_bot_flag(text: str) -> Optional[str]:
     lower_t = text.lower()
-    # Spam/Scam/Illegal heuristics
     if re.search(r"(http[s]?://|t\.me/|wa\.me/|bit\.ly)", lower_t):
         return "Unauthorized external link / solicitation"
     if any(k in lower_t for k in ["cheap rate gold", "crypto", "unregulated deal", "wire cash", "paytm scam", "telegram me"]):
@@ -879,7 +878,6 @@ async def create_gem(request: Request):
         body = await request.json()
         creator_id = body.get("creator_id")
         
-        # Check if creator is banned
         if creator_id:
             chk = supabase.table("users").select("is_banned").eq("id", creator_id).single().execute()
             if chk.data and chk.data.get("is_banned"):
@@ -903,7 +901,6 @@ async def get_community_messages(community_id: str = Query("vasai-virar")):
     if not supabase:
         return {"status": "success", "messages": []}
     try:
-        # Exclude soft-deleted messages
         res = supabase.table("messages") \
             .select("*, users(display_name, avatar_url, role)") \
             .eq("community_id", community_id) \
@@ -938,7 +935,6 @@ async def report_community_item(request: Request):
             "status": "pending"
         }).execute()
 
-        # Update flag count on message
         if message_id:
             try:
                 m = supabase.table("messages").select("flag_count").eq("id", message_id).single().execute()
@@ -970,14 +966,13 @@ async def moderate_community_incident(request: Request):
         body = await request.json()
         admin_id = body.get("admin_id")
         report_id = body.get("report_id")
-        action = body.get("action")  # 'ban', 'mute_24h', 'purge_message', 'dismiss'
+        action = body.get("action")
         offender_id = body.get("offender_id")
         message_id = body.get("message_id")
         community_id = body.get("community_id", "vasai-virar")
 
         verify_admin_privileges(admin_id)
 
-        # 1. Action: Ban User
         if action == "ban" and offender_id:
             supabase.table("users").update({"is_banned": True}).eq("id", offender_id).execute()
             await manager.broadcast(community_id, {
@@ -986,12 +981,10 @@ async def moderate_community_incident(request: Request):
                 "reason": "Account banned for community violation."
             })
 
-        # 2. Action: Mute 24h
         elif action == "mute_24h" and offender_id:
             mute_until = (datetime.utcnow() + timedelta(hours=24)).isoformat()
             supabase.table("users").update({"muted_until": mute_until}).eq("id", offender_id).execute()
 
-        # 3. Action: Purge Message
         if (action in ["purge_message", "ban"]) and message_id:
             supabase.table("messages").update({"is_deleted": True}).eq("id", message_id).execute()
             await manager.broadcast(community_id, {
@@ -999,7 +992,6 @@ async def moderate_community_incident(request: Request):
                 "message_id": message_id
             })
 
-        # Update report status
         if report_id:
             supabase.table("community_reports").update({
                 "status": "resolved" if action != "dismiss" else "dismissed",
@@ -1008,7 +1000,6 @@ async def moderate_community_incident(request: Request):
                 "updated_at": datetime.utcnow().isoformat()
             }).eq("id", report_id).execute()
 
-        # Log to audit ledger
         supabase.table("admin_audit_logs").insert({
             "admin_id": admin_id,
             "target_user_id": offender_id,
@@ -1020,7 +1011,6 @@ async def moderate_community_incident(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 1-on-1 Direct Chat & Consent Endpoints
 @app.post("/api/v1/direct/invite")
 async def invite_direct_chat(request: Request):
     if not supabase:
@@ -1031,7 +1021,6 @@ async def invite_direct_chat(request: Request):
         recipient_id = body.get("recipient_id")
         initial_note = body.get("initial_note", "Hi, I would like to connect about local recommendations.")
 
-        # Check existing conversation or invite
         existing = supabase.table("direct_conversations") \
             .select("*") \
             .or_(f"and(user_a.eq.{requester_id},user_b.eq.{recipient_id}),and(user_a.eq.{recipient_id},user_b.eq.{requester_id})") \
@@ -1043,7 +1032,7 @@ async def invite_direct_chat(request: Request):
         new_conv = supabase.table("direct_conversations").insert({
             "user_a": requester_id,
             "user_b": recipient_id,
-            "status": "pending",  # 'pending', 'accepted', 'rejected'
+            "status": "pending",
             "initial_note": initial_note
         }).execute()
 
@@ -1058,7 +1047,7 @@ async def respond_direct_chat(request: Request):
     try:
         body = await request.json()
         conversation_id = body.get("conversation_id")
-        action = body.get("action")  # 'accept' or 'reject'
+        action = body.get("action")
         status_val = "accepted" if action == "accept" else "rejected"
 
         upd = supabase.table("direct_conversations").update({
@@ -1077,7 +1066,6 @@ async def delete_direct_conversation(request: Request):
     try:
         body = await request.json()
         conversation_id = body.get("conversation_id")
-        # Soft delete or archive conversation
         supabase.table("direct_conversations").update({"status": "archived"}).eq("id", conversation_id).execute()
         return {"status": "success", "message": "Conversation purged successfully."}
     except Exception as e:
@@ -1149,13 +1137,14 @@ class ConnectionManager:
 
     def disconnect(self, room_id: str, websocket: WebSocket):
         if room_id in self.active_connections:
-            self.active_connections[room_id].remove(websocket)
+            if websocket in self.active_connections[room_id]:
+                self.active_connections[room_id].remove(websocket)
             if not self.active_connections[room_id]:
                 del self.active_connections[room_id]
 
     async def broadcast(self, room_id: str, message: dict):
         if room_id in self.active_connections:
-            for connection in self.active_connections[room_id]:
+            for connection in list(self.active_connections[room_id]):
                 try:
                     await connection.send_json(message)
                 except Exception:
@@ -1170,6 +1159,8 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
         while True:
             data = await websocket.receive_json()
             sender_id = data.get("sender_id")
+            sender_name = data.get("sender_name", "Scout")
+            sender_avatar_url = data.get("sender_avatar_url")
             raw_text = (data.get("text") or "").strip()
 
             # 1. Enforcement Check: Banned or Muted
@@ -1194,7 +1185,6 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
                     "type": "bot_warning",
                     "text": f"Message blocked by Supervisor Bot: {bot_violation}."
                 })
-                # Log incident automatically
                 if supabase and sender_id:
                     try:
                         supabase.table("community_reports").insert({
@@ -1226,18 +1216,23 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
             # 4. Standard Message Insertion & Broadcast
             if supabase and raw_text:
                 try:
-                    ins_res = supabase.table("messages").insert({
+                    payload_to_insert = {
                         "community_id": community_id,
                         "sender_id": sender_id,
                         "text": raw_text,
                         "type": data.get("type", "text"),
-                        "gem_id": data.get("gem_id")
-                    }).execute()
+                        "gem_id": data.get("gem_id"),
+                    }
+                    ins_res = supabase.table("messages").insert(payload_to_insert).execute()
                     if ins_res.data and len(ins_res.data) > 0:
                         data["id"] = ins_res.data[0].get("id")
                         data["created_at"] = ins_res.data[0].get("created_at")
                 except Exception as e:
                     print(f"[Supabase WS Insert Notice]: {e}")
+
+            # Ensure sender metadata is preserved for live peers
+            data["sender_name"] = sender_name
+            data["sender_avatar_url"] = sender_avatar_url
 
             await manager.broadcast(community_id, data)
     except WebSocketDisconnect:
@@ -1250,7 +1245,7 @@ def wake():
     return {
         "status": "Operational",
         "service": "Omni TouristOS & Unified Intelligence Cloud",
-        "version": "92.1.0",
+        "version": "93.0.0",
         "timestamp": datetime.utcnow().isoformat(),
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "supabase_connected": bool(supabase)
