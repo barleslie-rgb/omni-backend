@@ -1078,19 +1078,1208 @@ async def delete_direct_conversation(request: Request):
 # -------------------------------------------------------------
 # 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
 # -------------------------------------------------------------
-@app.post("/api/v1/railway-inquiry")
-async def railway_inquiry(request: Request):
+# Railway data layer is intentionally contained in this section only.
+# The rest of main.py (Paper Pilot, Community, WebSockets, etc.) is untouched.
+#
+# IMPORTANT:
+# - This implementation does NOT require a railway API key.
+# - Timetable data is read from a public Mumbai suburban timetable reference
+#   at request time and cached in memory.
+# - It covers only Western, Central and Harbour lines, as requested.
+# - Live delay/platform/door values are NEVER fabricated. They are returned
+#   only when a real backend source supplies them.
+# -------------------------------------------------------------
+
+RAILWAY_REFERENCE_BASE = "https://www.mumbailifeline.com"
+RAILWAY_REFERENCE_LABEL = "Mumbai Lifeline public timetable reference"
+RAILWAY_TIMETABLE_VERSIONS = {
+    "W": "May 2026",
+    "C": "2024",
+    "H": "May 2026",
+}
+
+# Short, stable station master used by the app.  The timetable source uses
+# station slugs/names rather than the app's local codes, so we translate here.
+RAILWAY_STATIONS: Dict[str, Dict[str, Any]] = {
+    # ----------------------------- WESTERN -----------------------------
+    "CCG": {"name": "Churchgate", "line": "W", "slug": "churchgate"},
+    "MEL": {"name": "Marine Lines", "line": "W", "slug": "marine_lines"},
+    "CYR": {"name": "Charni Road", "line": "W", "slug": "charni_road"},
+    "GTR": {"name": "Grant Road", "line": "W", "slug": "grant_road"},
+    "MMCT": {"name": "Mumbai Central", "line": "W", "slug": "mumbai_central"},
+    "MX": {"name": "Mahalaxmi", "line": "W", "slug": "mahalaxmi"},
+    "PL": {"name": "Lower Parel", "line": "W", "slug": "lower_parel"},
+    "PBHD": {"name": "Prabhadevi", "line": "W", "slug": "prabhadevi"},
+    "DDR": {"name": "Dadar", "line": "W", "slug": "dadar"},
+    "MRU": {"name": "Matunga Road", "line": "W", "slug": "matunga_road"},
+    "MM": {"name": "Mahim", "line": "W", "slug": "mahim"},
+    "BA": {"name": "Bandra", "line": "W", "slug": "bandra"},
+    "KHAR": {"name": "Khar Road", "line": "W", "slug": "khar_road"},
+    "STC": {"name": "Santacruz", "line": "W", "slug": "santacruz"},
+    "VLP": {"name": "Vile Parle", "line": "W", "slug": "vile_parle"},
+    "ADH": {"name": "Andheri", "line": "W", "slug": "andheri"},
+    "JOS": {"name": "Jogeshwari", "line": "jogeshwari"},
+    "RMAR": {"name": "Ram Mandir", "line": "ram_mandir"},
+    "GMN": {"name": "Goregaon", "line": "W", "slug": "goregaon"},
+    "MDD": {"name": "Malad", "line": "W", "slug": "malad"},
+    "KILE": {"name": "Kandivali", "line": "W", "slug": "kandivali"},
+    "BVI": {"name": "Borivali", "line": "W", "slug": "borivali"},
+    "DIC": {"name": "Dahisar", "line": "W", "slug": "dahisar"},
+    "MIRA": {"name": "Mira Road", "line": "W", "slug": "mira_road"},
+    "BYR": {"name": "Bhayandar", "line": "W", "slug": "bhayandar"},
+    "NIG": {"name": "Naigaon", "line": "W", "slug": "naigaon"},
+    "BSR": {"name": "Vasai Road", "line": "W", "slug": "vasai_road"},
+    "NSP": {"name": "Nalasopara", "line": "W", "slug": "nalla_sopara"},
+    "VR": {"name": "Virar", "line": "W", "slug": "virar"},
+    "Kelve": {"name": "Kelva Road", "line": "W", "slug": "kelva_road"},
+    "SAP": {"name": "Saphale", "line": "W", "slug": "saphale"},
+    "VTN": {"name": "Vaitarna", "line": "W", "slug": "vaitarna"},
+    "PAL": {"name": "Palghar", "line": "W", "slug": "palghar"},
+    "BOIS": {"name": "Boisar", "line": "W", "slug": "boisar"},
+    "VNG": {"name": "Vangaon", "line": "W", "slug": "vangaon"},
+    "DRD": {"name": "Dahanu Road", "line": "W", "slug": "dahanu_road"},
+
+    # ----------------------------- CENTRAL -----------------------------
+    "CSMT": {"name": "Mumbai CST", "line": "C", "slug": "mumbai_cst"},
+    "BY": {"name": "Byculla", "line": "C", "slug": "byculla"},
+    "SDR": {"name": "Sandhurst Road", "line": "C", "slug": "sandhurst_road"},
+    "CRR": {"name": "Currey Road", "line": "C", "slug": "currey_road"},
+    "PAR": {"name": "Parel", "line": "C", "slug": "parel"},
+    "CDR": {"name": "Dadar", "line": "C", "slug": "dadar"},
+    "MAT": {"name": "Matunga", "line": "C", "slug": "matunga"},
+    "SION": {"name": "Sion", "line": "C", "slug": "sion"},
+    "CLA": {"name": "Kurla", "line": "C", "slug": "kurla"},
+    "VID": {"name": "Vidyavihar", "line": "C", "slug": "vidyavihar"},
+    "GC": {"name": "Ghatkopar", "line": "C", "slug": "ghatkopar"},
+    "VSD": {"name": "Vikhroli", "line": "C", "slug": "vikhroli"},
+    "KMR": {"name": "Kanjurmarg", "line": "C", "slug": "kanjurmarg"},
+    "BND": {"name": "Bhandup", "line": "C", "slug": "bhandup"},
+    "NAH": {"name": "Nahur", "line": "C", "slug": "nahur"},
+    "MLND": {"name": "Mulund", "line": "C", "slug": "mulund"},
+    "TNA": {"name": "Thane", "line": "C", "slug": "thane"},
+    "KLV": {"name": "Kalva", "line": "C", "slug": "kalva"},
+    "MMB": {"name": "Mumbra", "line": "C", "slug": "mumbra"},
+    "DIVA": {"name": "Diva", "line": "C", "slug": "diva"},
+    "KOP": {"name": "Kopar", "line": "C", "slug": "kopar"},
+    "DOM": {"name": "Dombivli", "line": "C", "slug": "dombivli"},
+    "THK": {"name": "Thakurli", "line": "C", "slug": "thakurli"},
+    "KYN": {"name": "Kalyan", "line": "C", "slug": "kalyan"},
+    "VTL": {"name": "Vitthalwadi", "line": "C", "slug": "vitthalwadi"},
+    "ULH": {"name": "Ulhasnagar", "line": "C", "slug": "ulhasnagar"},
+    "AMB": {"name": "Ambernath", "line": "C", "slug": "ambernath"},
+    "BAD": {"name": "Badlapur", "line": "C", "slug": "badlapur"},
+    "VGI": {"name": "Vangani", "line": "C", "slug": "vangani"},
+    "SHE": {"name": "Shelu", "line": "C", "slug": "shelu"},
+    "NER": {"name": "Neral", "line": "C", "slug": "neral"},
+    "BHV": {"name": "Bhivpuri Road", "line": "C", "slug": "bhivpuri_road"},
+    "KJT": {"name": "Karjat", "line": "C", "slug": "karjat"},
+    "TIT": {"name": "Titwala", "line": "C", "slug": "titwala"},
+    "KHD": {"name": "Khadavli", "line": "C", "slug": "khadavli"},
+    "VSI": {"name": "Vasind", "line": "C", "slug": "vasind"},
+    "ASN": {"name": "Asangaon", "line": "C", "slug": "asangaon"},
+    "KAS": {"name": "Kasara", "line": "C", "slug": "kasara"},
+    "KPH": {"name": "Khopoli", "line": "C", "slug": "khopoli"},
+
+    # ----------------------------- HARBOUR -----------------------------
+    "HCS": {"name": "Mumbai CST", "line": "H", "slug": "mumbai_cst"},
+    "MSD": {"name": "Masjid", "line": "H", "slug": "masjid"},
+    "SNRD": {"name": "Sandhurst Road", "line": "H", "slug": "sandhurst_road"},
+    "DYR": {"name": "Dockyard Road", "line": "H", "slug": "dockyard_road"},
+    "RAY": {"name": "Reay Road", "line": "H", "slug": "reay_road"},
+    "CTN": {"name": "Cotton Green", "line": "H", "slug": "cotton_green"},
+    "SEW": {"name": "Sewri", "line": "H", "slug": "sewri"},
+    "VDR": {"name": "Vadala Road", "line": "H", "slug": "vadala_road"},
+    "GTB": {"name": "GTB Nagar", "line": "H", "slug": "gtb_nagar"},
+    "CHN": {"name": "Chunabhatti", "line": "H", "slug": "chunabhatti"},
+    "KLS": {"name": "Kings Circle", "line": "H", "slug": "kings_circle"},
+    "MAH": {"name": "Mahim", "line": "H", "slug": "mahim"},
+    "BH": {"name": "Bandra", "line": "H", "slug": "bandra_hr"},
+    "ADH_H": {"name": "Andheri", "line": "H", "slug": "andheri_hr"},
+    "GMN_H": {"name": "Goregaon", "line": "H", "slug": "goregaon_hr"},
+    "CLA_H": {"name": "Kurla", "line": "H", "slug": "kurla"},
+    "CHMB": {"name": "Chembur", "line": "H", "slug": "chembur"},
+    "GOV": {"name": "Govandi", "line": "H", "slug": "govandi"},
+    "MNRD": {"name": "Mankhurd", "line": "H", "slug": "mankhurd"},
+    "VSH": {"name": "Vashi", "line": "H", "slug": "vashi"},
+    "SAN": {"name": "Sanpada", "line": "H", "slug": "sanpada"},
+    "JUI": {"name": "Juinagar", "line": "H", "slug": "juinagar"},
+    "NER_H": {"name": "Nerul", "line": "H", "slug": "nerul"},
+    "SEW_H": {"name": "Seawoods", "line": "H", "slug": "seawoods"},
+    "BEPR": {"name": "Belapur CBD", "line": "H", "slug": "belapur_cbd"},
+    "KHAR_H": {"name": "Kharghar", "line": "H", "slug": "kharghar"},
+    "MNS": {"name": "Mansarovar", "line": "H", "slug": "mansarovar"},
+    "KLM": {"name": "Khandeshwar", "line": "H", "slug": "khandeshwar"},
+    "PNVL": {"name": "Panvel", "line": "H", "slug": "panvel"},
+}
+
+# Some stations belong to more than one suburban line.  Keep these aliases
+# explicit so the route planner can recognize interchanges.
+RAILWAY_INTERCHANGES = {
+    "DADAR": ["W", "C"],
+    "KURLA": ["C", "H"],
+    "MUMBAI CST": ["C", "H"],
+    "ANDHERI": ["W", "H"],
+    "BANDRA": ["W", "H"],
+    "MAHIM": ["W", "H"],
+}
+
+RAILWAY_CACHE: Dict[str, Dict[str, Any]] = {}
+RAILWAY_CACHE_TTL_SECONDS = 300
+RAILWAY_HTTP_TIMEOUT_SECONDS = 10.0
+
+
+def _rail_normalize(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _rail_time_to_minutes(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    raw = str(value).strip().upper().replace(".", "")
+    raw = re.sub(r"\s+", " ", raw)
+    match = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?$", raw)
+    if not match:
+        match = re.match(r"^(\d{1,2})\s*(AM|PM)$", raw)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2).isdigit() else 0
+    meridiem = match.group(3)
+
+    if meridiem:
+        if hour == 12:
+            hour = 0
+        if meridiem == "PM":
+            hour += 12
+
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _rail_minutes_to_12h(total_minutes: int) -> str:
+    total_minutes %= 1440
+    hour = total_minutes // 60
+    minute = total_minutes % 60
+    period = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return f"{display_hour}:{minute:02d} {period}"
+
+
+def _rail_slug_from_station(station: str, line: str = "") -> str:
+    raw = str(station or "").strip()
+
+    # First accept app station code.
+    upper = raw.upper()
+    if upper in RAILWAY_STATIONS:
+        return str(RAILWAY_STATIONS[upper]["slug"])
+
+    # Then accept station name.
+    norm = _rail_normalize(raw)
+    for code, data in RAILWAY_STATIONS.items():
+        if _rail_normalize(data["name"]) == norm:
+            return str(data["slug"])
+
+    aliases = {
+        "mumbaicsmt": "mumbai_cst",
+        "mumbaicst": "mumbai_cst",
+        "cst": "mumbai_cst",
+        "csmt": "mumbai_cst",
+        "vadalaroad": "vadala_road",
+        "vasairoad": "vasai_road",
+        "nalasopara": "nalla_sopara",
+        "nallasopara": "nalla_sopara",
+        "belapur": "belapur_cbd",
+        "belapurcbd": "belapur_cbd",
+        "kharroad": "khar_road",
+    }
+    if norm in aliases:
+        return aliases[norm]
+
+    # Safe generic fallback. The public reference uses underscore slugs.
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", raw.lower())).strip("_")
+
+
+def _rail_station_display_name(station: str) -> str:
+    upper = str(station or "").strip().upper()
+    if upper in RAILWAY_STATIONS:
+        return str(RAILWAY_STATIONS[upper]["name"])
+
+    norm = _rail_normalize(station)
+    for data in RAILWAY_STATIONS.values():
+        if _rail_normalize(data["name"]) == norm:
+            return str(data["name"])
+
+    return str(station or "Unknown Station").strip()
+
+
+def _rail_lines_for_station(station: str) -> List[str]:
+    name = _rail_station_display_name(station)
+    norm = name.upper()
+
+    # Explicit interchange knowledge first.
+    if norm in RAILWAY_INTERCHANGES:
+        return list(RAILWAY_INTERCHANGES[norm])
+
+    lines: List[str] = []
+    upper = str(station or "").strip().upper()
+    if upper in RAILWAY_STATIONS:
+        lines.append(str(RAILWAY_STATIONS[upper]["line"]))
+
+    for data in RAILWAY_STATIONS.values():
+        if _rail_normalize(data["name"]) == _rail_normalize(name):
+            line = str(data["line"])
+            if line not in lines:
+                lines.append(line)
+
+    return lines
+
+
+def _rail_line_name(line: str) -> str:
     return {
-        "status": "success",
-        "type": "station_board",
-        "station_code": "BSR",
-        "station_name": "Vasai Road Junction",
-        "trains": [
-            {"time": "08:15 AM", "train_no": "90302", "name": "Virar - Churchgate Fast", "service_type": "F", "platform": "2", "status": "On Time"}
-        ]
+        "W": "Western Railway",
+        "C": "Central Railway",
+        "H": "Harbour Line",
+    }.get(str(line).upper(), "Mumbai Suburban Railway")
+
+
+def _rail_route_slug(line: str) -> str:
+    return {
+        "W": "western",
+        "C": "central",
+        "H": "harbour",
+    }.get(str(line).upper(), "western")
+
+
+def _rail_route_url(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> str:
+    from_slug = _rail_slug_from_station(from_station, line)
+    to_slug = _rail_slug_from_station(to_station, line)
+
+    params = {
+        "after": _rail_minutes_to_12h(after_minutes),
+        "before": _rail_minutes_to_12h(before_minutes),
     }
 
+    return (
+        f"{RAILWAY_REFERENCE_BASE}/timetable/"
+        f"{_rail_route_slug(line)}/{from_slug}/{to_slug}"
+        f"?{urllib.parse.urlencode(params)}"
+    )
+
+
+def _rail_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    item = RAILWAY_CACHE.get(key)
+    if not item:
+        return None
+    if time.time() - float(item.get("timestamp", 0)) > RAILWAY_CACHE_TTL_SECONDS:
+        RAILWAY_CACHE.pop(key, None)
+        return None
+    return item.get("data")
+
+
+def _rail_cache_set(key: str, data: Dict[str, Any]) -> None:
+    RAILWAY_CACHE[key] = {
+        "timestamp": time.time(),
+        "data": data,
+    }
+
+    # Keep memory bounded.
+    if len(RAILWAY_CACHE) > 80:
+        oldest_key = min(
+            RAILWAY_CACHE.keys(),
+            key=lambda k: float(RAILWAY_CACHE[k].get("timestamp", 0)),
+        )
+        RAILWAY_CACHE.pop(oldest_key, None)
+
+
+def _rail_clean_train_no(value: str) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    raw = re.sub(r"\b(MON[–-]SAT|SAT[–-]SUN|DAILY|MON-SAT|SAT-SUN)\b", "", raw, flags=re.I)
+    raw = re.sub(r"\s+", " ", raw).strip(" -|")
+    return raw.split(" ")[0] if raw else "—"
+
+
+def _rail_days_from_label(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "Daily / per timetable"
+    for token in ["Mon–Sat", "Sat–Sun", "Daily", "Mon-Sat", "Sat-Sun"]:
+        if token.lower() in raw.lower():
+            return token.replace("–", "-")
+    return "As published"
+
+
+def _rail_detect_service(train_no_cell: str, speed_cell: str) -> Tuple[str, str]:
+    no_text = str(train_no_cell or "").upper()
+    speed = str(speed_cell or "").strip().upper()
+
+    if "AC" in no_text:
+        return "AC", "Air-conditioned local"
+    if "LADIES" in no_text or "WOMEN" in no_text:
+        return "LADIES", "Ladies special"
+    if "FAST" in speed:
+        return "F", "Fast"
+    if "SLOW" in speed:
+        return "S", "Slow"
+    if "MEDIUM" in speed:
+        return "M", "Medium"
+    return "S", speed.title() if speed and speed != "—" else "Local"
+
+
+def _rail_find_header(headers: List[str], candidates: List[str]) -> Optional[int]:
+    normalized_headers = [_rail_normalize(h) for h in headers]
+    for candidate in candidates:
+        candidate_norm = _rail_normalize(candidate)
+        for idx, header_norm in enumerate(normalized_headers):
+            if candidate_norm and candidate_norm in header_norm:
+                return idx
+    return None
+
+
+def _rail_parse_timetable_html(
+    html: str,
+    line: str,
+    from_station: str,
+    to_station: str,
+    source_url: str,
+) -> List[Dict[str, Any]]:
+    if BeautifulSoup is None:
+        return []
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    trains: List[Dict[str, Any]] = []
+
+    requested_from_name = _rail_station_display_name(from_station)
+    requested_to_name = _rail_station_display_name(to_station)
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+
+        header_cells = [
+            cell.get_text(" ", strip=True)
+            for cell in rows[0].find_all(["th", "td"])
+        ]
+
+        if not header_cells:
+            continue
+
+        train_idx = _rail_find_header(header_cells, ["Train No", "Train"])
+        speed_idx = _rail_find_header(header_cells, ["Speed"])
+        coach_idx = _rail_find_header(header_cells, ["Coaches"])
+        origin_idx = _rail_find_header(header_cells, ["Originating From", "Origin"])
+        ending_idx = _rail_find_header(header_cells, ["Ending At", "Destination"])
+        duration_idx = _rail_find_header(header_cells, ["Duration"])
+        from_time_idx = _rail_find_header(header_cells, [requested_from_name, from_station])
+        to_time_idx = _rail_find_header(header_cells, [requested_to_name, to_station])
+
+        if train_idx is None or from_time_idx is None or to_time_idx is None:
+            continue
+
+        for row in rows[1:]:
+            cells = row.find_all(["th", "td"])
+            values = [c.get_text(" ", strip=True) for c in cells]
+
+            required_indexes = [train_idx, from_time_idx, to_time_idx]
+            if any(idx >= len(values) for idx in required_indexes):
+                continue
+
+            train_cell = values[train_idx].strip()
+            dep_raw = values[from_time_idx].strip()
+            arr_raw = values[to_time_idx].strip()
+
+            if not train_cell or not dep_raw or dep_raw in {"—", "-", "–"}:
+                continue
+
+            dep_min = _rail_time_to_minutes(dep_raw)
+            arr_min = _rail_time_to_minutes(arr_raw)
+
+            if dep_min is None:
+                continue
+
+            speed = values[speed_idx] if speed_idx is not None and speed_idx < len(values) else ""
+            coaches = values[coach_idx] if coach_idx is not None and coach_idx < len(values) else None
+            origin = values[origin_idx] if origin_idx is not None and origin_idx < len(values) else None
+            ending = values[ending_idx] if ending_idx is not None and ending_idx < len(values) else None
+            duration = values[duration_idx] if duration_idx is not None and duration_idx < len(values) else None
+
+            service_type, service_label = _rail_detect_service(train_cell, speed)
+
+            cleaned_train_no = _rail_clean_train_no(train_cell)
+            days = _rail_days_from_label(train_cell)
+
+            if cleaned_train_no == "—":
+                cleaned_train_no = train_cell
+
+            if arr_min is not None and arr_min < dep_min:
+                # Cross-midnight arrival.
+                arr_min += 1440
+
+            trains.append({
+                "time": dep_raw,
+                "departure_time": dep_raw,
+                "arrival_time": arr_raw if arr_raw not in {"—", "-", "–"} else None,
+                "timestamp_minutes": dep_min,
+                "arrival_minutes": arr_min,
+                "train_no": cleaned_train_no,
+                "name": f"{origin or requested_from_name} → {ending or requested_to_name}",
+                "service_type": service_type,
+                "service": service_label,
+                "category": service_label,
+                "platform": None,
+                "platform_note": "Platform not published in this timetable response.",
+                "status": "Scheduled",
+                "status_msg": "Scheduled timetable entry",
+                "delay_minutes": None,
+                "crowd": None,
+                "door_side": None,
+                "coaches": coaches,
+                "coach_count": coaches,
+                "composition": coaches,
+                "source": requested_from_name,
+                "destination": requested_to_name,
+                "origin": origin,
+                "ending_at": ending,
+                "duration": duration,
+                "days": days,
+                "live": False,
+                "data_source": source_url,
+                "data_source_type": RAILWAY_REFERENCE_LABEL,
+                "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+            })
+
+        # The correct timetable table normally contains these headers.
+        # Don't accidentally parse unrelated tables from the page.
+        if trains:
+            break
+
+    # Deduplicate rows that can occur because of responsive table markup.
+    unique: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    for train in trains:
+        key = (
+            str(train.get("train_no", "")),
+            int(train.get("timestamp_minutes", -1)),
+            str(train.get("destination", "")),
+        )
+        unique[key] = train
+
+    return sorted(
+        unique.values(),
+        key=lambda item: int(item.get("timestamp_minutes", 0)),
+    )
+
+
+async def _rail_fetch_timetable(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> Dict[str, Any]:
+    line = str(line).upper()
+    from_name = _rail_station_display_name(from_station)
+    to_name = _rail_station_display_name(to_station)
+
+    source_url = _rail_route_url(
+        line=line,
+        from_station=from_station,
+        to_station=to_station,
+        after_minutes=after_minutes,
+        before_minutes=before_minutes,
+    )
+
+    cache_key = f"{line}|{from_name}|{to_name}|{after_minutes}|{before_minutes}"
+    cached = _rail_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = {
+        "trains": [],
+        "source_url": source_url,
+        "source_label": RAILWAY_REFERENCE_LABEL,
+        "line": line,
+        "line_name": _rail_line_name(line),
+        "from": from_name,
+        "to": to_name,
+        "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+        "retrieved_at": datetime.now().astimezone().isoformat(),
+        "error": None,
+    }
+
+    try:
+        headers = {
+            "User-Agent": "OmniTouristOS/93.0 Railway/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=RAILWAY_HTTP_TIMEOUT_SECONDS,
+            headers=headers,
+        ) as client:
+            response = await client.get(source_url)
+
+        if response.status_code != 200:
+            result["error"] = f"Timetable source returned HTTP {response.status_code}."
+            _rail_cache_set(cache_key, result)
+            return result
+
+        parsed = _rail_parse_timetable_html(
+            html=response.text,
+            line=line,
+            from_station=from_station,
+            to_station=to_station,
+            source_url=source_url,
+        )
+        result["trains"] = parsed
+
+        if not parsed:
+            result["error"] = "No timetable rows could be parsed from the public timetable response."
+
+    except Exception as exc:
+        result["error"] = f"Timetable source unavailable: {exc}"
+
+    _rail_cache_set(cache_key, result)
+    return result
+
+
+def _rail_filter_trains(
+    trains: List[Dict[str, Any]],
+    service: str,
+) -> List[Dict[str, Any]]:
+    wanted = str(service or "ALL").strip().upper()
+    if wanted in {"", "ALL"}:
+        return list(trains)
+
+    output: List[Dict[str, Any]] = []
+    for train in trains:
+        service_type = str(train.get("service_type", "")).upper()
+        label = str(train.get("service", "")).upper()
+        category = str(train.get("category", "")).upper()
+
+        if wanted == "FAST" and (service_type == "F" or "FAST" in label):
+            output.append(train)
+        elif wanted == "SLOW" and (service_type == "S" or "SLOW" in label):
+            output.append(train)
+        elif wanted == "AC" and (service_type == "AC" or "AC" in label or "AC" in category):
+            output.append(train)
+        elif wanted == "LADIES" and (
+            service_type == "LADIES"
+            or "LADIES" in label
+            or "WOMEN" in category
+        ):
+            output.append(train)
+
+    return output
+
+
+def _rail_default_board_targets(station: str, line: str) -> List[str]:
+    station_name = _rail_station_display_name(station)
+    norm = _rail_normalize(station_name)
+
+    if line == "W":
+        targets = ["churchgate", "virar"]
+        if norm == _rail_normalize("Churchgate"):
+            targets = ["virar", "borivali"]
+        elif norm == _rail_normalize("Virar"):
+            targets = ["churchgate", "dahanu_road"]
+        elif norm in {
+            _rail_normalize("Palghar"),
+            _rail_normalize("Boisar"),
+            _rail_normalize("Dahanu Road"),
+        }:
+            targets = ["churchgate", "virar"]
+        return targets
+
+    if line == "C":
+        # Main-line board. At Kalyan and key junctions include the branches.
+        if norm == _rail_normalize("Kalyan"):
+            return ["mumbai_cst", "kasara", "khopoli"]
+        if norm in {
+            _rail_normalize("Karjat"),
+            _rail_normalize("Neral"),
+            _rail_normalize("Badlapur"),
+            _rail_normalize("Ambernath"),
+        }:
+            return ["mumbai_cst", "kalyan"]
+        if norm in {_rail_normalize("Kasara"), _rail_normalize("Asangaon"), _rail_normalize("Vasind"), _rail_normalize("Titwala")}:
+            return ["mumbai_cst", "kalyan"]
+        if norm == _rail_normalize("Mumbai CST"):
+            return ["kalyan", "khopoli", "kasara"]
+        return ["mumbai_cst", "kalyan"]
+
+    if line == "H":
+        if norm == _rail_normalize("Mumbai CST"):
+            return ["panvel", "goregaon_hr", "andheri_hr"]
+        if norm in {
+            _rail_normalize("Vadala Road"),
+            _rail_normalize("Bandra"),
+            _rail_normalize("Andheri"),
+            _rail_normalize("Goregaon"),
+        }:
+            return ["mumbai_cst", "panvel"]
+        if norm == _rail_normalize("Panvel"):
+            return ["mumbai_cst", "goregaon_hr"]
+        return ["mumbai_cst", "panvel"]
+
+    return []
+
+
+def _rail_station_name_from_slug(slug: str) -> str:
+    norm = _rail_normalize(slug)
+    for data in RAILWAY_STATIONS.values():
+        if _rail_normalize(data["slug"]) == norm:
+            return str(data["name"])
+    return slug.replace("_", " ").title()
+
+
+def _rail_resolve_line_for_pair(
+    from_station: str,
+    to_station: str,
+    requested_line: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    requested = str(requested_line or "ALL").upper()
+    from_lines = _rail_lines_for_station(from_station)
+    to_lines = _rail_lines_for_station(to_station)
+
+    if requested in {"W", "C", "H"}:
+        if requested in from_lines and requested in to_lines:
+            return requested, None
+        return requested, "Selected line does not directly serve both stations."
+
+    common = [line for line in ["W", "C", "H"] if line in from_lines and line in to_lines]
+    if common:
+        return common[0], None
+
+    if from_lines and to_lines:
+        return None, "Interchange route required."
+
+    return None, "Could not identify a Mumbai suburban line for one or both stations."
+
+
+async def _rail_cross_line_route(
+    from_station: str,
+    to_station: str,
+    from_lines: List[str],
+    to_lines: List[str],
+) -> Dict[str, Any]:
+    # Pick the most common/simple interchange so the backend stays lightweight.
+    interchange_rules = [
+        ("Dadar", "W", "C"),
+        ("Andheri", "W", "H"),
+        ("Kurla", "C", "H"),
+        ("Mumbai CST", "C", "H"),
+        ("Bandra", "W", "H"),
+        ("Mahim", "W", "H"),
+    ]
+
+    choice = None
+    for interchange, line_a, line_b in interchange_rules:
+        if line_a in from_lines and line_b in to_lines:
+            choice = (interchange, line_a, line_b)
+            break
+        if line_b in from_lines and line_a in to_lines:
+            choice = (interchange, line_b, line_a)
+            break
+
+    if choice is None:
+        return {
+            "trains": [],
+            "requires_interchange": True,
+            "interchange_options": [],
+            "message": "Stations are on different suburban lines. Choose an interchange station such as Dadar, Andheri, Kurla or Mumbai CST.",
+        }
+
+    interchange, first_line, second_line = choice
+    now = datetime.now()
+    start_min = now.hour * 60 + now.minute
+    window_end = min(start_min + 180, 1439)
+
+    first = await _rail_fetch_timetable(
+        first_line,
+        from_station,
+        interchange,
+        start_min,
+        window_end,
+    )
+    second = await _rail_fetch_timetable(
+        second_line,
+        interchange,
+        to_station,
+        start_min,
+        window_end,
+    )
+
+    first_trains = first.get("trains", [])
+    second_trains = second.get("trains", [])
+
+    journeys: List[Dict[str, Any]] = []
+
+    for leg1 in first_trains:
+        leg1_arrival = leg1.get("arrival_minutes")
+        if leg1_arrival is None:
+            continue
+
+        for leg2 in second_trains:
+            leg2_depart = leg2.get("timestamp_minutes")
+            if leg2_depart is None:
+                continue
+
+            effective_arrival = int(leg1_arrival)
+            if effective_arrival < int(leg1.get("timestamp_minutes", 0)):
+                effective_arrival += 1440
+
+            connection = int(leg2_depart) - effective_arrival
+            if 5 <= connection <= 40:
+                leg2_arrival = leg2.get("arrival_minutes")
+                duration_text = "Scheduled interchange"
+
+                if leg2_arrival is not None:
+                    total_duration = int(leg2_arrival) - int(leg1.get("timestamp_minutes", 0))
+                    if total_duration < 0:
+                        total_duration += 1440
+                    hours = total_duration // 60
+                    minutes = total_duration % 60
+                    duration_text = f"{hours}h {minutes}m" if hours else f"{minutes} min"
+
+                journeys.append({
+                    "time": leg1.get("departure_time"),
+                    "departure_time": leg1.get("departure_time"),
+                    "arrival_time": leg2.get("arrival_time"),
+                    "timestamp_minutes": leg1.get("timestamp_minutes"),
+                    "train_no": f"{leg1.get('train_no', '—')} + {leg2.get('train_no', '—')}",
+                    "name": f"{from_station} → {interchange} → {to_station}",
+                    "service_type": "CHANGE",
+                    "service": "Interchange",
+                    "category": "Connected route",
+                    "platform": None,
+                    "status": f"Scheduled • Change at {interchange}",
+                    "status_msg": f"Change at {interchange} • {connection} min connection",
+                    "delay_minutes": None,
+                    "crowd": None,
+                    "door_side": None,
+                    "coaches": None,
+                    "source": _rail_station_display_name(from_station),
+                    "destination": _rail_station_display_name(to_station),
+                    "origin": _rail_station_display_name(from_station),
+                    "ending_at": _rail_station_display_name(to_station),
+                    "duration": duration_text,
+                    "days": "As published",
+                    "live": False,
+                    "interchange": interchange,
+                    "connection_minutes": connection,
+                    "leg_1": leg1,
+                    "leg_2": leg2,
+                    "data_source": [
+                        first.get("source_url"),
+                        second.get("source_url"),
+                    ],
+                    "data_source_type": RAILWAY_REFERENCE_LABEL,
+                    "timetable_version": (
+                        f"{RAILWAY_TIMETABLE_VERSIONS.get(first_line, 'Unknown')} / "
+                        f"{RAILWAY_TIMETABLE_VERSIONS.get(second_line, 'Unknown')}"
+                    ),
+                })
+                break
+
+        if len(journeys) >= 12:
+            break
+
+    journeys.sort(key=lambda item: int(item.get("timestamp_minutes", 0)))
+
+    return {
+        "trains": journeys[:12],
+        "requires_interchange": True,
+        "interchange": interchange,
+        "from": _rail_station_display_name(from_station),
+        "to": _rail_station_display_name(to_station),
+        "line": f"{first_line}+{second_line}",
+        "line_name": f"{_rail_line_name(first_line)} + {_rail_line_name(second_line)}",
+        "source_label": RAILWAY_REFERENCE_LABEL,
+    }
+
+
+@app.post("/api/v1/railway-inquiry")
+async def railway_inquiry(request: Request):
+    """
+    Backward-compatible railway gateway.
+
+    Supported query_type values:
+      - station_board
+      - route_search
+      - live_train
+      - pnr
+
+    The Flutter client can continue using the same endpoint and payload shape.
+    """
+
+    try:
+        content_type = request.headers.get("content-type", "").lower()
+
+        query_type = "station_board"
+        query_value: Any = ""
+        target_language = "English"
+
+        if "application/json" in content_type:
+            body = await request.json()
+            query_type = str(body.get("query_type", "station_board"))
+            query_value = body.get("query_value", "")
+            target_language = str(body.get("target_language", "English"))
+        else:
+            form = await request.form()
+            query_type = str(form.get("query_type", "station_board"))
+            query_value = form.get("query_value", "")
+            target_language = str(form.get("target_language", "English"))
+
+        normalized_type = query_type.strip().lower()
+
+        # ----------------------------- ROUTE SEARCH -----------------------------
+        if normalized_type == "route_search":
+            try:
+                route_payload = json.loads(str(query_value)) if query_value else {}
+            except Exception:
+                route_payload = {}
+
+            from_station = str(
+                route_payload.get("from")
+                or route_payload.get("source")
+                or route_payload.get("from_station")
+                or "BSR"
+            ).strip()
+
+            to_station = str(
+                route_payload.get("to")
+                or route_payload.get("destination")
+                or route_payload.get("to_station")
+                or "DDR"
+            ).strip()
+
+            requested_line = str(route_payload.get("line") or "ALL").upper()
+            requested_service = str(route_payload.get("service") or "ALL").upper()
+
+            if _rail_normalize(from_station) == _rail_normalize(to_station):
+                return {
+                    "status": "error",
+                    "type": "route_search",
+                    "message": "Origin and destination cannot be the same station.",
+                    "trains": [],
+                }
+
+            direct_line, line_error = _rail_resolve_line_for_pair(
+                from_station,
+                to_station,
+                requested_line,
+            )
+
+            if direct_line and not line_error:
+                now = datetime.now()
+                start_min = now.hour * 60 + now.minute
+                window_end = min(start_min + 180, 1439)
+
+                result = await _rail_fetch_timetable(
+                    direct_line,
+                    from_station,
+                    to_station,
+                    start_min,
+                    window_end,
+                )
+
+                trains = _rail_filter_trains(
+                    list(result.get("trains", [])),
+                    requested_service,
+                )
+
+                return {
+                    "status": "success",
+                    "type": "route_search",
+                    "station_code": str(from_station).upper(),
+                    "station_name": _rail_station_display_name(from_station),
+                    "from": _rail_station_display_name(from_station),
+                    "to": _rail_station_display_name(to_station),
+                    "line": direct_line,
+                    "line_name": _rail_line_name(direct_line),
+                    "trains": trains,
+                    "route_search": True,
+                    "requires_interchange": False,
+                    "service_filter": requested_service,
+                    "current_time": _rail_minutes_to_12h(start_min),
+                    "timetable_version": result.get(
+                        "timetable_version",
+                        RAILWAY_TIMETABLE_VERSIONS.get(direct_line, "Unknown"),
+                    ),
+                    "data_source": result.get("source_url"),
+                    "data_source_label": RAILWAY_REFERENCE_LABEL,
+                    "source_notice": (
+                        "Timetable values are from a public timetable reference; "
+                        "they are scheduled values, not a live delay feed."
+                    ),
+                    "source_error": result.get("error"),
+                }
+
+            # Try an interchange journey when the selected stations span lines.
+            from_lines = _rail_lines_for_station(from_station)
+            to_lines = _rail_lines_for_station(to_station)
+
+            if requested_line in {"W", "C", "H"}:
+                from_lines = [requested_line] if requested_line in from_lines else from_lines
+                to_lines = [requested_line] if requested_line in to_lines else to_lines
+
+            if from_lines and to_lines:
+                cross_line = await _rail_cross_line_route(
+                    from_station=from_station,
+                    to_station=to_station,
+                    from_lines=from_lines,
+                    to_lines=to_lines,
+                )
+                cross_line["status"] = "success"
+                cross_line["type"] = "route_search"
+                cross_line["route_search"] = True
+                cross_line["current_time"] = _rail_minutes_to_12h(
+                    datetime.now().hour * 60 + datetime.now().minute
+                )
+                cross_line["data_source_label"] = RAILWAY_REFERENCE_LABEL
+                cross_line["source_notice"] = (
+                    "Connected journeys are assembled from scheduled public timetable "
+                    "entries; connection times are timetable-based, not live platform data."
+                )
+                return cross_line
+
+            return {
+                "status": "error",
+                "type": "route_search",
+                "message": line_error or "No supported suburban route found.",
+                "trains": [],
+            }
+
+        # ----------------------------- STATION BOARD -----------------------------
+        if normalized_type == "station_board":
+            station = str(query_value or "BSR").strip().upper()
+            station_name = _rail_station_display_name(station)
+            station_lines = _rail_lines_for_station(station)
+
+            if not station_lines:
+                return {
+                    "status": "error",
+                    "type": "station_board",
+                    "station_code": station,
+                    "station_name": station_name,
+                    "message": "Station not found in the Omni Rail station directory.",
+                    "trains": [],
+                }
+
+            now = datetime.now()
+            current_min = now.hour * 60 + now.minute
+            board_start = 3 * 60 + 30
+            board_end = 23 * 60 + 59
+
+            all_trains: List[Dict[str, Any]] = []
+            source_urls: List[str] = []
+            source_errors: List[str] = []
+
+            # A station can be an interchange (e.g. Dadar / Kurla / CSMT).
+            # Return both line boards rather than silently selecting one.
+            unique_line_set: List[str] = []
+            for line in station_lines:
+                if line not in unique_line_set:
+                    unique_line_set.append(line)
+
+            for line in unique_line_set:
+                targets = _rail_default_board_targets(station, line)
+
+                for target in targets:
+                    target_name = _rail_station_name_from_slug(target)
+                    if _rail_normalize(target_name) == _rail_normalize(station_name):
+                        continue
+
+                    result = await _rail_fetch_timetable(
+                        line=line,
+                        from_station=station,
+                        to_station=target_name,
+                        after_minutes=board_start,
+                        before_minutes=board_end,
+                    )
+
+                    source_url = result.get("source_url")
+                    if source_url:
+                        source_urls.append(source_url)
+
+                    if result.get("error"):
+                        source_errors.append(str(result["error"]))
+
+                    for train in result.get("trains", []):
+                        item = dict(train)
+                        item["line"] = line
+                        item["line_name"] = _rail_line_name(line)
+                        item["direction"] = target_name
+                        all_trains.append(item)
+
+            # Apply service-independent chronological ordering.
+            all_trains.sort(
+                key=lambda item: (
+                    int(item.get("timestamp_minutes", 0)),
+                    str(item.get("train_no", "")),
+                )
+            )
+
+            # De-duplicate identical rows coming from overlapping direction searches.
+            seen = set()
+            deduped = []
+            for train in all_trains:
+                key = (
+                    str(train.get("train_no")),
+                    int(train.get("timestamp_minutes", -1)),
+                    str(train.get("destination")),
+                    str(train.get("line")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(train)
+
+            # Keep the complete day schedule practical for mobile JSON responses,
+            # while preserving enough rows for the "next trains" experience.
+            deduped = deduped[:450]
+
+            upcoming = [
+                t for t in deduped
+                if int(t.get("timestamp_minutes", 0)) >= current_min
+            ][:12]
+
+            return {
+                "status": "success",
+                "type": "station_board",
+                "station_code": station,
+                "station_name": station_name,
+                "line": unique_line_set[0] if len(unique_line_set) == 1 else "ALL",
+                "line_name": (
+                    _rail_line_name(unique_line_set[0])
+                    if len(unique_line_set) == 1
+                    else "Mumbai Suburban Network"
+                ),
+                "lines": unique_line_set,
+                "line_names": [_rail_line_name(line) for line in unique_line_set],
+                "current_time": _rail_minutes_to_12h(current_min),
+                "board_window": "03:30 AM – 11:59 PM",
+                "trains": deduped,
+                "next_trains": upcoming,
+                "train_count": len(deduped),
+                "source_urls": sorted(set(source_urls)),
+                "source_errors": sorted(set(source_errors))[:5],
+                "source_label": RAILWAY_REFERENCE_LABEL,
+                "timetable_versions": {
+                    line: RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown")
+                    for line in unique_line_set
+                },
+                "source_notice": (
+                    "Scheduled timetable data is shown from a public Mumbai suburban "
+                    "timetable reference. Platform, delay, door-side and crowd values "
+                    "are not invented when no live feed exists."
+                ),
+                "station_directory": [
+                    {
+                        "code": code,
+                        "name": data["name"],
+                        "line": data["line"],
+                    }
+                    for code, data in RAILWAY_STATIONS.items()
+                    if _rail_normalize(data["name"]) == _rail_normalize(station_name)
+                ],
+            }
+
+        # ----------------------------- LIVE TRAIN -----------------------------
+        if normalized_type == "live_train":
+            train_query = str(query_value or "").strip()
+
+            if not train_query:
+                return {
+                    "status": "error",
+                    "type": "live_train",
+                    "message": "Enter a train number or timetable train code.",
+                }
+
+            # We deliberately return a truthful response here.  The timetable
+            # source does not provide real-time movement/delay data.
+            return {
+                "status": "success",
+                "type": "live_train",
+                "train_no": train_query,
+                "train_name": "Mumbai Suburban Local",
+                "current_station": None,
+                "next_station": None,
+                "platform": None,
+                "door_side": None,
+                "delay_minutes": None,
+                "crowd": None,
+                "status_msg": (
+                    "Live movement data is not available from the current no-key "
+                    "railway source. Use the Mumbai Local timetable for scheduled stops."
+                ),
+                "live": False,
+                "live_feed_available": False,
+                "message": (
+                    "Omni Rail will display live location/delay/platform information "
+                    "only when an authorized or genuinely live feed is connected."
+                ),
+                "data_source_label": RAILWAY_REFERENCE_LABEL,
+            }
+
+        # ----------------------------- PNR -----------------------------
+        if normalized_type == "pnr":
+            pnr = re.sub(r"\D", "", str(query_value or ""))
+
+            if len(pnr) != 10:
+                return {
+                    "status": "error",
+                    "type": "pnr",
+                    "message": "PNR must contain exactly 10 digits.",
+                }
+
+            return {
+                "status": "success",
+                "type": "pnr",
+                "pnr": pnr,
+                "train_no": None,
+                "train_name": None,
+                "from_station": None,
+                "to_station": None,
+                "journey_date": None,
+                "booking_status": "Live PNR lookup unavailable",
+                "status_msg": (
+                    "This backend does not have an authorized live PNR feed. "
+                    "Please verify the PNR through an official railway service."
+                ),
+                "live": False,
+                "data_source_label": "Official railway PNR service required",
+            }
+
+        return {
+            "status": "error",
+            "type": normalized_type,
+            "message": "Unsupported railway query type.",
+            "trains": [],
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Railway inquiry error: {exc}",
+            "trains": [],
+        }
+
 # -------------------------------------------------------------
+
 # 20. BARGAIN PAL (PRICE EVALUATOR)
 # -------------------------------------------------------------
 @app.post("/api/v1/bargain-evaluate")
