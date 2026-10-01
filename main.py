@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 import httpx
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, WebSocketDisconnect, HTTPException
+from places import router as places_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -36,6 +37,9 @@ app = FastAPI(
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Universal Document Auditor, Transit Cloud & Community Intelligence",
     version="93.0.0"
 )
+
+# Register the places router on the active app instance
+app.include_router(places_router)
 
 app.add_middleware(
     CORSMiddleware,
