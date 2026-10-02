@@ -1,5 +1,6 @@
 import os
 import io
+import asyncio
 import gc
 import json
 import re
@@ -8,7 +9,6 @@ import uuid
 import base64
 import zipfile
 import urllib.parse
-import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
@@ -1076,18 +1076,19 @@ async def delete_direct_conversation(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------# 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
 # -------------------------------------------------------------
-# Mumbai suburban timetable layer for Western, Central and Harbour lines.
+# 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
+# -------------------------------------------------------------
+# Railway data layer is intentionally contained in this section only.
+# The rest of main.py (Paper Pilot, Community, WebSockets, etc.) is untouched.
 #
-# Design rules:
-# - Timetable values are scheduled values from the public reference source.
-# - No live delay/location/platform data is fabricated.
-# - All railway time calculations use Asia/Kolkata, not the Render server TZ.
-# - Station-board retrieval is concurrent and bounded so the Flutter client
-#   does not sit behind a chain of sequential 10-second requests.
-# - Parser failures stay in backend diagnostics; the mobile UI receives a
-#   clean user-facing state.
+# IMPORTANT:
+# - This implementation does NOT require a railway API key.
+# - Timetable data is read from a public Mumbai suburban timetable reference
+#   at request time and cached in memory.
+# - It covers only Western, Central and Harbour lines, as requested.
+# - Live delay/platform/door values are NEVER fabricated. They are returned
+#   only when a real backend source supplies them.
 # -------------------------------------------------------------
 
 RAILWAY_REFERENCE_BASE = "https://www.mumbailifeline.com"
@@ -1098,6 +1099,8 @@ RAILWAY_TIMETABLE_VERSIONS = {
     "H": "May 2026",
 }
 
+# Short, stable station master used by the app.  The timetable source uses
+# station slugs/names rather than the app's local codes, so we translate here.
 RAILWAY_STATIONS: Dict[str, Dict[str, Any]] = {
     # ----------------------------- WESTERN -----------------------------
     "CCG": {"name": "Churchgate", "line": "W", "slug": "churchgate"},
@@ -1210,6 +1213,8 @@ RAILWAY_STATIONS: Dict[str, Dict[str, Any]] = {
     "PNVL": {"name": "Panvel", "line": "H", "slug": "panvel"},
 }
 
+# Some stations belong to more than one suburban line.  Keep these aliases
+# explicit so the route planner can recognize interchanges.
 RAILWAY_INTERCHANGES = {
     "DADAR": ["W", "C"],
     "KURLA": ["C", "H"],
@@ -1221,25 +1226,7 @@ RAILWAY_INTERCHANGES = {
 
 RAILWAY_CACHE: Dict[str, Dict[str, Any]] = {}
 RAILWAY_CACHE_TTL_SECONDS = 300
-RAILWAY_HTTP_TIMEOUT_SECONDS = 5.0
-RAILWAY_MAX_CONCURRENT_FETCHES = 6
-
-try:
-    from zoneinfo import ZoneInfo
-    RAILWAY_TZ = ZoneInfo("Asia/Kolkata")
-except Exception:
-    RAILWAY_TZ = None
-
-
-def _rail_now() -> datetime:
-    if RAILWAY_TZ is not None:
-        return datetime.now(RAILWAY_TZ)
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
-
-
-def _rail_current_minutes() -> int:
-    now = _rail_now()
-    return now.hour * 60 + now.minute
+RAILWAY_HTTP_TIMEOUT_SECONDS = 4.5
 
 
 def _rail_normalize(value: Any) -> str:
@@ -1251,36 +1238,32 @@ def _rail_time_to_minutes(value: Any) -> Optional[int]:
         return None
     raw = str(value).strip().upper().replace(".", "")
     raw = re.sub(r"\s+", " ", raw)
-    match = re.search(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)?\b", raw)
+    match = re.match(r"^(\d{1,2}):(\d{2})\s*(AM|PM)?$", raw)
     if not match:
-        match = re.search(r"\b(\d{1,2})\s*(AM|PM)\b", raw)
+        match = re.match(r"^(\d{1,2})\s*(AM|PM)$", raw)
     if not match:
         return None
+
     hour = int(match.group(1))
-    minute = int(match.group(2)) if len(match.groups()) >= 2 and match.group(2).isdigit() else 0
-    meridiem = match.group(3) if len(match.groups()) >= 3 else None
+    minute = int(match.group(2)) if match.group(2).isdigit() else 0
+    meridiem = match.group(3)
+
     if meridiem:
         if hour == 12:
             hour = 0
         if meridiem == "PM":
             hour += 12
+
     if hour > 23 or minute > 59:
         return None
     return hour * 60 + minute
 
 
-def _rail_extract_time(text: str) -> Optional[str]:
-    match = re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[AP]M)?\b", str(text or ""), re.I)
-    return match.group(0).strip() if match else None
-
-
-def _rail_extract_times(text: str) -> List[str]:
-    return re.findall(r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*[AP]M)?\b", str(text or ""), re.I)
-
-
 def _rail_minutes_to_24h(total_minutes: int) -> str:
     total_minutes %= 1440
-    return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+    hour = total_minutes // 60
+    minute = total_minutes % 60
+    return f"{hour:02d}:{minute:02d}"
 
 
 def _rail_minutes_to_12h(total_minutes: int) -> str:
@@ -1288,18 +1271,24 @@ def _rail_minutes_to_12h(total_minutes: int) -> str:
     hour = total_minutes // 60
     minute = total_minutes % 60
     period = "AM" if hour < 12 else "PM"
-    return f"{hour % 12 or 12}:{minute:02d} {period}"
+    display_hour = hour % 12 or 12
+    return f"{display_hour}:{minute:02d} {period}"
 
 
 def _rail_slug_from_station(station: str, line: str = "") -> str:
     raw = str(station or "").strip()
+
+    # First accept app station code.
     upper = raw.upper()
     if upper in RAILWAY_STATIONS:
         return str(RAILWAY_STATIONS[upper]["slug"])
+
+    # Then accept station name.
     norm = _rail_normalize(raw)
-    for data in RAILWAY_STATIONS.values():
+    for code, data in RAILWAY_STATIONS.items():
         if _rail_normalize(data["name"]) == norm:
             return str(data["slug"])
+
     aliases = {
         "mumbaicsmt": "mumbai_cst",
         "mumbaicst": "mumbai_cst",
@@ -1315,6 +1304,8 @@ def _rail_slug_from_station(station: str, line: str = "") -> str:
     }
     if norm in aliases:
         return aliases[norm]
+
+    # Safe generic fallback. The public reference uses underscore slugs.
     return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", raw.lower())).strip("_")
 
 
@@ -1322,52 +1313,88 @@ def _rail_station_display_name(station: str) -> str:
     upper = str(station or "").strip().upper()
     if upper in RAILWAY_STATIONS:
         return str(RAILWAY_STATIONS[upper]["name"])
+
     norm = _rail_normalize(station)
     for data in RAILWAY_STATIONS.values():
         if _rail_normalize(data["name"]) == norm:
             return str(data["name"])
+
     return str(station or "Unknown Station").strip()
 
 
 def _rail_lines_for_station(station: str) -> List[str]:
     name = _rail_station_display_name(station)
-    if name.upper() in RAILWAY_INTERCHANGES:
-        return list(RAILWAY_INTERCHANGES[name.upper()])
+    norm = name.upper()
+
+    # Explicit interchange knowledge first.
+    if norm in RAILWAY_INTERCHANGES:
+        return list(RAILWAY_INTERCHANGES[norm])
+
     lines: List[str] = []
     upper = str(station or "").strip().upper()
     if upper in RAILWAY_STATIONS:
         lines.append(str(RAILWAY_STATIONS[upper]["line"]))
+
     for data in RAILWAY_STATIONS.values():
         if _rail_normalize(data["name"]) == _rail_normalize(name):
             line = str(data["line"])
             if line not in lines:
                 lines.append(line)
+
     return lines
 
 
 def _rail_line_name(line: str) -> str:
-    return {"W": "Western Railway", "C": "Central Railway", "H": "Harbour Line"}.get(
-        str(line).upper(), "Mumbai Suburban Railway"
-    )
+    return {
+        "W": "Western Railway",
+        "C": "Central Railway",
+        "H": "Harbour Line",
+    }.get(str(line).upper(), "Mumbai Suburban Railway")
 
 
 def _rail_route_slug(line: str) -> str:
-    return {"W": "western", "C": "central", "H": "harbour"}.get(str(line).upper(), "western")
+    return {
+        "W": "western",
+        "C": "central",
+        "H": "harbour",
+    }.get(str(line).upper(), "western")
 
 
 def _rail_legacy_station_param(station: str, line: str = "") -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", _rail_station_display_name(station)).strip("_").upper()
+    """Return the station parameter used by Mumbai Lifeline's server-rendered timetable."""
+    name = _rail_station_display_name(station)
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
 
 
-def _rail_route_url(line: str, from_station: str, to_station: str, after_minutes: int, before_minutes: int) -> str:
+def _rail_route_url(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> str:
+    """Return the primary modern Mumbai Lifeline timetable URL."""
+    line_slug = _rail_route_slug(line)
+    from_slug = _rail_slug_from_station(from_station, line)
+    to_slug = _rail_slug_from_station(to_station, line)
+    params = {
+        "after": _rail_minutes_to_24h(after_minutes),
+        "before": _rail_minutes_to_24h(before_minutes),
+    }
     return (
-        f"{RAILWAY_REFERENCE_BASE}/timetable/{_rail_route_slug(line)}/"
-        f"{_rail_slug_from_station(from_station, line)}/{_rail_slug_from_station(to_station, line)}?"
-        f"{urllib.parse.urlencode({'after': _rail_minutes_to_24h(after_minutes), 'before': _rail_minutes_to_24h(before_minutes)})}"
+        f"{RAILWAY_REFERENCE_BASE}/timetable/"
+        f"{line_slug}/{from_slug}/{to_slug}?{urllib.parse.urlencode(params)}"
     )
 
 
-def _rail_legacy_route_url(line: str, from_station: str, to_station: str, after_minutes: int, before_minutes: int) -> str:
+def _rail_legacy_route_url(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> str:
+    """Fallback URL for Mumbai Lifeline's server-rendered timetable.php."""
     params = {
         "Submit": "Submit",
         "sel_route": _rail_route_slug(line),
@@ -1379,23 +1406,38 @@ def _rail_legacy_route_url(line: str, from_station: str, to_station: str, after_
     return f"{RAILWAY_REFERENCE_BASE}/timetable.php?{urllib.parse.urlencode(params)}"
 
 
-def _rail_mobile_route_url(line: str, from_station: str, to_station: str, after_minutes: int) -> str:
+def _rail_mobile_route_url(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+) -> str:
+    """Last-resort lightweight timetable page used when table HTML is unavailable."""
     params = {
         "sfrom": _rail_legacy_station_param(from_station, line),
         "sto": _rail_legacy_station_param(to_station, line),
         "time1": _rail_minutes_to_12h(after_minutes),
     }
-    path = "/m/timetable_western.php" if str(line).upper() == "W" else "/m/timetable.php"
+    if str(line).upper() == "W":
+        path = "/m/timetable_western.php"
+    else:
+        path = "/m/timetable.php"
     return f"{RAILWAY_REFERENCE_BASE}{path}?{urllib.parse.urlencode(params)}"
 
 
-def _rail_candidate_urls(line: str, from_station: str, to_station: str, after_minutes: int, before_minutes: int) -> List[str]:
-    return list(dict.fromkeys([
+def _rail_candidate_urls(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> List[str]:
+    urls = [
         _rail_route_url(line, from_station, to_station, after_minutes, before_minutes),
         _rail_legacy_route_url(line, from_station, to_station, after_minutes, before_minutes),
         _rail_mobile_route_url(line, from_station, to_station, after_minutes),
-    ]))
-
+    ]
+    return list(dict.fromkeys(urls))
 
 def _rail_cache_get(key: str) -> Optional[Dict[str, Any]]:
     item = RAILWAY_CACHE.get(key)
@@ -1408,229 +1450,287 @@ def _rail_cache_get(key: str) -> Optional[Dict[str, Any]]:
 
 
 def _rail_cache_set(key: str, data: Dict[str, Any]) -> None:
-    RAILWAY_CACHE[key] = {"timestamp": time.time(), "data": data}
-    if len(RAILWAY_CACHE) > 120:
-        oldest = min(RAILWAY_CACHE, key=lambda k: float(RAILWAY_CACHE[k].get("timestamp", 0)))
-        RAILWAY_CACHE.pop(oldest, None)
+    RAILWAY_CACHE[key] = {
+        "timestamp": time.time(),
+        "data": data,
+    }
+
+    # Keep memory bounded.
+    if len(RAILWAY_CACHE) > 80:
+        oldest_key = min(
+            RAILWAY_CACHE.keys(),
+            key=lambda k: float(RAILWAY_CACHE[k].get("timestamp", 0)),
+        )
+        RAILWAY_CACHE.pop(oldest_key, None)
 
 
-def _rail_find_header(headers: List[str], candidates: List[str]) -> Optional[int]:
-    normalized = [_rail_normalize(h) for h in headers]
-    for candidate in candidates:
-        wanted = _rail_normalize(candidate)
-        if not wanted:
-            continue
-        for idx, value in enumerate(normalized):
-            if wanted == value or wanted in value or value in wanted:
-                return idx
-    return None
-
-
-def _rail_clean_identifier(value: str) -> str:
+def _rail_clean_train_no(value: str) -> str:
     raw = re.sub(r"\s+", " ", str(value or "").strip())
-    if not raw:
-        return ""
-    raw = re.sub(r"\b(?:MON[–-]SAT|SAT[–-]SUN|DAILY|MON-SAT|SAT-SUN)\b", "", raw, flags=re.I)
+    raw = re.sub(r"\b(MON[–-]SAT|SAT[–-]SUN|DAILY|MON-SAT|SAT-SUN)\b", "", raw, flags=re.I)
     raw = re.sub(r"\s+", " ", raw).strip(" -|")
-    # Prefer an explicit numeric service/train number when present.
-    number = re.search(r"\b\d{4,6}\b", raw)
-    if number:
-        return number.group(0)
-    # Otherwise retain the first short service code (VR, BVI, CCG, etc.).
-    token = re.search(r"\b[A-Z]{2,6}\b", raw.upper())
-    if token and token.group(0) not in {"FAST", "SLOW", "LOCAL", "DAILY", "AC"}:
-        return token.group(0)
-    return raw[:24] if raw else "Local"
-
-
-def _rail_detect_service(identifier: str, speed: str, raw_text: str = "") -> Tuple[str, str]:
-    text = f"{identifier} {speed} {raw_text}".upper()
-    if "AC" in text:
-        return "AC", "Air-conditioned local"
-    if "LADIES" in text or "WOMEN" in text:
-        return "LADIES", "Ladies special"
-    if "FAST" in text:
-        return "F", "Fast"
-    if "SLOW" in text:
-        return "S", "Slow"
-    if "MEDIUM" in text:
-        return "M", "Medium"
-    return "S", "Local"
+    return raw.split(" ")[0] if raw else "—"
 
 
 def _rail_days_from_label(value: str) -> str:
     raw = str(value or "").strip()
+    if not raw:
+        return "Daily / per timetable"
     for token in ["Mon–Sat", "Sat–Sun", "Daily", "Mon-Sat", "Sat-Sun"]:
         if token.lower() in raw.lower():
             return token.replace("–", "-")
     return "As published"
 
 
-def _rail_make_train(
-    *, line: str, from_station: str, to_station: str, dep_raw: str, arr_raw: Optional[str],
-    identifier_raw: str, speed: str, coaches: Any, origin: Any, ending: Any, duration: Any,
-    source_url: str, raw_row: str = ""
-) -> Optional[Dict[str, Any]]:
-    dep_min = _rail_time_to_minutes(dep_raw)
-    if dep_min is None:
-        return None
-    arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
-    if arr_min is not None and arr_min < dep_min:
-        arr_min += 1440
-    service_id = _rail_clean_identifier(identifier_raw)
-    if not service_id:
-        service_id = _rail_clean_identifier(f"{origin or ''} {ending or ''}") or "Local"
-    service_type, service_label = _rail_detect_service(service_id, speed, raw_row)
-    origin_name = str(origin).strip() if origin else _rail_station_display_name(from_station)
-    ending_name = str(ending).strip() if ending else _rail_station_display_name(to_station)
-    return {
-        "time": dep_raw,
-        "departure_time": dep_raw,
-        "arrival_time": arr_raw,
-        "timestamp_minutes": dep_min,
-        "arrival_minutes": arr_min,
-        "departure_minutes": dep_min,
-        "train_no": service_id,
-        "service_id": service_id,
-        "service_code": service_id,
-        "identifier_source": "published timetable service identifier",
-        "name": f"{origin_name} → {ending_name}",
-        "service_type": service_type,
-        "service": service_label,
-        "category": service_label,
-        "platform": None,
-        "platform_note": "Platform not published by the scheduled timetable source.",
-        "status": "Scheduled",
-        "status_msg": "Scheduled timetable entry",
-        "delay_minutes": None,
-        "crowd": None,
-        "door_side": None,
-        "coaches": coaches,
-        "coach_count": coaches,
-        "composition": coaches,
-        "source": _rail_station_display_name(from_station),
-        "destination": _rail_station_display_name(to_station),
-        "origin": origin_name,
-        "ending_at": ending_name,
-        "duration": duration,
-        "days": _rail_days_from_label(identifier_raw),
-        "live": False,
-        "data_source": source_url,
-        "data_source_type": RAILWAY_REFERENCE_LABEL,
-        "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
-    }
+def _rail_detect_service(train_no_cell: str, speed_cell: str) -> Tuple[str, str]:
+    no_text = str(train_no_cell or "").upper()
+    speed = str(speed_cell or "").strip().upper()
+
+    if "AC" in no_text:
+        return "AC", "Air-conditioned local"
+    if "LADIES" in no_text or "WOMEN" in no_text:
+        return "LADIES", "Ladies special"
+    if "FAST" in speed:
+        return "F", "Fast"
+    if "SLOW" in speed:
+        return "S", "Slow"
+    if "MEDIUM" in speed:
+        return "M", "Medium"
+    return "S", speed.title() if speed and speed != "—" else "Local"
 
 
-def _rail_parse_timetable_html(html: str, line: str, from_station: str, to_station: str, source_url: str) -> List[Dict[str, Any]]:
-    """Tolerant parser: header-driven when possible, time-cell inference otherwise."""
-    if not html:
+def _rail_find_header(headers: List[str], candidates: List[str]) -> Optional[int]:
+    normalized_headers = [_rail_normalize(h) for h in headers]
+    for candidate in candidates:
+        candidate_norm = _rail_normalize(candidate)
+        for idx, header_norm in enumerate(normalized_headers):
+            if candidate_norm and candidate_norm in header_norm:
+                return idx
+    return None
+
+
+def _rail_extract_time_candidates(value: str) -> List[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    # Handles both 24-hour and AM/PM timetable cells.
+    return re.findall(r"\b\d{1,2}:\d{2}(?:\s*[APap][Mm])?\b", raw)
+
+
+def _rail_extract_service_identifier(cell: Any) -> str:
+    """Extract the source's service/train identifier without inventing a number."""
+    if cell is None:
+        return "—"
+    try:
+        texts = [cell.get_text(" ", strip=True)]
+        for node in cell.find_all(["button", "a", "span", "strong", "b"]):
+            value = node.get_text(" ", strip=True)
+            if value:
+                texts.append(value)
+        raw = " ".join(dict.fromkeys(texts))
+    except Exception:
+        raw = str(cell).strip()
+
+    raw = re.sub(r"\s+", " ", raw).strip(" -|")
+    if not raw:
+        return "—"
+
+    # Prefer a compact source identifier such as VR, BVI, CSMT, etc.
+    tokens = [x.strip("()[]{}|,-") for x in raw.split() if x.strip()]
+    for token in tokens:
+        if re.fullmatch(r"[A-Za-z]{1,8}\d{0,6}", token):
+            return token.upper()
+    for token in tokens:
+        if re.fullmatch(r"\d{1,6}", token):
+            return token
+    # Keep meaningful source text rather than replacing it with a fake number.
+    return tokens[0] if tokens else "—"
+
+
+def _rail_parse_timetable_html(
+    html: str,
+    line: str,
+    from_station: str,
+    to_station: str,
+    source_url: str,
+) -> List[Dict[str, Any]]:
+    """Robustly parse Mumbai Lifeline timetable tables across layout variations."""
+    if BeautifulSoup is None:
         return []
 
-    tables: List[List[List[str]]] = []
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            for table in soup.find_all("table"):
-                rows = []
-                for row in table.find_all("tr"):
-                    cells = row.find_all(["th", "td"])
-                    values = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)) for c in cells]
-                    if values:
-                        rows.append(values)
-                if rows:
-                    tables.append(rows)
-        except Exception:
-            tables = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
 
-    if not tables:
-        # Dependency-free fallback for environments without beautifulsoup4.
-        row_chunks = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.I | re.S)
-        for chunk in row_chunks:
-            cells = re.findall(r"<(?:th|td)[^>]*>(.*?)</(?:th|td)>", chunk, flags=re.I | re.S)
-            values = []
-            for cell in cells:
-                plain = re.sub(r"<[^>]+>", " ", cell)
-                plain = re.sub(r"\s+", " ", plain).strip()
-                if plain:
-                    values.append(plain)
-            if values:
-                tables.append([values])
-
-    requested_from = _rail_station_display_name(from_station)
-    requested_to = _rail_station_display_name(to_station)
     trains: List[Dict[str, Any]] = []
+    requested_from_name = _rail_station_display_name(from_station)
+    requested_to_name = _rail_station_display_name(to_station)
+    from_norms = {
+        _rail_normalize(requested_from_name),
+        _rail_normalize(from_station),
+        _rail_normalize(_rail_legacy_station_param(from_station)),
+    }
+    to_norms = {
+        _rail_normalize(requested_to_name),
+        _rail_normalize(to_station),
+        _rail_normalize(_rail_legacy_station_param(to_station)),
+    }
 
-    for rows in tables:
-        header_idx: Optional[int] = None
-        headers: List[str] = []
-        for i, row in enumerate(rows[:80]):
-            norm = [_rail_normalize(x) for x in row]
-            has_station = any(_rail_normalize(requested_from) in x or _rail_normalize(from_station) in x for x in norm)
-            has_timetable_meta = any(
-                any(key in x for key in ("trainno", "trainnumber", "train", "speed", "coaches", "originatingfrom", "endingat", "duration"))
-                for x in norm
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+
+        header_row_index: Optional[int] = None
+        header_cells: List[str] = []
+
+        # Do not require the station name to be present in the header. Some
+        # source variants use station codes or abbreviated headings.
+        for row_index, row in enumerate(rows[:80]):
+            cells = row.find_all(["th", "td"])
+            candidate = [cell.get_text(" ", strip=True) for cell in cells]
+            normalized = [_rail_normalize(x) for x in candidate]
+            has_train = any(
+                ("trainno" in x) or ("trainnumber" in x) or x == "train"
+                for x in normalized
             )
-            if has_station and has_timetable_meta:
-                header_idx, headers = i, row
-                break
-            if has_timetable_meta and len(row) >= 4:
-                header_idx, headers = i, row
-                break
-
-        train_idx = _rail_find_header(headers, ["Train No", "Train Number", "Service", "Train"]) if headers else None
-        speed_idx = _rail_find_header(headers, ["Speed"]) if headers else None
-        coach_idx = _rail_find_header(headers, ["Coaches", "Coach"]) if headers else None
-        origin_idx = _rail_find_header(headers, ["Originating From", "Origin"]) if headers else None
-        ending_idx = _rail_find_header(headers, ["Ending At", "Destination", "End"]) if headers else None
-        duration_idx = _rail_find_header(headers, ["Duration", "Travel Time"]) if headers else None
-        dep_idx = _rail_find_header(headers, [requested_from, from_station, _rail_legacy_station_param(from_station, line)]) if headers else None
-        arr_idx = _rail_find_header(headers, [requested_to, to_station, _rail_legacy_station_param(to_station, line)]) if headers else None
-
-        data_rows = rows[(header_idx + 1) if header_idx is not None else 0:]
-        for row in data_rows:
-            if not row:
-                continue
-            row_text = " | ".join(row)
-            times_by_cell: List[Tuple[int, str]] = []
-            for idx, cell in enumerate(row):
-                t = _rail_extract_time(cell)
-                if t:
-                    times_by_cell.append((idx, t))
-            if not times_by_cell:
-                continue
-
-            if dep_idx is not None and dep_idx < len(row):
-                dep_raw = _rail_extract_time(row[dep_idx])
-            else:
-                dep_raw = times_by_cell[0][1]
-            if not dep_raw:
-                continue
-
-            if arr_idx is not None and arr_idx < len(row):
-                arr_raw = _rail_extract_time(row[arr_idx])
-            else:
-                arr_raw = times_by_cell[1][1] if len(times_by_cell) > 1 else None
-
-            identifier_raw = row[train_idx] if train_idx is not None and train_idx < len(row) else ""
-            # If the train/service column is absent, use non-time text from the
-            # first few cells rather than returning a meaningless em dash.
-            if not identifier_raw:
-                identifier_raw = "Local"
-
-            speed = row[speed_idx] if speed_idx is not None and speed_idx < len(row) else ""
-            coaches = row[coach_idx] if coach_idx is not None and coach_idx < len(row) else None
-            origin = row[origin_idx] if origin_idx is not None and origin_idx < len(row) else None
-            ending = row[ending_idx] if ending_idx is not None and ending_idx < len(row) else None
-            duration = row[duration_idx] if duration_idx is not None and duration_idx < len(row) else None
-
-            train = _rail_make_train(
-                line=line, from_station=from_station, to_station=to_station,
-                dep_raw=dep_raw, arr_raw=arr_raw, identifier_raw=identifier_raw,
-                speed=speed, coaches=coaches, origin=origin, ending=ending,
-                duration=duration, source_url=source_url, raw_row=row_text,
+            has_speed = any("speed" in x for x in normalized)
+            has_coach = any("coach" in x for x in normalized)
+            has_origin = any("origin" in x or "originating" in x for x in normalized)
+            has_time_header = any(
+                any(name and name in x for name in from_norms | to_norms)
+                for x in normalized
             )
-            if train:
-                trains.append(train)
+            if has_train or (has_speed and has_coach) or (has_origin and has_time_header):
+                header_row_index = row_index
+                header_cells = candidate
+                break
+
+        # Some mobile/server-rendered variants have no conventional header.
+        if header_row_index is None:
+            for row_index, row in enumerate(rows[:20]):
+                cells = row.find_all(["th", "td"])
+                values = [c.get_text(" ", strip=True) for c in cells]
+                if len(values) >= 3 and sum(bool(_rail_extract_time_candidates(v)) for v in values) >= 1:
+                    header_row_index = row_index - 1 if row_index > 0 else 0
+                    header_cells = [c.get_text(" ", strip=True) for c in rows[header_row_index].find_all(["th", "td"])]
+                    break
+
+        if header_row_index is None:
+            continue
+
+        train_idx = _rail_find_header(header_cells, ["Train No", "Train Number", "Train", "Service"])
+        speed_idx = _rail_find_header(header_cells, ["Speed", "Type"])
+        coach_idx = _rail_find_header(header_cells, ["Coaches", "Coach"])
+        origin_idx = _rail_find_header(header_cells, ["Originating From", "Origin", "Starts"])
+        ending_idx = _rail_find_header(header_cells, ["Ending At", "Destination", "Ends"])
+        duration_idx = _rail_find_header(header_cells, ["Duration", "Travel Time"])
+        from_time_idx = _rail_find_header(
+            header_cells,
+            [requested_from_name, from_station, _rail_legacy_station_param(from_station)],
+        )
+        to_time_idx = _rail_find_header(
+            header_cells,
+            [requested_to_name, to_station, _rail_legacy_station_param(to_station)],
+        )
+
+        for row in rows[header_row_index + 1:]:
+            cells = row.find_all(["th", "td"])
+            values = [c.get_text(" ", strip=True) for c in cells]
+            if not values:
+                continue
+
+            # Determine departure column from the named header first. If that
+            # fails, choose the first column containing a valid time.
+            dep_idx = from_time_idx
+            if dep_idx is None or dep_idx >= len(values):
+                time_indices = [i for i, v in enumerate(values) if _rail_extract_time_candidates(v)]
+                if not time_indices:
+                    continue
+                dep_idx = time_indices[0]
+
+            dep_candidates = _rail_extract_time_candidates(values[dep_idx])
+            if not dep_candidates:
+                continue
+            dep_raw = dep_candidates[0]
+            dep_min = _rail_time_to_minutes(dep_raw)
+            if dep_min is None:
+                continue
+
+            # Arrival is normally the next station column. Prefer the named
+            # destination column, otherwise use another time-bearing cell.
+            arr_raw = ""
+            if to_time_idx is not None and to_time_idx < len(values) and to_time_idx != dep_idx:
+                candidates = _rail_extract_time_candidates(values[to_time_idx])
+                if candidates:
+                    arr_raw = candidates[0]
+            if not arr_raw:
+                for i, value in enumerate(values):
+                    if i == dep_idx:
+                        continue
+                    candidates = _rail_extract_time_candidates(value)
+                    if candidates:
+                        arr_raw = candidates[0]
+                        break
+
+            arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
+            if arr_min is not None and arr_min < dep_min:
+                arr_min += 1440
+
+            train_cell = values[train_idx] if train_idx is not None and train_idx < len(values) else ""
+            identifier = _rail_extract_service_identifier(cells[train_idx] if train_idx is not None and train_idx < len(cells) else (cells[0] if cells else None))
+            if identifier == "—" and train_cell:
+                identifier = _rail_extract_service_identifier(cells[train_idx] if train_idx is not None and train_idx < len(cells) else None)
+
+            speed = values[speed_idx] if speed_idx is not None and speed_idx < len(values) else ""
+            coaches = values[coach_idx] if coach_idx is not None and coach_idx < len(values) else None
+            origin = values[origin_idx] if origin_idx is not None and origin_idx < len(values) else None
+            ending = values[ending_idx] if ending_idx is not None and ending_idx < len(values) else None
+            duration = values[duration_idx] if duration_idx is not None and duration_idx < len(values) else None
+
+            # Never treat a raw station/time value as a train number.
+            if identifier in {requested_from_name, requested_to_name, dep_raw, arr_raw}:
+                identifier = "—"
+
+            service_type, service_label = _rail_detect_service(
+                f"{train_cell} {identifier}", speed
+            )
+            name_origin = origin or requested_from_name
+            name_destination = ending or requested_to_name
+
+            trains.append({
+                "time": dep_raw,
+                "departure_time": dep_raw,
+                "arrival_time": arr_raw or None,
+                "timestamp_minutes": dep_min,
+                "arrival_minutes": arr_min,
+                "train_no": identifier,
+                "service_id": identifier,
+                "name": f"{name_origin} → {name_destination}",
+                "service_type": service_type,
+                "service": service_label,
+                "category": service_label,
+                "platform": None,
+                "platform_note": "Platform not published in this timetable response.",
+                "status": "Scheduled",
+                "status_msg": "Scheduled timetable entry",
+                "delay_minutes": None,
+                "crowd": None,
+                "door_side": None,
+                "coaches": coaches,
+                "coach_count": coaches,
+                "composition": coaches,
+                "source": requested_from_name,
+                "destination": requested_to_name,
+                "origin": origin,
+                "ending_at": ending,
+                "duration": duration,
+                "days": _rail_days_from_label(train_cell),
+                "live": False,
+                "data_source": source_url,
+                "data_source_type": RAILWAY_REFERENCE_LABEL,
+                "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+            })
 
         if trains:
             break
@@ -1638,50 +1738,113 @@ def _rail_parse_timetable_html(html: str, line: str, from_station: str, to_stati
     unique: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
     for train in trains:
         key = (
-            str(train.get("service_id", "")),
+            str(train.get("train_no", "—")),
             int(train.get("timestamp_minutes", -1)),
             str(train.get("destination", "")),
-            str(train.get("arrival_time", "")),
+            str(train.get("name", "")),
         )
+        unique[key] = train
+
+    return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
+
+def _rail_parse_mobile_timetable_html(
+    html: str,
+    line: str,
+    from_station: str,
+    to_station: str,
+    source_url: str,
+) -> List[Dict[str, Any]]:
+    """Parse the lightweight Mumbai Lifeline timetable as a final fallback."""
+    if BeautifulSoup is None:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text("\n", strip=True)
+    except Exception:
+        return []
+
+    station = re.escape(_rail_station_display_name(from_station))
+    pattern = re.compile(
+        rf"^{station}\s+to\s+(.+?)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)$",
+        re.I,
+    )
+
+    trains: List[Dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line_text = re.sub(r"\s+", " ", raw_line).strip()
+        match = pattern.match(line_text)
+        if not match:
+            continue
+
+        destination = match.group(1).strip()
+        dep_raw = match.group(2).strip()
+        arr_raw = match.group(3).strip()
+        dep_min = _rail_time_to_minutes(dep_raw)
+        arr_min = _rail_time_to_minutes(arr_raw)
+        if dep_min is None:
+            continue
+        if arr_min is not None and arr_min < dep_min:
+            arr_min += 1440
+
+        trains.append({
+            "time": dep_raw,
+            "departure_time": dep_raw,
+            "arrival_time": arr_raw,
+            "timestamp_minutes": dep_min,
+            "arrival_minutes": arr_min,
+            "train_no": "—",
+            "name": f"{_rail_station_display_name(from_station)} → {destination}",
+            "service_type": "S",
+            "service": "Scheduled local",
+            "category": "Scheduled local",
+            "platform": None,
+            "status": "Scheduled",
+            "status_msg": "Scheduled timetable entry",
+            "delay_minutes": None,
+            "coaches": None,
+            "coach_count": None,
+            "composition": None,
+            "source": _rail_station_display_name(from_station),
+            "destination": destination,
+            "origin": _rail_station_display_name(from_station),
+            "ending_at": destination,
+            "duration": None,
+            "days": "As published",
+            "live": False,
+            "data_source": source_url,
+            "data_source_type": RAILWAY_REFERENCE_LABEL,
+            "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+        })
+
+    unique: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    for train in trains:
+        key = (str(train.get("name")), int(train.get("timestamp_minutes", -1)), str(train.get("arrival_time")))
         unique[key] = train
     return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
 
 
-def _rail_parse_mobile_timetable_html(html: str, line: str, from_station: str, to_station: str, source_url: str) -> List[Dict[str, Any]]:
-    if not html:
-        return []
-    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
-    pattern = re.compile(
-        rf"{re.escape(_rail_station_display_name(from_station))}\s+to\s+(.+?)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)",
-        re.I,
-    )
-    trains = []
-    for match in pattern.finditer(text):
-        destination, dep_raw, arr_raw = match.groups()
-        train = _rail_make_train(
-            line=line, from_station=from_station, to_station=to_station,
-            dep_raw=dep_raw, arr_raw=arr_raw, identifier_raw="Local",
-            speed="", coaches=None, origin=_rail_station_display_name(from_station),
-            ending=destination, duration=None, source_url=source_url,
-        )
-        if train:
-            trains.append(train)
-    return sorted(trains, key=lambda x: int(x.get("timestamp_minutes", 0)))
-
-
-async def _rail_fetch_timetable(line: str, from_station: str, to_station: str, after_minutes: int, before_minutes: int) -> Dict[str, Any]:
+async def _rail_fetch_timetable(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> Dict[str, Any]:
+    """Fetch one timetable quickly, concurrently testing source variants."""
     line = str(line).upper()
     from_name = _rail_station_display_name(from_station)
     to_name = _rail_station_display_name(to_station)
     source_urls = _rail_candidate_urls(line, from_station, to_station, after_minutes, before_minutes)
+    primary_url = source_urls[0]
+
     cache_key = f"{line}|{from_name}|{to_name}|{after_minutes}|{before_minutes}"
     cached = _rail_cache_get(cache_key)
-    if cached is not None:
+    if cached is not None and cached.get("trains"):
         return cached
 
-    result: Dict[str, Any] = {
+    result = {
         "trains": [],
-        "source_url": source_urls[0],
+        "source_url": primary_url,
         "source_urls": source_urls,
         "source_label": RAILWAY_REFERENCE_LABEL,
         "line": line,
@@ -1689,7 +1852,7 @@ async def _rail_fetch_timetable(line: str, from_station: str, to_station: str, a
         "from": from_name,
         "to": to_name,
         "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
-        "retrieved_at": _rail_now().isoformat(),
+        "retrieved_at": datetime.now().astimezone().isoformat(),
         "error": None,
     }
 
@@ -1699,140 +1862,157 @@ async def _rail_fetch_timetable(line: str, from_station: str, to_station: str, a
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    async def fetch(url: str) -> Tuple[str, Optional[str]]:
+    async def fetch_one(client: httpx.AsyncClient, url: str) -> Tuple[str, Optional[httpx.Response], Optional[str]]:
         try:
-            timeout = httpx.Timeout(RAILWAY_HTTP_TIMEOUT_SECONDS, connect=3.0)
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=timeout,
-                headers=headers,
-            ) as client:
-                response = await client.get(url)
+            response = await client.get(url)
             if response.status_code != 200:
-                return url, f"HTTP {response.status_code}"
-            return str(response.url), response.text
+                return url, response, f"HTTP {response.status_code}"
+            return url, response, None
         except Exception as exc:
-            return url, f"{type(exc).__name__}: {exc}"
+            return url, None, f"{type(exc).__name__}: {exc}"
 
-    # Primary and legacy endpoints are attempted together. This is the key
-    # timeout fix: a failed primary source no longer blocks every other route.
-    first_wave = await asyncio.gather(*(fetch(url) for url in source_urls[:2]))
-    diagnostics: List[str] = []
-    for requested_url, payload in first_wave:
-        if payload and not payload.startswith(("HTTP ", "TimeoutException", "ConnectError", "ReadTimeout", "ConnectTimeout")):
-            parsed = _rail_parse_timetable_html(
-                payload,
-                line,
-                from_station,
-                to_station,
-                requested_url,
-            )
-            if parsed:
-                result.update({
-                    "trains": parsed,
-                    "source_url": requested_url,
-                    "source_used": "timetable",
-                    "error": None,
-                })
-                _rail_cache_set(cache_key, result)
-                return result
-            diagnostics.append("No timetable rows parsed")
-        elif payload:
-            diagnostics.append(payload)
+    errors: List[str] = []
+    try:
+        timeout = httpx.Timeout(
+            connect=2.5,
+            read=RAILWAY_HTTP_TIMEOUT_SECONDS,
+            write=2.5,
+            pool=2.5,
+        )
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            headers=headers,
+        ) as client:
+            # Run the three source variants together. This prevents the station
+            # board from serially waiting 10s + 10s + 10s for fallbacks.
+            responses = await asyncio.gather(*(fetch_one(client, url) for url in source_urls))
 
-    # Last-resort mobile page only after the two normal endpoints fail.
-    if len(source_urls) >= 3:
-        requested_url, payload = await fetch(source_urls[2])
-        if payload and not payload.startswith(("HTTP ", "TimeoutException", "ConnectError", "ReadTimeout", "ConnectTimeout")):
+        # Prefer the modern timetable page, then legacy, then mobile fallback.
+        for url, response, error in responses:
+            if error:
+                errors.append(f"{error}: {url}")
+                continue
+            if response is None:
+                continue
+
             parsed = _rail_parse_timetable_html(
-                payload,
-                line,
-                from_station,
-                to_station,
-                requested_url,
+                html=response.text,
+                line=line,
+                from_station=from_station,
+                to_station=to_station,
+                source_url=str(response.url),
             )
-            if not parsed:
+            if not parsed and "/m/" in str(response.url):
                 parsed = _rail_parse_mobile_timetable_html(
-                    payload,
-                    line,
-                    from_station,
-                    to_station,
-                    requested_url,
+                    html=response.text,
+                    line=line,
+                    from_station=from_station,
+                    to_station=to_station,
+                    source_url=str(response.url),
                 )
+
             if parsed:
-                result.update({
-                    "trains": parsed,
-                    "source_url": requested_url,
-                    "source_used": "mobile",
-                    "error": None,
-                })
+                result["trains"] = parsed
+                result["source_url"] = str(response.url)
+                result["source_used"] = "mobile" if "/m/" in str(response.url) else "timetable"
+                result["error"] = None
+                result["source_errors"] = []
                 _rail_cache_set(cache_key, result)
                 return result
-            diagnostics.append("No mobile timetable rows parsed")
-        elif payload:
-            diagnostics.append(payload)
 
+            errors.append(f"No timetable rows parsed: {url}")
+
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+
+    # Keep diagnostics for logs/debugging, but do not make the Flutter UI
+    # depend on verbose parser/URL details.
     result["error"] = "Timetable temporarily unavailable."
-    result["diagnostic_errors"] = diagnostics[-4:]
+    result["source_errors"] = errors[-3:]
+    result["data_available"] = False
     _rail_cache_set(cache_key, result)
     return result
 
-
-async def _rail_fetch_many(requests_list: List[Tuple[str, str, str, int, int]]) -> List[Dict[str, Any]]:
-    semaphore = asyncio.Semaphore(RAILWAY_MAX_CONCURRENT_FETCHES)
-
-    async def one(item: Tuple[str, str, str, int, int]) -> Dict[str, Any]:
-        async with semaphore:
-            return await _rail_fetch_timetable(*item)
-
-    if not requests_list:
-        return []
-    return list(await asyncio.gather(*(one(item) for item in requests_list), return_exceptions=False))
-
-
-def _rail_filter_trains(trains: List[Dict[str, Any]], service: str) -> List[Dict[str, Any]]:
+def _rail_filter_trains(
+    trains: List[Dict[str, Any]],
+    service: str,
+) -> List[Dict[str, Any]]:
     wanted = str(service or "ALL").strip().upper()
     if wanted in {"", "ALL"}:
         return list(trains)
-    output = []
+
+    output: List[Dict[str, Any]] = []
     for train in trains:
         service_type = str(train.get("service_type", "")).upper()
         label = str(train.get("service", "")).upper()
+        category = str(train.get("category", "")).upper()
+
         if wanted == "FAST" and (service_type == "F" or "FAST" in label):
             output.append(train)
         elif wanted == "SLOW" and (service_type == "S" or "SLOW" in label):
             output.append(train)
-        elif wanted == "AC" and (service_type == "AC" or "AC" in label):
+        elif wanted == "AC" and (service_type == "AC" or "AC" in label or "AC" in category):
             output.append(train)
-        elif wanted == "LADIES" and (service_type == "LADIES" or "LADIES" in label or "WOMEN" in label):
+        elif wanted == "LADIES" and (
+            service_type == "LADIES"
+            or "LADIES" in label
+            or "WOMEN" in category
+        ):
             output.append(train)
+
     return output
 
 
 def _rail_default_board_targets(station: str, line: str) -> List[str]:
-    norm = _rail_normalize(_rail_station_display_name(station))
+    station_name = _rail_station_display_name(station)
+    norm = _rail_normalize(station_name)
+
     if line == "W":
+        targets = ["churchgate", "virar"]
         if norm == _rail_normalize("Churchgate"):
-            return ["virar", "borivali"]
-        if norm == _rail_normalize("Virar"):
-            return ["churchgate", "dahanu_road"]
-        if norm in {_rail_normalize("Palghar"), _rail_normalize("Boisar"), _rail_normalize("Dahanu Road")}:
-            return ["churchgate", "virar"]
-        return ["churchgate", "virar"]
+            targets = ["virar", "borivali"]
+        elif norm == _rail_normalize("Virar"):
+            targets = ["churchgate", "dahanu_road"]
+        elif norm in {
+            _rail_normalize("Palghar"),
+            _rail_normalize("Boisar"),
+            _rail_normalize("Dahanu Road"),
+        }:
+            targets = ["churchgate", "virar"]
+        return targets
+
     if line == "C":
+        # Main-line board. At Kalyan and key junctions include the branches.
         if norm == _rail_normalize("Kalyan"):
             return ["mumbai_cst", "kasara", "khopoli"]
+        if norm in {
+            _rail_normalize("Karjat"),
+            _rail_normalize("Neral"),
+            _rail_normalize("Badlapur"),
+            _rail_normalize("Ambernath"),
+        }:
+            return ["mumbai_cst", "kalyan"]
+        if norm in {_rail_normalize("Kasara"), _rail_normalize("Asangaon"), _rail_normalize("Vasind"), _rail_normalize("Titwala")}:
+            return ["mumbai_cst", "kalyan"]
         if norm == _rail_normalize("Mumbai CST"):
             return ["kalyan", "khopoli", "kasara"]
-        if norm in {_rail_normalize("Karjat"), _rail_normalize("Neral"), _rail_normalize("Badlapur"), _rail_normalize("Ambernath"), _rail_normalize("Kasara"), _rail_normalize("Asangaon"), _rail_normalize("Vasind"), _rail_normalize("Titwala")}:
-            return ["mumbai_cst", "kalyan"]
         return ["mumbai_cst", "kalyan"]
+
     if line == "H":
         if norm == _rail_normalize("Mumbai CST"):
             return ["panvel", "goregaon_hr", "andheri_hr"]
+        if norm in {
+            _rail_normalize("Vadala Road"),
+            _rail_normalize("Bandra"),
+            _rail_normalize("Andheri"),
+            _rail_normalize("Goregaon"),
+        }:
+            return ["mumbai_cst", "panvel"]
         if norm == _rail_normalize("Panvel"):
             return ["mumbai_cst", "goregaon_hr"]
         return ["mumbai_cst", "panvel"]
+
     return []
 
 
@@ -1844,93 +2024,197 @@ def _rail_station_name_from_slug(slug: str) -> str:
     return slug.replace("_", " ").title()
 
 
-def _rail_resolve_line_for_pair(from_station: str, to_station: str, requested_line: str) -> Tuple[Optional[str], Optional[str]]:
+def _rail_resolve_line_for_pair(
+    from_station: str,
+    to_station: str,
+    requested_line: str,
+) -> Tuple[Optional[str], Optional[str]]:
     requested = str(requested_line or "ALL").upper()
     from_lines = _rail_lines_for_station(from_station)
     to_lines = _rail_lines_for_station(to_station)
+
     if requested in {"W", "C", "H"}:
         if requested in from_lines and requested in to_lines:
             return requested, None
         return requested, "Selected line does not directly serve both stations."
+
     common = [line for line in ["W", "C", "H"] if line in from_lines and line in to_lines]
     if common:
         return common[0], None
+
     if from_lines and to_lines:
         return None, "Interchange route required."
+
     return None, "Could not identify a Mumbai suburban line for one or both stations."
 
 
-async def _rail_cross_line_route(from_station: str, to_station: str, from_lines: List[str], to_lines: List[str]) -> Dict[str, Any]:
-    rules = [
-        ("Dadar", "W", "C"), ("Andheri", "W", "H"), ("Kurla", "C", "H"),
-        ("Mumbai CST", "C", "H"), ("Bandra", "W", "H"), ("Mahim", "W", "H"),
+async def _rail_cross_line_route(
+    from_station: str,
+    to_station: str,
+    from_lines: List[str],
+    to_lines: List[str],
+) -> Dict[str, Any]:
+    # Pick the most common/simple interchange so the backend stays lightweight.
+    interchange_rules = [
+        ("Dadar", "W", "C"),
+        ("Andheri", "W", "H"),
+        ("Kurla", "C", "H"),
+        ("Mumbai CST", "C", "H"),
+        ("Bandra", "W", "H"),
+        ("Mahim", "W", "H"),
     ]
+
     choice = None
-    for interchange, line_a, line_b in rules:
+    for interchange, line_a, line_b in interchange_rules:
         if line_a in from_lines and line_b in to_lines:
-            choice = (interchange, line_a, line_b); break
+            choice = (interchange, line_a, line_b)
+            break
         if line_b in from_lines and line_a in to_lines:
-            choice = (interchange, line_b, line_a); break
+            choice = (interchange, line_b, line_a)
+            break
+
     if choice is None:
-        return {"trains": [], "requires_interchange": True, "interchange_options": [], "message": "Stations are on different suburban lines. Choose an interchange station such as Dadar, Andheri, Kurla or Mumbai CST."}
+        return {
+            "trains": [],
+            "requires_interchange": True,
+            "interchange_options": [],
+            "message": "Stations are on different suburban lines. Choose an interchange station such as Dadar, Andheri, Kurla or Mumbai CST.",
+        }
 
     interchange, first_line, second_line = choice
-    now_min = _rail_current_minutes()
-    end_min = min(now_min + 180, 1439)
-    results = await _rail_fetch_many([
-        (first_line, from_station, interchange, now_min, end_min),
-        (second_line, interchange, to_station, now_min, end_min),
-    ])
-    first_trains = results[0].get("trains", [])
-    second_trains = results[1].get("trains", [])
-    journeys = []
+    now = datetime.now()
+    start_min = now.hour * 60 + now.minute
+    window_end = min(start_min + 180, 1439)
+
+    first = await _rail_fetch_timetable(
+        first_line,
+        from_station,
+        interchange,
+        start_min,
+        window_end,
+    )
+    second = await _rail_fetch_timetable(
+        second_line,
+        interchange,
+        to_station,
+        start_min,
+        window_end,
+    )
+
+    first_trains = first.get("trains", [])
+    second_trains = second.get("trains", [])
+
+    journeys: List[Dict[str, Any]] = []
+
     for leg1 in first_trains:
-        arr = leg1.get("arrival_minutes")
-        if arr is None: continue
+        leg1_arrival = leg1.get("arrival_minutes")
+        if leg1_arrival is None:
+            continue
+
         for leg2 in second_trains:
-            dep2 = leg2.get("timestamp_minutes")
-            if dep2 is None: continue
-            effective_arr = int(arr)
-            if effective_arr < int(leg1.get("timestamp_minutes", 0)): effective_arr += 1440
-            connection = int(dep2) - effective_arr
+            leg2_depart = leg2.get("timestamp_minutes")
+            if leg2_depart is None:
+                continue
+
+            effective_arrival = int(leg1_arrival)
+            if effective_arrival < int(leg1.get("timestamp_minutes", 0)):
+                effective_arrival += 1440
+
+            connection = int(leg2_depart) - effective_arrival
             if 5 <= connection <= 40:
+                leg2_arrival = leg2.get("arrival_minutes")
+                duration_text = "Scheduled interchange"
+
+                if leg2_arrival is not None:
+                    total_duration = int(leg2_arrival) - int(leg1.get("timestamp_minutes", 0))
+                    if total_duration < 0:
+                        total_duration += 1440
+                    hours = total_duration // 60
+                    minutes = total_duration % 60
+                    duration_text = f"{hours}h {minutes}m" if hours else f"{minutes} min"
+
                 journeys.append({
-                    "time": leg1.get("departure_time"), "departure_time": leg1.get("departure_time"),
-                    "arrival_time": leg2.get("arrival_time"), "timestamp_minutes": leg1.get("timestamp_minutes"),
-                    "train_no": f"{leg1.get('service_id', 'Local')} + {leg2.get('service_id', 'Local')}",
-                    "service_id": f"{leg1.get('service_id', 'Local')} + {leg2.get('service_id', 'Local')}",
-                    "name": f"{_rail_station_display_name(from_station)} → {interchange} → {_rail_station_display_name(to_station)}",
-                    "service_type": "CHANGE", "service": "Interchange", "category": "Connected route",
-                    "status": f"Scheduled • Change at {interchange}", "status_msg": f"Change at {interchange} • {connection} min connection",
-                    "delay_minutes": None, "platform": None, "door_side": None, "coaches": None,
-                    "source": _rail_station_display_name(from_station), "destination": _rail_station_display_name(to_station),
-                    "origin": _rail_station_display_name(from_station), "ending_at": _rail_station_display_name(to_station),
-                    "duration": "Scheduled interchange", "days": "As published", "live": False,
-                    "interchange": interchange, "connection_minutes": connection,
-                    "leg_1": leg1, "leg_2": leg2,
+                    "time": leg1.get("departure_time"),
+                    "departure_time": leg1.get("departure_time"),
+                    "arrival_time": leg2.get("arrival_time"),
+                    "timestamp_minutes": leg1.get("timestamp_minutes"),
+                    "train_no": f"{leg1.get('train_no', '—')} + {leg2.get('train_no', '—')}",
+                    "name": f"{from_station} → {interchange} → {to_station}",
+                    "service_type": "CHANGE",
+                    "service": "Interchange",
+                    "category": "Connected route",
+                    "platform": None,
+                    "status": f"Scheduled • Change at {interchange}",
+                    "status_msg": f"Change at {interchange} • {connection} min connection",
+                    "delay_minutes": None,
+                    "crowd": None,
+                    "door_side": None,
+                    "coaches": None,
+                    "source": _rail_station_display_name(from_station),
+                    "destination": _rail_station_display_name(to_station),
+                    "origin": _rail_station_display_name(from_station),
+                    "ending_at": _rail_station_display_name(to_station),
+                    "duration": duration_text,
+                    "days": "As published",
+                    "live": False,
+                    "interchange": interchange,
+                    "connection_minutes": connection,
+                    "leg_1": leg1,
+                    "leg_2": leg2,
+                    "data_source": [
+                        first.get("source_url"),
+                        second.get("source_url"),
+                    ],
                     "data_source_type": RAILWAY_REFERENCE_LABEL,
+                    "timetable_version": (
+                        f"{RAILWAY_TIMETABLE_VERSIONS.get(first_line, 'Unknown')} / "
+                        f"{RAILWAY_TIMETABLE_VERSIONS.get(second_line, 'Unknown')}"
+                    ),
                 })
                 break
-        if len(journeys) >= 12: break
-    journeys.sort(key=lambda x: int(x.get("timestamp_minutes", 0)))
+
+        if len(journeys) >= 12:
+            break
+
+    journeys.sort(key=lambda item: int(item.get("timestamp_minutes", 0)))
+
     return {
-        "trains": journeys[:12], "next_trains": journeys[:12], "full_day_timetable": [],
-        "requires_interchange": True, "interchange": interchange,
-        "from": _rail_station_display_name(from_station), "to": _rail_station_display_name(to_station),
-        "line": f"{first_line}+{second_line}", "line_name": f"{_rail_line_name(first_line)} + {_rail_line_name(second_line)}",
+        "trains": journeys[:12],
+        "requires_interchange": True,
+        "interchange": interchange,
+        "from": _rail_station_display_name(from_station),
+        "to": _rail_station_display_name(to_station),
+        "line": f"{first_line}+{second_line}",
+        "line_name": f"{_rail_line_name(first_line)} + {_rail_line_name(second_line)}",
         "source_label": RAILWAY_REFERENCE_LABEL,
     }
 
 
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
-    """Railway gateway. Timetable data is scheduled; live values are never fabricated."""
+    """
+    Backward-compatible railway gateway.
+
+    Supported query_type values:
+      - station_board
+      - route_search
+      - live_train
+      - pnr
+
+    The Flutter client can continue using the same endpoint and payload shape.
+    """
+
     try:
         content_type = request.headers.get("content-type", "").lower()
+
+        query_type = "station_board"
+        query_value: Any = ""
+        target_language = "English"
+
         if "application/json" in content_type:
             body = await request.json()
             query_type = str(body.get("query_type", "station_board"))
-            query_value: Any = body.get("query_value", "")
+            query_value = body.get("query_value", "")
             target_language = str(body.get("target_language", "English"))
         else:
             form = await request.form()
@@ -1940,149 +2224,341 @@ async def railway_inquiry(request: Request):
 
         normalized_type = query_type.strip().lower()
 
+        # ----------------------------- ROUTE SEARCH -----------------------------
         if normalized_type == "route_search":
             try:
-                payload = json.loads(str(query_value)) if query_value else {}
+                route_payload = json.loads(str(query_value)) if query_value else {}
             except Exception:
-                payload = {}
-            from_station = str(payload.get("from") or payload.get("source") or payload.get("from_station") or "BSR").strip()
-            to_station = str(payload.get("to") or payload.get("destination") or payload.get("to_station") or "DDR").strip()
-            requested_line = str(payload.get("line") or "ALL").upper()
-            requested_service = str(payload.get("service") or "ALL").upper()
-            if _rail_normalize(from_station) == _rail_normalize(to_station):
-                return {"status": "error", "type": "route_search", "message": "Origin and destination cannot be the same station.", "trains": []}
+                route_payload = {}
 
-            direct_line, line_error = _rail_resolve_line_for_pair(from_station, to_station, requested_line)
-            if direct_line and not line_error:
-                now_min = _rail_current_minutes()
-                end_min = min(now_min + 180, 1439)
-                result = await _rail_fetch_timetable(direct_line, from_station, to_station, now_min, end_min)
-                trains = _rail_filter_trains(result.get("trains", []), requested_service)
-                trains = [t for t in trains if int(t.get("timestamp_minutes", -1)) >= now_min]
+            from_station = str(
+                route_payload.get("from")
+                or route_payload.get("source")
+                or route_payload.get("from_station")
+                or "BSR"
+            ).strip()
+
+            to_station = str(
+                route_payload.get("to")
+                or route_payload.get("destination")
+                or route_payload.get("to_station")
+                or "DDR"
+            ).strip()
+
+            requested_line = str(route_payload.get("line") or "ALL").upper()
+            requested_service = str(route_payload.get("service") or "ALL").upper()
+
+            if _rail_normalize(from_station) == _rail_normalize(to_station):
                 return {
-                    "status": "success", "type": "route_search", "station_code": str(from_station).upper(),
-                    "station_name": _rail_station_display_name(from_station), "from": _rail_station_display_name(from_station),
-                    "to": _rail_station_display_name(to_station), "line": direct_line, "line_name": _rail_line_name(direct_line),
-                    "trains": trains[:20], "next_trains": trains[:12], "full_day_timetable": [],
-                    "route_search": True, "requires_interchange": False, "service_filter": requested_service,
-                    "current_time": _rail_minutes_to_12h(now_min), "timetable_version": result.get("timetable_version"),
-                    "data_source": result.get("source_url"), "data_source_label": RAILWAY_REFERENCE_LABEL,
-                    "source_notice": "Scheduled timetable values. Live delay/location information is not included.",
+                    "status": "error",
+                    "type": "route_search",
+                    "message": "Origin and destination cannot be the same station.",
+                    "trains": [],
+                }
+
+            direct_line, line_error = _rail_resolve_line_for_pair(
+                from_station,
+                to_station,
+                requested_line,
+            )
+
+            if direct_line and not line_error:
+                now = datetime.now()
+                start_min = now.hour * 60 + now.minute
+                window_end = min(start_min + 180, 1439)
+
+                result = await _rail_fetch_timetable(
+                    direct_line,
+                    from_station,
+                    to_station,
+                    start_min,
+                    window_end,
+                )
+
+                trains = _rail_filter_trains(
+                    list(result.get("trains", [])),
+                    requested_service,
+                )
+
+                return {
+                    "status": "success",
+                    "type": "route_search",
+                    "station_code": str(from_station).upper(),
+                    "station_name": _rail_station_display_name(from_station),
+                    "from": _rail_station_display_name(from_station),
+                    "to": _rail_station_display_name(to_station),
+                    "line": direct_line,
+                    "line_name": _rail_line_name(direct_line),
+                    "trains": trains,
+                    "route_search": True,
+                    "requires_interchange": False,
+                    "service_filter": requested_service,
+                    "current_time": _rail_minutes_to_12h(start_min),
+                    "timetable_version": result.get(
+                        "timetable_version",
+                        RAILWAY_TIMETABLE_VERSIONS.get(direct_line, "Unknown"),
+                    ),
+                    "data_source": result.get("source_url"),
+                    "data_source_label": RAILWAY_REFERENCE_LABEL,
+                    "source_notice": (
+                        "Timetable values are from a public timetable reference; "
+                        "they are scheduled values, not a live delay feed."
+                    ),
                     "source_error": result.get("error"),
                 }
 
+            # Try an interchange journey when the selected stations span lines.
             from_lines = _rail_lines_for_station(from_station)
             to_lines = _rail_lines_for_station(to_station)
-            if requested_line in {"W", "C", "H"}:
-                if requested_line in from_lines: from_lines = [requested_line]
-                if requested_line in to_lines: to_lines = [requested_line]
-            if from_lines and to_lines:
-                cross = await _rail_cross_line_route(from_station, to_station, from_lines, to_lines)
-                cross.update({"status": "success", "type": "route_search", "route_search": True,
-                              "current_time": _rail_minutes_to_12h(_rail_current_minutes()),
-                              "data_source_label": RAILWAY_REFERENCE_LABEL,
-                              "source_notice": "Connected journeys are assembled from scheduled timetable entries."})
-                return cross
-            return {"status": "error", "type": "route_search", "message": line_error or "No supported suburban route found.", "trains": []}
 
+            if requested_line in {"W", "C", "H"}:
+                from_lines = [requested_line] if requested_line in from_lines else from_lines
+                to_lines = [requested_line] if requested_line in to_lines else to_lines
+
+            if from_lines and to_lines:
+                cross_line = await _rail_cross_line_route(
+                    from_station=from_station,
+                    to_station=to_station,
+                    from_lines=from_lines,
+                    to_lines=to_lines,
+                )
+                cross_line["status"] = "success"
+                cross_line["type"] = "route_search"
+                cross_line["route_search"] = True
+                cross_line["current_time"] = _rail_minutes_to_12h(
+                    datetime.now().hour * 60 + datetime.now().minute
+                )
+                cross_line["data_source_label"] = RAILWAY_REFERENCE_LABEL
+                cross_line["source_notice"] = (
+                    "Connected journeys are assembled from scheduled public timetable "
+                    "entries; connection times are timetable-based, not live platform data."
+                )
+                return cross_line
+
+            return {
+                "status": "error",
+                "type": "route_search",
+                "message": line_error or "No supported suburban route found.",
+                "trains": [],
+            }
+
+        # ----------------------------- STATION BOARD -----------------------------
         if normalized_type == "station_board":
             station = str(query_value or "BSR").strip().upper()
             station_name = _rail_station_display_name(station)
             station_lines = _rail_lines_for_station(station)
+
             if not station_lines:
-                return {"status": "error", "type": "station_board", "station_code": station, "station_name": station_name,
-                        "message": "Station not found in the Omni Rail station directory.", "trains": [], "next_trains": [], "full_day_timetable": []}
+                return {
+                    "status": "error",
+                    "type": "station_board",
+                    "station_code": station,
+                    "station_name": station_name,
+                    "message": "Station not found in the Omni Rail station directory.",
+                    "trains": [],
+                }
 
-            # Fetch the whole scheduled day concurrently. This is the key fix for
-            # the previous 25-second timeout caused by sequential fallback calls.
-            requests_list: List[Tuple[str, str, str, int, int]] = []
-            unique_lines: List[str] = []
-            for line in station_lines:
-                if line not in unique_lines: unique_lines.append(line)
-                for target in _rail_default_board_targets(station, line):
-                    target_name = _rail_station_name_from_slug(target)
-                    if _rail_normalize(target_name) == _rail_normalize(station_name):
-                        continue
-                    requests_list.append((line, station_name, target_name, 0, 1439))
+            now = datetime.now()
+            current_min = now.hour * 60 + now.minute
+            board_start = 3 * 60 + 30
+            board_end = 23 * 60 + 59
 
-            results = await _rail_fetch_many(requests_list)
             all_trains: List[Dict[str, Any]] = []
             source_urls: List[str] = []
             source_errors: List[str] = []
-            for result in results:
-                if result.get("source_url"): source_urls.append(str(result["source_url"]))
-                # Keep only compact diagnostics for backend logs/diagnostics.
-                if result.get("error"): source_errors.append(str(result["error"]))
-                for train in result.get("trains", []):
-                    item = dict(train)
-                    item["line"] = result.get("line")
-                    item["line_name"] = result.get("line_name")
-                    item["direction"] = result.get("to")
-                    all_trains.append(item)
 
-            all_trains.sort(key=lambda x: (int(x.get("timestamp_minutes", 0)), str(x.get("service_id", ""))))
+            # A station can be an interchange (e.g. Dadar / Kurla / CSMT).
+            # Return both line boards rather than silently selecting one.
+            unique_line_set: List[str] = []
+            for line in station_lines:
+                if line not in unique_line_set:
+                    unique_line_set.append(line)
+
+            for line in unique_line_set:
+                targets = _rail_default_board_targets(station, line)
+
+                for target in targets:
+                    target_name = _rail_station_name_from_slug(target)
+                    if _rail_normalize(target_name) == _rail_normalize(station_name):
+                        continue
+
+                    # Fetch from the beginning of the published service day so the
+                    # response contains the full schedule. The backend derives
+                    # next_trains from current_min below.
+                    result = await _rail_fetch_timetable(
+                        line=line,
+                        from_station=station,
+                        to_station=target_name,
+                        after_minutes=0,
+                        before_minutes=board_end,
+                    )
+
+                    source_url = result.get("source_url")
+                    if source_url:
+                        source_urls.append(source_url)
+
+                    if result.get("error"):
+                        source_errors.append(str(result["error"]))
+
+                    for train in result.get("trains", []):
+                        item = dict(train)
+                        item["line"] = line
+                        item["line_name"] = _rail_line_name(line)
+                        item["direction"] = target_name
+                        all_trains.append(item)
+
+            # Apply service-independent chronological ordering.
+            all_trains.sort(
+                key=lambda item: (
+                    int(item.get("timestamp_minutes", 0)),
+                    str(item.get("train_no", "")),
+                )
+            )
+
+            # De-duplicate identical rows coming from overlapping direction searches.
             seen = set()
-            deduped: List[Dict[str, Any]] = []
+            deduped = []
             for train in all_trains:
-                key = (str(train.get("service_id", "")), int(train.get("timestamp_minutes", -1)),
-                       str(train.get("destination", "")), str(train.get("line", "")), str(train.get("arrival_time", "")))
-                if key in seen: continue
-                seen.add(key); deduped.append(train)
+                key = (
+                    str(train.get("train_no")),
+                    int(train.get("timestamp_minutes", -1)),
+                    str(train.get("destination")),
+                    str(train.get("line")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(train)
 
-            current_min = _rail_current_minutes()
-            filtered_all = _rail_filter_trains(deduped, "ALL")
-            upcoming = [t for t in filtered_all if int(t.get("timestamp_minutes", -1)) >= current_min][:12]
+            # Keep the complete day schedule practical for mobile JSON responses,
+            # while preserving enough rows for the "next trains" experience.
+            deduped = deduped[:450]
+
+            upcoming = [
+                t for t in deduped
+                if int(t.get("timestamp_minutes", 0)) >= current_min
+            ][:12]
+
             return {
-                "status": "success", "type": "station_board", "station_code": station, "station_name": station_name,
-                "line": unique_lines[0] if len(unique_lines) == 1 else "ALL",
-                "line_name": _rail_line_name(unique_lines[0]) if len(unique_lines) == 1 else "Mumbai Suburban Network",
-                "lines": unique_lines, "line_names": [_rail_line_name(x) for x in unique_lines],
+                "status": "success",
+                "type": "station_board",
+                "station_code": station,
+                "station_name": station_name,
+                "line": unique_line_set[0] if len(unique_line_set) == 1 else "ALL",
+                "line_name": (
+                    _rail_line_name(unique_line_set[0])
+                    if len(unique_line_set) == 1
+                    else "Mumbai Suburban Network"
+                ),
+                "lines": unique_line_set,
+                "line_names": [_rail_line_name(line) for line in unique_line_set],
                 "current_time": _rail_minutes_to_12h(current_min),
-                "current_time_minutes": current_min,
-                "board_window": "Full scheduled day • 12:00 AM – 11:59 PM",
-                "trains": deduped[:600],
-                "full_day_timetable": deduped[:600],
+                "board_window": "00:00 AM – 11:59 PM",
+                "trains": deduped,
                 "next_trains": upcoming,
                 "train_count": len(deduped),
                 "source_urls": sorted(set(source_urls)),
                 "source_errors": sorted(set(source_errors))[:5],
                 "source_label": RAILWAY_REFERENCE_LABEL,
-                "timetable_versions": {line: RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown") for line in unique_lines},
-                "source_notice": "Scheduled timetable data. Live delay, location, platform and crowd values are shown only when a genuine live feed is connected.",
-                "station_directory": [{"code": code, "name": data["name"], "line": data["line"]}
-                                      for code, data in RAILWAY_STATIONS.items()
-                                      if _rail_normalize(data["name"]) == _rail_normalize(station_name)],
+                "timetable_versions": {
+                    line: RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown")
+                    for line in unique_line_set
+                },
+                "source_notice": (
+                    "Scheduled timetable data is shown from a public Mumbai suburban "
+                    "timetable reference. Platform, delay, door-side and crowd values "
+                    "are not invented when no live feed exists."
+                ),
+                "station_directory": [
+                    {
+                        "code": code,
+                        "name": data["name"],
+                        "line": data["line"],
+                    }
+                    for code, data in RAILWAY_STATIONS.items()
+                    if _rail_normalize(data["name"]) == _rail_normalize(station_name)
+                ],
             }
 
+        # ----------------------------- LIVE TRAIN -----------------------------
         if normalized_type == "live_train":
             train_query = str(query_value or "").strip()
+
             if not train_query:
-                return {"status": "error", "type": "live_train", "message": "Enter a train number or timetable service code."}
+                return {
+                    "status": "error",
+                    "type": "live_train",
+                    "message": "Enter a train number or timetable train code.",
+                }
+
+            # We deliberately return a truthful response here.  The timetable
+            # source does not provide real-time movement/delay data.
             return {
-                "status": "success", "type": "live_train", "train_no": train_query,
-                "train_name": "Mumbai Suburban Local", "current_station": None, "next_station": None,
-                "platform": None, "door_side": None, "delay_minutes": None, "crowd": None,
-                "status_msg": "Live movement data is not available from the current no-key timetable source.",
-                "live": False, "live_feed_available": False,
-                "message": "Omni Rail will show live location/delay/platform data only when a genuine live feed is connected.",
+                "status": "success",
+                "type": "live_train",
+                "train_no": train_query,
+                "train_name": "Mumbai Suburban Local",
+                "current_station": None,
+                "next_station": None,
+                "platform": None,
+                "door_side": None,
+                "delay_minutes": None,
+                "crowd": None,
+                "status_msg": (
+                    "Live movement data is not available from the current no-key "
+                    "railway source. Use the Mumbai Local timetable for scheduled stops."
+                ),
+                "live": False,
+                "live_feed_available": False,
+                "message": (
+                    "Omni Rail will display live location/delay/platform information "
+                    "only when an authorized or genuinely live feed is connected."
+                ),
                 "data_source_label": RAILWAY_REFERENCE_LABEL,
             }
 
+        # ----------------------------- PNR -----------------------------
         if normalized_type == "pnr":
             pnr = re.sub(r"\D", "", str(query_value or ""))
+
             if len(pnr) != 10:
-                return {"status": "error", "type": "pnr", "message": "PNR must contain exactly 10 digits."}
+                return {
+                    "status": "error",
+                    "type": "pnr",
+                    "message": "PNR must contain exactly 10 digits.",
+                }
+
             return {
-                "status": "success", "type": "pnr", "pnr": pnr, "train_no": None, "train_name": None,
-                "from_station": None, "to_station": None, "journey_date": None,
+                "status": "success",
+                "type": "pnr",
+                "pnr": pnr,
+                "train_no": None,
+                "train_name": None,
+                "from_station": None,
+                "to_station": None,
+                "journey_date": None,
                 "booking_status": "Live PNR lookup unavailable",
-                "status_msg": "This backend does not have an authorized live PNR feed.",
-                "live": False, "data_source_label": "Official railway PNR service required",
+                "status_msg": (
+                    "This backend does not have an authorized live PNR feed. "
+                    "Please verify the PNR through an official railway service."
+                ),
+                "live": False,
+                "data_source_label": "Official railway PNR service required",
             }
 
-        return {"status": "error", "type": normalized_type, "message": "Unsupported railway query type.", "trains": []}
+        return {
+            "status": "error",
+            "type": normalized_type,
+            "message": "Unsupported railway query type.",
+            "trains": [],
+        }
+
     except Exception as exc:
-        return {"status": "error", "type": normalized_type if 'normalized_type' in locals() else "railway", "message": "Railway service temporarily unavailable.", "detail": str(exc), "trains": [], "next_trains": [], "full_day_timetable": []}
+        return {
+            "status": "error",
+            "message": f"Railway inquiry error: {exc}",
+            "trains": [],
+        }
 
 # -------------------------------------------------------------
 
