@@ -10,6 +10,7 @@ import base64
 import zipfile
 import urllib.parse
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
 
@@ -363,129 +364,1105 @@ async def export_docx(title: str = Form(...), content: str = Form(...)):
         return {"status": "error", "message": str(e)}
 
 # -------------------------------------------------------------
-# 9. NATIVE IN-APP FLIGHT SEARCH & COMPARISON ENGINE
+# 9. TRAVEL DATA PLATFORM: CURRENCY + FLIGHTS + DESTINATIONS + STAYS
 # -------------------------------------------------------------
+# Production travel integrations deliberately fail closed.  When a provider
+# is unavailable or credentials are missing, this backend returns an explicit
+# unavailable state instead of inventing flights, hotels, prices, coordinates,
+# ratings, timings, or booking URLs.
+
+DUFFEL_BASE_URL = os.environ.get("DUFFEL_BASE_URL", "https://api.duffel.com").rstrip("/")
+DUFFEL_ACCESS_TOKEN = os.environ.get("DUFFEL_ACCESS_TOKEN", "").strip()
+DUFFEL_VERSION = os.environ.get("DUFFEL_VERSION", "v2").strip() or "v2"
+DUFFEL_SUPPLIER_TIMEOUT_MS = max(2000, min(int(os.environ.get("DUFFEL_SUPPLIER_TIMEOUT_MS", "15000")), 60000))
+
+BOOKING_BASE_URL = os.environ.get("BOOKING_BASE_URL", "https://demandapi.booking.com/3.2").rstrip("/")
+BOOKING_API_KEY = os.environ.get("BOOKING_API_KEY", "").strip()
+BOOKING_AFFILIATE_ID = os.environ.get("BOOKING_AFFILIATE_ID", "").strip()
+BOOKING_RADIUS_KM = max(1, min(float(os.environ.get("BOOKING_RADIUS_KM", "25")), 100))
+
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
+GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
+
+FX_BASE_URL = os.environ.get("FX_BASE_URL", "https://api.frankfurter.dev/v2").rstrip("/")
+FX_CACHE_TTL_SECONDS = max(60, min(int(os.environ.get("FX_CACHE_TTL_SECONDS", "1800")), 86400))
+
+# ISO-3166 country -> ISO-4217 currency.  This is only a deterministic
+# destination/home-currency resolver; actual exchange rates are fetched live.
+COUNTRY_TO_CURRENCY = {
+    "ad": "EUR", "ae": "AED", "af": "AFN", "ag": "XCD", "ai": "XCD", "al": "ALL",
+    "am": "AMD", "ao": "AOA", "ar": "ARS", "as": "USD", "at": "EUR", "au": "AUD",
+    "aw": "AWG", "ax": "EUR", "az": "AZN", "ba": "BAM", "bb": "BBD", "bd": "BDT",
+    "be": "EUR", "bf": "XOF", "bg": "BGN", "bh": "BHD", "bi": "BIF", "bj": "XOF",
+    "bl": "EUR", "bm": "BMD", "bn": "BND", "bo": "BOB", "bq": "USD", "br": "BRL",
+    "bs": "BSD", "bt": "BTN", "bv": "NOK", "bw": "BWP", "by": "BYN", "bz": "BZD",
+    "ca": "CAD", "cc": "AUD", "cd": "CDF", "cf": "XAF", "cg": "XAF", "ch": "CHF",
+    "ci": "XOF", "ck": "NZD", "cl": "CLP", "cm": "XAF", "cn": "CNY", "co": "COP",
+    "cr": "CRC", "cu": "CUP", "cv": "CVE", "cw": "ANG", "cx": "AUD", "cy": "EUR",
+    "cz": "CZK", "de": "EUR", "dj": "DJF", "dk": "DKK", "dm": "XCD", "do": "DOP",
+    "dz": "DZD", "ec": "USD", "ee": "EUR", "eg": "EGP", "eh": "MAD", "er": "ERN",
+    "es": "EUR", "et": "ETB", "fi": "EUR", "fj": "FJD", "fk": "FKP", "fm": "USD",
+    "fo": "DKK", "fr": "EUR", "ga": "XAF", "gb": "GBP", "gd": "XCD", "ge": "GEL",
+    "gf": "EUR", "gg": "GBP", "gh": "GHS", "gi": "GIP", "gl": "DKK", "gm": "GMD",
+    "gn": "GNF", "gp": "EUR", "gq": "XAF", "gr": "EUR", "gs": "GBP", "gt": "GTQ",
+    "gu": "USD", "gw": "XOF", "gy": "GYD", "hk": "HKD", "hm": "AUD", "hn": "HNL",
+    "hr": "EUR", "ht": "HTG", "hu": "HUF", "id": "IDR", "ie": "EUR", "il": "ILS",
+    "im": "GBP", "in": "INR", "io": "USD", "iq": "IQD", "ir": "IRR", "is": "ISK",
+    "it": "EUR", "je": "GBP", "jm": "JMD", "jo": "JOD", "jp": "JPY", "ke": "KES",
+    "kg": "KGS", "kh": "KHR", "ki": "AUD", "km": "KMF", "kn": "XCD", "kp": "KPW",
+    "kr": "KRW", "kw": "KWD", "ky": "KYD", "kz": "KZT", "la": "LAK", "lb": "LBP",
+    "lc": "XCD", "li": "CHF", "lk": "LKR", "lr": "LRD", "ls": "LSL", "lt": "EUR",
+    "lu": "EUR", "lv": "EUR", "ly": "LYD", "ma": "MAD", "mc": "EUR", "md": "MDL",
+    "me": "EUR", "mf": "EUR", "mg": "MGA", "mh": "USD", "mk": "MKD", "ml": "XOF",
+    "mm": "MMK", "mn": "MNT", "mo": "MOP", "mp": "USD", "mq": "EUR", "mr": "MRU",
+    "ms": "XCD", "mt": "EUR", "mu": "MUR", "mv": "MVR", "mw": "MWK", "mx": "MXN",
+    "my": "MYR", "mz": "MZN", "na": "NAD", "nc": "XPF", "ne": "XOF", "nf": "AUD",
+    "ng": "NGN", "ni": "NIO", "nl": "EUR", "no": "NOK", "np": "NPR", "nr": "AUD",
+    "nu": "NZD", "nz": "NZD", "om": "OMR", "pa": "PAB", "pe": "PEN", "pf": "XPF",
+    "pg": "PGK", "ph": "PHP", "pk": "PKR", "pl": "PLN", "pm": "EUR", "pn": "NZD",
+    "pr": "USD", "ps": "ILS", "pt": "EUR", "pw": "USD", "py": "PYG", "qa": "QAR",
+    "re": "EUR", "ro": "RON", "rs": "RSD", "ru": "RUB", "rw": "RWF", "sa": "SAR",
+    "sb": "SBD", "sc": "SCR", "sd": "SDG", "se": "SEK", "sg": "SGD", "sh": "SHP",
+    "si": "EUR", "sj": "NOK", "sk": "EUR", "sl": "SLE", "sm": "EUR", "sn": "XOF",
+    "so": "SOS", "sr": "SRD", "ss": "SSP", "st": "STN", "sv": "USD", "sx": "ANG",
+    "sy": "SYP", "sz": "SZL", "tc": "USD", "td": "XAF", "tf": "EUR", "tg": "XOF",
+    "th": "THB", "tj": "TJS", "tk": "NZD", "tl": "USD", "tm": "TMT", "tn": "TND",
+    "to": "TOP", "tr": "TRY", "tt": "TTD", "tv": "AUD", "tw": "TWD", "tz": "TZS",
+    "ua": "UAH", "ug": "UGX", "um": "USD", "us": "USD", "uy": "UYU", "uz": "UZS",
+    "va": "EUR", "vc": "XCD", "ve": "VES", "vg": "USD", "vi": "USD", "vn": "VND",
+    "vu": "VUV", "wf": "XPF", "ws": "WST", "ye": "YER", "yt": "EUR", "za": "ZAR",
+    "zm": "ZMW", "zw": "ZWG"
+}
+
+COUNTRY_NAME_TO_ISO2 = {
+    "india": "in", "united states": "us", "usa": "us", "united states of america": "us",
+    "united kingdom": "gb", "uk": "gb", "england": "gb", "uae": "ae",
+    "united arab emirates": "ae", "singapore": "sg", "japan": "jp", "thailand": "th",
+    "france": "fr", "germany": "de", "italy": "it", "spain": "es", "switzerland": "ch",
+    "australia": "au", "canada": "ca", "new zealand": "nz", "china": "cn", "hong kong": "hk",
+    "south korea": "kr", "korea": "kr", "indonesia": "id", "malaysia": "my", "philippines": "ph",
+    "vietnam": "vn", "nepal": "np", "sri lanka": "lk", "bangladesh": "bd", "pakistan": "pk",
+    "saudi arabia": "sa", "qatar": "qa", "bahrain": "bh", "oman": "om", "kuwait": "kw",
+    "turkey": "tr", "türkiye": "tr", "netherlands": "nl", "belgium": "be", "austria": "at",
+    "portugal": "pt", "ireland": "ie", "greece": "gr", "czech republic": "cz", "czechia": "cz",
+    "poland": "pl", "hungary": "hu", "sweden": "se", "norway": "no", "denmark": "dk",
+    "finland": "fi", "iceland": "is", "mexico": "mx", "brazil": "br", "argentina": "ar",
+    "chile": "cl", "colombia": "co", "peru": "pe", "south africa": "za", "egypt": "eg",
+    "morocco": "ma", "kenya": "ke", "tanzania": "tz", "nigeria": "ng", "ghana": "gh",
+    "israel": "il", "russia": "ru", "ukraine": "ua"
+}
+
+CURRENCY_SYMBOLS = {
+    "AED": "د.إ", "AUD": "A$", "BRL": "R$", "CAD": "C$", "CHF": "CHF", "CNY": "¥",
+    "CZK": "Kč", "DKK": "kr", "EUR": "€", "GBP": "£", "HKD": "HK$", "HUF": "Ft",
+    "IDR": "Rp", "INR": "₹", "ILS": "₪", "JPY": "¥", "KRW": "₩", "KWD": "د.ك",
+    "MAD": "MAD", "MXN": "MX$", "MYR": "RM", "NOK": "kr", "NZD": "NZ$", "PHP": "₱",
+    "PLN": "zł", "QAR": "ر.ق", "RON": "lei", "RUB": "₽", "SAR": "﷼", "SEK": "kr",
+    "SGD": "S$", "THB": "฿", "TRY": "₺", "TWD": "NT$", "USD": "$", "VND": "₫", "ZAR": "R"
+}
+
+_fx_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_google_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+
+def _normalize_country_iso2(country: str) -> str:
+    raw = str(country or "").strip().lower()
+    if len(raw) == 2 and raw.isalpha():
+        return raw
+    return COUNTRY_NAME_TO_ISO2.get(raw, "in")
+
+
+def _currency_for_country(country: str) -> str:
+    return COUNTRY_TO_CURRENCY.get(_normalize_country_iso2(country), "USD")
+
+
+def _currency_symbol(code: str) -> str:
+    return CURRENCY_SYMBOLS.get(str(code or "USD").upper(), str(code or "USD").upper())
+
+
+def _safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    try:
+        if value is None or value == "":
+            return default
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return default
+
+
+def _format_decimal(value: Decimal) -> str:
+    normalized = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(normalized, "f")
+
+
+def _parse_iso_duration(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not text.startswith("P"):
+        return text
+    match = re.fullmatch(r"P(?:([0-9]+)D)?(?:T(?:([0-9]+)H)?(?:([0-9]+)M)?(?:([0-9]+)S)?)?", text)
+    if not match:
+        return text
+    days, hours, minutes, seconds = match.groups()
+    parts = []
+    if days and int(days):
+        parts.append(f"{int(days)}d")
+    if hours and int(hours):
+        parts.append(f"{int(hours)}h")
+    if minutes and int(minutes):
+        parts.append(f"{int(minutes)}m")
+    if seconds and int(seconds) and not parts:
+        parts.append(f"{int(seconds)}s")
+    return " ".join(parts) or "0m"
+
+
+def _format_clock(iso_value: Any) -> str:
+    text = str(iso_value or "")
+    if "T" in text:
+        text = text.split("T", 1)[1]
+    text = text.split("+", 1)[0].split("Z", 1)[0]
+    if len(text) >= 5:
+        return text[:5]
+    return text
+
+
+def _format_date(iso_value: Any) -> str:
+    text = str(iso_value or "")
+    return text[:10] if len(text) >= 10 else text
+
+
+async def _fx_rate(base: str, quote: str) -> Optional[Dict[str, Any]]:
+    base = str(base or "").upper()
+    quote = str(quote or "").upper()
+    if not base or not quote:
+        return None
+    if base == quote:
+        return {"base": base, "quote": quote, "rate": Decimal("1"), "date": None, "provider": "identity"}
+
+    key = (base, quote)
+    cached = _fx_cache.get(key)
+    if cached and (time.time() - cached.get("timestamp", 0) < FX_CACHE_TTL_SECONDS):
+        return cached.get("data")
+
+    url = f"{FX_BASE_URL}/rate/{base.lower()}/{quote.lower()}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+            response = await client.get(url, headers={"Accept": "application/json"})
+        if response.status_code != 200:
+            print(f"[FX Notice] {response.status_code}: {response.text[:200]}")
+            return None
+        data = response.json()
+        rate = _safe_decimal(data.get("rate"), Decimal("0"))
+        if rate <= 0:
+            return None
+        result = {
+            "base": base,
+            "quote": quote,
+            "rate": rate,
+            "date": data.get("date"),
+            "provider": "Frankfurter"
+        }
+        _fx_cache[key] = {"timestamp": time.time(), "data": result}
+        return result
+    except Exception as e:
+        print(f"[FX Notice]: {e}")
+        return None
+
+
+async def _convert_amount(value: Any, base: str, quote: str) -> Optional[Decimal]:
+    amount = _safe_decimal(value)
+    rate_data = await _fx_rate(base, quote)
+    if not rate_data:
+        return None
+    return amount * rate_data["rate"]
+
+
+def _duffel_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {DUFFEL_ACCESS_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Duffel-Version": DUFFEL_VERSION,
+    }
+
+
+def _booking_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {BOOKING_API_KEY}",
+        "X-Affiliate-Id": BOOKING_AFFILIATE_ID,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+
+async def _google_text_search(query: str, max_result_count: int = 10) -> List[Dict[str, Any]]:
+    if not GOOGLE_PLACES_API_KEY:
+        return []
+
+    endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
+    field_mask = ",".join([
+        "places.id",
+        "places.displayName",
+        "places.formattedAddress",
+        "places.location",
+        "places.googleMapsUri",
+        "places.websiteUri",
+        "places.primaryType",
+        "places.primaryTypeDisplayName",
+        "places.types",
+        "places.addressComponents",
+        "places.rating",
+        "places.userRatingCount",
+        "places.regularOpeningHours",
+        "places.photos",
+    ])
+    payload = {
+        "textQuery": query,
+        "pageSize": max(1, min(int(max_result_count), 20)),
+        "languageCode": "en",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0)) as client:
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                    "X-Goog-FieldMask": field_mask,
+                },
+                json=payload,
+            )
+        if response.status_code != 200:
+            print(f"[Google Places Notice] {response.status_code}: {response.text[:300]}")
+            return []
+        data = response.json()
+        return data.get("places", []) or []
+    except Exception as e:
+        print(f"[Google Places Notice]: {e}")
+        return []
+
+
+async def _resolve_destination_with_google(city: str, state: str, country: str) -> Optional[Dict[str, Any]]:
+    key = (city.strip().lower(), state.strip().lower(), country.strip().lower())
+    if key in _google_destination_cache:
+        return _google_destination_cache[key]
+    if not GOOGLE_PLACES_API_KEY:
+        return None
+
+    query_parts = [city.strip()]
+    if state.strip():
+        query_parts.append(state.strip())
+    if country.strip():
+        query_parts.append(country.strip())
+
+    results = await _google_text_search(", ".join(query_parts), max_result_count=8)
+    if not results:
+        return None
+
+    def candidate_score(place: Dict[str, Any]) -> int:
+        types = {str(x).lower() for x in (place.get("types") or [])}
+        primary = str(place.get("primaryType") or "").lower()
+        display = str((place.get("displayName") or {}).get("text") or "").strip().lower()
+        score = 0
+        if "locality" in types or "postal_town" in types:
+            score += 100
+        if "administrative_area_level_2" in types:
+            score += 80
+        if "administrative_area_level_1" in types:
+            score += 40
+        if primary in {"locality", "administrative_area_level_2", "administrative_area_level_1"}:
+            score += 30
+        if display == city.strip().lower():
+            score += 25
+        elif city.strip().lower() in display:
+            score += 10
+        return score
+
+    chosen = max(results, key=candidate_score)
+    loc = chosen.get("location") or {}
+    lat = loc.get("latitude")
+    lng = loc.get("longitude")
+    if lat is None or lng is None:
+        return None
+
+    display_name = (chosen.get("displayName") or {}).get("text") or city
+    resolved = {
+        "city": city,
+        "state": state,
+        "country": country,
+        "display_name": display_name,
+        "place_id": chosen.get("id"),
+        "latitude": float(lat),
+        "longitude": float(lng),
+        "formatted_address": chosen.get("formattedAddress"),
+        "google_maps_url": chosen.get("googleMapsUri"),
+        "website_url": chosen.get("websiteUri"),
+        "types": chosen.get("types") or [],
+        "address_components": chosen.get("addressComponents") or [],
+        "source": "Google Places",
+        "data_state": "VERIFIED",
+    }
+    _google_destination_cache[key] = resolved
+    return resolved
+
+
+def _place_category(place: Dict[str, Any]) -> str:
+    primary = str(place.get("primaryType") or "").lower()
+    label = str((place.get("primaryTypeDisplayName") or {}).get("text") or "").lower()
+    combined = f"{primary} {label}"
+    if any(k in combined for k in ["museum", "church", "temple", "mosque", "shrine", "historical", "castle", "monument"]):
+        return "Heritage & Forts"
+    if any(k in combined for k in ["beach", "park", "garden", "national_park", "nature", "waterfall"]):
+        return "Nature & Wildlife"
+    if any(k in combined for k in ["restaurant", "cafe", "market", "food", "bakery"]):
+        return "Culinary & Bazaars"
+    if any(k in combined for k in ["zoo", "aquarium", "amusement", "tourist"]):
+        return "Family & Attractions"
+    return "Sights & Landmarks"
+
+
+def _place_distance_km(lat: float, lng: float, origin_lat: float, origin_lng: float) -> float:
+    from math import asin, cos, radians, sin, sqrt
+    earth_radius_km = 6371.0088
+    lat1, lon1, lat2, lon2 = map(radians, [origin_lat, origin_lng, lat, lng])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return earth_radius_km * 2 * asin(min(1.0, sqrt(a)))
+
+
+def _compact_hours(place: Dict[str, Any]) -> Optional[str]:
+    hours = place.get("regularOpeningHours") or {}
+    descriptions = hours.get("weekdayDescriptions") or []
+    if not descriptions:
+        return None
+    return " • ".join(str(x) for x in descriptions[:2])
+
+
+def _normalize_google_place(place: Dict[str, Any], origin_lat: float, origin_lng: float) -> Optional[Dict[str, Any]]:
+    loc = place.get("location") or {}
+    lat = loc.get("latitude")
+    lng = loc.get("longitude")
+    name = (place.get("displayName") or {}).get("text")
+    if lat is None or lng is None or not name:
+        return None
+
+    distance = _place_distance_km(float(lat), float(lng), origin_lat, origin_lng)
+    photos = place.get("photos") or []
+    photo_names = [str(photo.get("name")) for photo in photos if photo.get("name")]
+    rating = place.get("rating")
+    rating_count = place.get("userRatingCount")
+    hours = _compact_hours(place)
+
+    result = {
+        "name": name,
+        "category": _place_category(place),
+        "distance": f"{distance:.1f} km from Center",
+        "distance_km": round(distance, 2),
+        "distance_type": "straight_line",
+        "timing": hours or "",
+        "entry": "See provider",
+        "lat": float(lat),
+        "lng": float(lng),
+        "history": str((place.get("primaryTypeDisplayName") or {}).get("text") or "Verified place listing"),
+        "best_food": "",
+        "things_to_do": "",
+        "best_time": "",
+        "warnings": "",
+        "rating": rating,
+        "reviews": rating_count,
+        "images": [],
+        "google_photo_names": photo_names[:3],
+        "maps_url": place.get("googleMapsUri"),
+        "website_url": place.get("websiteUri"),
+        "place_id": place.get("id"),
+        "source": "Google Places",
+        "data_state": "VERIFIED",
+        "provider_verified": True,
+        "attribution_required": "Google Maps",
+    }
+    return result
+
+
+async def _load_google_destination_places(city: str, state: str, country: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    destination = await _resolve_destination_with_google(city, state, country)
+    if not destination:
+        return None, []
+
+    queries = [
+        f"top attractions and landmarks in {city}, {country}",
+        f"things to do and tourist attractions in {city}, {country}",
+    ]
+    batches = await asyncio.gather(*[_google_text_search(q, 10) for q in queries], return_exceptions=True)
+    merged: Dict[str, Dict[str, Any]] = {}
+    for batch in batches:
+        if isinstance(batch, Exception):
+            continue
+        for place in batch:
+            place_id = str(place.get("id") or "")
+            if place_id and place_id not in merged:
+                merged[place_id] = place
+
+    normalized: List[Dict[str, Any]] = []
+    for place in merged.values():
+        item = _normalize_google_place(place, destination["latitude"], destination["longitude"])
+        if item:
+            normalized.append(item)
+
+    normalized.sort(key=lambda x: (-(float(x.get("rating") or 0)), -(int(x.get("reviews") or 0))))
+    return destination, normalized[:20]
+
+
+async def _booking_search_stays(
+    destination: Dict[str, Any],
+    checkin: str,
+    checkout: str,
+    adults: int,
+    rooms: int,
+    child_ages: List[int],
+    traveler_country: str,
+    display_currency: str,
+) -> Dict[str, Any]:
+    if not BOOKING_API_KEY or not BOOKING_AFFILIATE_ID:
+        return {
+            "status": "unavailable",
+            "provider": "Booking.com Demand API",
+            "reason": "BOOKING_API_KEY and/or BOOKING_AFFILIATE_ID is not configured.",
+            "hotels": [],
+        }
+
+    guests: Dict[str, Any] = {
+        "number_of_rooms": rooms,
+        "number_of_adults": adults,
+    }
+    if child_ages:
+        guests["children"] = child_ages
+        if rooms == 1:
+            guests["allocation"] = [{"number_of_adults": adults, "children": child_ages}]
+
+    body: Dict[str, Any] = {
+        "coordinates": {
+            "latitude": destination["latitude"],
+            "longitude": destination["longitude"],
+            "radius": BOOKING_RADIUS_KM,
+        },
+        "booker": {
+            "platform": "mobile",
+            "country": _normalize_country_iso2(traveler_country),
+        },
+        "currency": display_currency,
+        "checkin": checkin,
+        "checkout": checkout,
+        "guests": guests,
+        "rows": 20,
+        "extras": ["extra_charges", "products"],
+        "sort": {
+            "by": "distance",
+            "direction": "ascending",
+        },
+    }
+
+    endpoint = f"{BOOKING_BASE_URL}/accommodations/search"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=5.0)) as client:
+            response = await client.post(endpoint, headers=_booking_headers(), json=body)
+        if response.status_code != 200:
+            print(f"[Booking Search Notice] {response.status_code}: {response.text[:500]}")
+            return {
+                "status": "unavailable",
+                "provider": "Booking.com Demand API",
+                "reason": f"Provider returned HTTP {response.status_code}.",
+                "hotels": [],
+            }
+        payload = response.json()
+    except Exception as e:
+        print(f"[Booking Search Notice]: {e}")
+        return {
+            "status": "unavailable",
+            "provider": "Booking.com Demand API",
+            "reason": "Provider request failed or timed out.",
+            "hotels": [],
+        }
+
+    hotels: List[Dict[str, Any]] = []
+    for raw in payload.get("data") or []:
+        item = _normalize_booking_hotel(
+            raw,
+            city=destination.get("city", ""),
+            traveler_currency=display_currency,
+            center_lat=destination.get("latitude"),
+            center_lng=destination.get("longitude"),
+        )
+        if item:
+            hotels.append(item)
+
+    return {
+        "status": "success" if hotels else "empty",
+        "provider": "Booking.com Demand API",
+        "request_id": payload.get("request_id"),
+        "next_page": payload.get("metadata", {}).get("next_page_token") or payload.get("next_page"),
+        "hotels": hotels,
+    }
+
+
+def _normalize_booking_hotel(
+    raw: Dict[str, Any],
+    city: str,
+    traveler_currency: str,
+    center_lat: Optional[float] = None,
+    center_lng: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    name = raw.get("name") or raw.get("property_name")
+    if not name:
+        return None
+
+    location = raw.get("location") or {}
+    coords = location.get("coordinates") or {}
+    price = raw.get("price") or {}
+    currency = raw.get("currency") or {}
+    if isinstance(currency, str):
+        accommodation_currency = currency
+        booker_currency = traveler_currency
+    else:
+        accommodation_currency = currency.get("accommodation") or traveler_currency
+        booker_currency = currency.get("booker") or traveler_currency
+
+    display_price = price.get("display") if isinstance(price, dict) else None
+    total = None
+    if isinstance(display_price, dict):
+        total = display_price.get("total") or display_price.get("base")
+    total = total if total is not None else price.get("total") if isinstance(price, dict) else None
+    if total is None and isinstance(price, dict):
+        total = price.get("book") or price.get("display")
+
+    charges = price.get("charges") if isinstance(price, dict) else None
+    products = raw.get("products") or []
+    primary_product = products[0] if products else {}
+    policy = primary_product.get("policies") or {}
+    cancellation = policy.get("cancellation") or {}
+    meal_plan = policy.get("meal_plan") or {}
+    payment = policy.get("payment") or {}
+    inventory = primary_product.get("inventory") or {}
+    urls = raw.get("url") or {}
+    booking_url = urls.get("web") if isinstance(urls, dict) else urls if isinstance(urls, str) else None
+
+    review_score = raw.get("review_score")
+    if review_score is None:
+        rating_obj = raw.get("rating")
+        if isinstance(rating_obj, dict):
+            review_score = rating_obj.get("score") or rating_obj.get("value")
+        else:
+            review_score = rating_obj
+
+    images = []
+    for key in ["photos", "images"]:
+        candidate = raw.get(key)
+        if isinstance(candidate, list):
+            images.extend([str(x.get("url") or x.get("source") or x) for x in candidate if x])
+
+    hotel_lat = coords.get("latitude") if isinstance(coords, dict) else None
+    hotel_lng = coords.get("longitude") if isinstance(coords, dict) else None
+    distance_km = None
+    distance_text = ""
+    if hotel_lat is not None and hotel_lng is not None and center_lat is not None and center_lng is not None:
+        try:
+            distance_km = round(_place_distance_km(float(hotel_lat), float(hotel_lng), float(center_lat), float(center_lng)), 2)
+            distance_text = f"{distance_km:.1f} km from Center"
+        except (TypeError, ValueError):
+            distance_km = None
+            distance_text = ""
+
+    result = {
+        "name": name,
+        "tier": "Stay",
+        "rating": review_score,
+        "reviews": raw.get("review_count") or raw.get("number_of_reviews"),
+        "price": total,
+        "price_total": total,
+        "currency": accommodation_currency,
+        "booker_currency": booker_currency,
+        "price_display_currency": booker_currency,
+        "price_display_symbol": _currency_symbol(booker_currency),
+        "phone": location.get("phone") or raw.get("phone"),
+        "distance": distance_text,
+        "distance_km": distance_km,
+        "amenities": "",
+        "lat": hotel_lat,
+        "lng": hotel_lng,
+        "images": images[:5],
+        "address": location.get("address"),
+        "city": city,
+        "accommodation_id": raw.get("id"),
+        "booking_url": booking_url,
+        "cancellation_type": cancellation.get("type"),
+        "free_cancellation_until": cancellation.get("free_cancellation_until"),
+        "meal_plan": meal_plan.get("plan") or meal_plan.get("meals"),
+        "payment_timings": payment.get("timings") or [],
+        "inventory_type": inventory.get("type"),
+        "third_party_inventory": inventory.get("third_party"),
+        "charges": charges,
+        "product_id": primary_product.get("id"),
+        "source": "Booking.com Demand API",
+        "data_state": "PROVIDER",
+        "provider_verified": True,
+    }
+
+    return result
+
+
+def _duffel_cabin(value: str) -> str:
+    raw = str(value or "Economy").strip().lower()
+    mapping = {
+        "economy": "economy",
+        "premium economy": "premium_economy",
+        "premium_economy": "premium_economy",
+        "business": "business",
+        "first class": "first",
+        "first": "first",
+    }
+    return mapping.get(raw, "economy")
+
+
+def _normalize_duffel_offer(offer: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    slices = offer.get("slices") or []
+    if not slices:
+        return None
+
+    all_segments = []
+    slice_models = []
+    for sl in slices:
+        segments = sl.get("segments") or []
+        if not segments:
+            continue
+        all_segments.extend(segments)
+        slice_models.append({
+            "origin": (sl.get("origin") or {}).get("iata_code"),
+            "destination": (sl.get("destination") or {}).get("iata_code"),
+            "depart_at": sl.get("depart_at"),
+            "arrive_at": sl.get("arrive_at"),
+            "duration": _parse_iso_duration(sl.get("duration")),
+            "segments": segments,
+        })
+
+    if not all_segments:
+        return None
+
+    first = all_segments[0]
+    last = all_segments[-1]
+    first_operating = first.get("operating_carrier") or {}
+    first_marketing = first.get("marketing_carrier") or {}
+
+    flight_numbers = []
+    operating_carriers = []
+    for segment in all_segments:
+        op = segment.get("operating_carrier") or {}
+        if op.get("name"):
+            operating_carriers.append(op.get("name"))
+        carrier = segment.get("marketing_carrier") or {}
+        code = carrier.get("iata_code") or op.get("iata_code") or ""
+        number = segment.get("marketing_carrier_flight_number") or segment.get("flight_number") or ""
+        if code and number:
+            flight_numbers.append(f"{code}{number}")
+
+    stop_count = max(0, len(all_segments) - len(slices))
+    if stop_count == 0:
+        stops_text = "Non-stop Direct"
+    elif stop_count == 1:
+        stops_text = "1 Stop"
+    else:
+        stops_text = f"{stop_count} Stops"
+
+    total_amount = _safe_decimal(offer.get("total_amount"))
+    total_currency = str(offer.get("total_currency") or "USD").upper()
+    passenger_count = max(1, len(offer.get("passengers") or []))
+    per_passenger = total_amount / Decimal(passenger_count)
+
+    result = {
+        "id": offer.get("id"),
+        "airline": first_operating.get("name") or first_marketing.get("name") or "Unknown carrier",
+        "operating_carrier": first_operating.get("name"),
+        "operating_carriers": sorted(set(operating_carriers)),
+        "marketing_carrier": first_marketing.get("name"),
+        "marketing_carrier_code": first_marketing.get("iata_code"),
+        "code": flight_numbers[0] if flight_numbers else "",
+        "flight_numbers": flight_numbers,
+        "depart_time": _format_clock(first.get("departing_at")),
+        "arrive_time": _format_clock(last.get("arriving_at")),
+        "depart_datetime": first.get("departing_at"),
+        "arrive_datetime": last.get("arriving_at"),
+        "depart_date": _format_date(first.get("departing_at")),
+        "arrive_date": _format_date(last.get("arriving_at")),
+        "duration": _parse_iso_duration(offer.get("total_duration")) or _parse_iso_duration(slice_models[0].get("duration")),
+        "stops": stops_text,
+        "stop_count": stop_count,
+        "price": float(total_amount),
+        "total_price": float(total_amount),
+        "price_per_passenger": float(per_passenger),
+        "currency": total_currency,
+        "symbol": _currency_symbol(total_currency),
+        "expires_at": offer.get("expires_at"),
+        "source": "Duffel",
+        "data_state": "PROVIDER",
+        "provider_verified": True,
+        "live_mode": offer.get("live_mode"),
+        "booking_capable": True,
+        "booking_reference": offer.get("id"),
+        "cabin_class": (offer.get("cabin_class") or "economy"),
+        "fare_conditions": offer.get("conditions") or {},
+        "slices": slice_models,
+        "baggage": offer.get("available_services") or [],
+    }
+    return result
+
+
+async def _search_duffel_flights(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: Optional[str],
+    adults: int,
+    child_ages: List[int],
+    cabin_class: str,
+    max_connections: int,
+) -> Dict[str, Any]:
+    if not DUFFEL_ACCESS_TOKEN:
+        return {
+            "status": "unavailable",
+            "provider": "Duffel",
+            "reason": "DUFFEL_ACCESS_TOKEN is not configured.",
+            "flights": [],
+        }
+
+    passengers: List[Dict[str, Any]] = [{"type": "adult"} for _ in range(adults)]
+    passengers.extend({"age": int(age)} for age in child_ages)
+
+    slices = [
+        {
+            "origin": origin,
+            "destination": destination,
+            "departure_date": departure_date,
+        }
+    ]
+    if return_date:
+        slices.append({
+            "origin": destination,
+            "destination": origin,
+            "departure_date": return_date,
+        })
+
+    body = {
+        "data": {
+            "slices": slices,
+            "passengers": passengers,
+            "cabin_class": _duffel_cabin(cabin_class),
+            "max_connections": max(0, min(int(max_connections), 9)),
+        }
+    }
+
+    endpoint = f"{DUFFEL_BASE_URL}/air/offer_requests"
+    params = {
+        "return_offers": "true",
+        "supplier_timeout": str(DUFFEL_SUPPLIER_TIMEOUT_MS),
+        "view": "offers",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=6.0)) as client:
+            response = await client.post(endpoint, headers=_duffel_headers(), params=params, json=body)
+        if response.status_code not in (200, 201):
+            print(f"[Duffel Search Notice] {response.status_code}: {response.text[:500]}")
+            return {
+                "status": "unavailable",
+                "provider": "Duffel",
+                "reason": f"Provider returned HTTP {response.status_code}.",
+                "flights": [],
+            }
+        payload = response.json()
+    except Exception as e:
+        print(f"[Duffel Search Notice]: {e}")
+        return {
+            "status": "unavailable",
+            "provider": "Duffel",
+            "reason": "Provider request failed or timed out.",
+            "flights": [],
+        }
+
+    data = payload.get("data") or {}
+    offers = data.get("offers") or []
+    normalized = []
+    for offer in offers:
+        item = _normalize_duffel_offer(offer)
+        if item:
+            normalized.append(item)
+
+    return {
+        "status": "success" if normalized else "empty",
+        "provider": "Duffel",
+        "offer_request_id": data.get("id"),
+        "live_mode": data.get("live_mode"),
+        "expires_at": data.get("expires_at"),
+        "flights": normalized,
+    }
+
+
 @app.post("/api/v1/search-flights")
 async def search_flights(request: Request):
     try:
         body = await request.json()
-        origin = body.get("origin", "BOM").upper()
-        destination = body.get("destination", "TYO").upper()
-        depart_date = body.get("departure_date") or body.get("depart_date") or "2026-09-21"
-        return_date = body.get("return_date") or "2026-09-28"
+        origin = str(body.get("origin") or "").strip().upper()
+        destination = str(body.get("destination") or "").strip().upper()
+        departure_date = str(body.get("departure_date") or body.get("depart_date") or "").strip()
+        return_date_raw = body.get("return_date")
+        return_date = str(return_date_raw).strip() if return_date_raw else None
         adults = int(body.get("adults", 1))
-        cabin_class = body.get("cabin_class", "Economy")
-        is_round_trip = body.get("is_round_trip", True)
+        kids = int(body.get("kids", 0))
+        child_ages = [int(x) for x in (body.get("child_ages") or [])]
+        cabin_class = str(body.get("cabin_class") or "Economy")
+        max_connections = int(body.get("max_connections", 2))
+        traveler_country = str(body.get("traveler_country") or body.get("booker_country") or "IN")
+        traveler_currency = str(body.get("traveler_currency") or _currency_for_country(traveler_country)).upper()
 
-        fare_benchmarks = {
-            ("BOM", "TYO"): [
-                {
-                    "airline": "IndiGo & Partner Carrier",
-                    "code": "6E-512 / NH-860",
-                    "depart_time": "08:15",
-                    "arrive_time": "19:40",
-                    "duration": "8h 55m",
-                    "stops": "1 Stop (BKK)",
-                    "price_inr": 34200,
-                    "badge": "Cheapest Fare",
-                    "badge_color": "0xFF16A34A",
-                    "perks": "7kg Cabin • Seat Selection Selectable"
-                },
-                {
-                    "airline": "Air India (Tata Group)",
-                    "code": "AI-306",
-                    "depart_time": "20:00",
-                    "arrive_time": "07:55",
-                    "duration": "8h 25m",
-                    "stops": "Non-stop Direct",
-                    "price_inr": 44500,
-                    "badge": "Fastest Direct",
-                    "badge_color": "0xFFDC2626",
-                    "perks": "23kg Check-in • Hot Gourmet Meals Included"
-                }
-            ],
-            ("BOM", "SIN"): [
-                {
-                    "airline": "Air India Express",
-                    "code": "IX-245",
-                    "depart_time": "11:10",
-                    "arrive_time": "19:15",
-                    "duration": "5h 35m",
-                    "stops": "Non-stop Direct",
-                    "price_inr": 14200,
-                    "badge": "Cheapest Fare",
-                    "badge_color": "0xFF16A34A",
-                    "perks": "7kg Cabin • Paid Add-ons Available"
-                }
-            ]
+        if not re.fullmatch(r"[A-Z]{3}", origin) or not re.fullmatch(r"[A-Z]{3}", destination):
+            return {"status": "error", "message": "Valid 3-letter IATA origin and destination codes are required.", "flights": []}
+        if not departure_date:
+            return {"status": "error", "message": "departure_date is required.", "flights": []}
+        if adults < 1 or adults > 9:
+            return {"status": "error", "message": "adults must be between 1 and 9.", "flights": []}
+        if kids < 0 or kids > 8:
+            return {"status": "error", "message": "kids must be between 0 and 8.", "flights": []}
+        if kids != len(child_ages):
+            return {
+                "status": "error",
+                "message": "Child ages are required for live fare shopping; send one age for each child.",
+                "required": ["child_ages"],
+                "flights": [],
+            }
+        if any(age < 2 or age > 11 for age in child_ages):
+            return {"status": "error", "message": "child_ages must contain values from 2 through 11.", "flights": []}
+        if return_date and return_date <= departure_date:
+            return {"status": "error", "message": "return_date must be later than departure_date.", "flights": []}
+
+        result = await _search_duffel_flights(
+            origin=origin,
+            destination=destination,
+            departure_date=departure_date,
+            return_date=return_date,
+            adults=adults,
+            child_ages=child_ages,
+            cabin_class=cabin_class,
+            max_connections=max_connections,
+        )
+
+        flights = result.get("flights") or []
+        source_currencies = sorted(set(str(item.get("currency") or traveler_currency).upper() for item in flights))
+        fx_results = await asyncio.gather(*[_fx_rate(cur, traveler_currency) for cur in source_currencies], return_exceptions=True)
+        fx_map: Dict[str, Dict[str, Any]] = {}
+        for cur, fx in zip(source_currencies, fx_results):
+            if isinstance(fx, dict):
+                fx_map[cur] = fx
+
+        for item in flights:
+            source_currency = str(item.get("currency") or traveler_currency).upper()
+            rate_data = fx_map.get(source_currency)
+            if rate_data:
+                rate = rate_data["rate"]
+                source_total = _safe_decimal(item.get("total_price"))
+                source_per_passenger = _safe_decimal(item.get("price_per_passenger"))
+                display_total = source_total * rate
+                display_per_passenger = source_per_passenger * rate
+                item["display_currency"] = traveler_currency
+                item["display_symbol"] = _currency_symbol(traveler_currency)
+                item["display_total_price"] = float(display_total)
+                item["display_price_per_passenger"] = float(display_per_passenger)
+                item["fx_rate"] = float(rate)
+                item["fx_date"] = rate_data.get("date")
+            else:
+                item["display_currency"] = source_currency
+                item["display_symbol"] = _currency_symbol(source_currency)
+                item["display_total_price"] = item.get("total_price")
+                item["display_price_per_passenger"] = item.get("price_per_passenger")
+                item["fx_rate"] = 1.0
+                item["fx_date"] = None
+
+        return {
+            "status": result.get("status", "empty"),
+            "provider": result.get("provider", "Duffel"),
+            "provider_state": "LIVE" if result.get("live_mode") else "PROVIDER",
+            "offer_request_id": result.get("offer_request_id"),
+            "live_mode": result.get("live_mode"),
+            "reason": result.get("reason"),
+            "origin": origin,
+            "destination": destination,
+            "depart_date": departure_date,
+            "return_date": return_date,
+            "adults": adults,
+            "kids": kids,
+            "child_ages": child_ages,
+            "cabin_class": cabin_class,
+            "currency": traveler_currency,
+            "symbol": _currency_symbol(traveler_currency),
+            "source_currencies": source_currencies,
+            "flights": flights,
         }
+    except Exception as e:
+        print(f"[Flight Search Error]: {e}")
+        return {"status": "error", "message": str(e), "flights": []}
 
-        pair = (origin, destination)
-        results = fare_benchmarks.get(pair)
 
-        if not results:
-            results = [
-                {
-                    "airline": "Regional Value Air",
-                    "code": "VA-102",
-                    "depart_time": "07:30",
-                    "arrive_time": "16:45",
-                    "duration": "6h 45m",
-                    "stops": "1 Stop",
-                    "price_inr": 21500,
-                    "badge": "Cheapest Fare",
-                    "badge_color": "0xFF16A34A",
-                    "perks": "7kg Cabin Baggage Included"
-                },
-                {
-                    "airline": "National Full-Service Carrier",
-                    "code": "FC-404",
-                    "depart_time": "14:15",
-                    "arrive_time": "21:30",
-                    "duration": "5h 15m",
-                    "stops": "Non-stop Direct",
-                    "price_inr": 31200,
-                    "badge": "Fastest Direct",
-                    "badge_color": "0xFFDC2626",
-                    "perks": "20kg Baggage + Hot Meal Included"
-                }
-            ]
+@app.get("/api/v1/flight-offers/{offer_id}")
+async def get_live_flight_offer(offer_id: str, traveler_currency: str = Query("INR")):
+    if not DUFFEL_ACCESS_TOKEN:
+        return {"status": "unavailable", "provider": "Duffel", "message": "DUFFEL_ACCESS_TOKEN is not configured."}
 
-        mult = 1.0
-        if cabin_class == "Premium Economy":
-            mult = 1.55
-        elif cabin_class == "Business":
-            mult = 2.85
-        elif cabin_class == "First Class":
-            mult = 4.60
+    endpoint = f"{DUFFEL_BASE_URL}/air/offers/{urllib.parse.quote(offer_id, safe='') }"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            response = await client.get(
+                endpoint,
+                headers=_duffel_headers(),
+                params={"return_available_services": "true"},
+            )
+        if response.status_code != 200:
+            return {"status": "unavailable", "provider": "Duffel", "message": f"Provider returned HTTP {response.status_code}."}
+        payload = response.json()
+        offer = payload.get("data") or {}
+        normalized = _normalize_duffel_offer(offer)
+        if not normalized:
+            return {"status": "empty", "provider": "Duffel", "offer": None}
 
-        adjusted_results = []
-        for f in results:
-            item = dict(f)
-            unit_price = item["price_inr"] * (1.85 if is_round_trip else 1.0) * mult
-            item["unit_price_inr"] = int(unit_price)
-            item["total_price_inr"] = int(unit_price * adults)
-            item["price"] = int(unit_price)
-            item["currency"] = "INR"
-            item["symbol"] = "₹"
-            adjusted_results.append(item)
+        source_currency = str(normalized.get("currency") or "USD").upper()
+        quote_currency = str(traveler_currency or "INR").upper()
+        fx = await _fx_rate(source_currency, quote_currency)
+        if fx:
+            rate = fx["rate"]
+            normalized["display_currency"] = quote_currency
+            normalized["display_symbol"] = _currency_symbol(quote_currency)
+            normalized["display_total_price"] = float(_safe_decimal(normalized["total_price"]) * rate)
+            normalized["display_price_per_passenger"] = float(_safe_decimal(normalized["price_per_passenger"]) * rate)
+            normalized["fx_rate"] = float(rate)
+            normalized["fx_date"] = fx.get("date")
+        return {"status": "success", "provider": "Duffel", "offer": normalized}
+    except Exception as e:
+        return {"status": "unavailable", "provider": "Duffel", "message": str(e)}
+
+
+@app.get("/api/v1/currency-rate")
+async def get_currency_rate(base: str = Query(...), quote: str = Query(...)):
+    base_code = str(base or "").strip().upper()
+    quote_code = str(quote or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", base_code) or not re.fullmatch(r"[A-Z]{3}", quote_code):
+        raise HTTPException(status_code=400, detail="base and quote must be valid 3-letter ISO currency codes.")
+    rate_data = await _fx_rate(base_code, quote_code)
+    if not rate_data:
+        raise HTTPException(status_code=503, detail="Currency rate temporarily unavailable.")
+    return {
+        "status": "success",
+        "base": rate_data["base"],
+        "quote": rate_data["quote"],
+        "rate": float(rate_data["rate"]),
+        "date": rate_data.get("date"),
+        "provider": rate_data.get("provider"),
+        "symbol": _currency_symbol(quote_code),
+    }
+
+
+@app.post("/api/v1/explore-city")
+async def explore_city(request: Request):
+    try:
+        body = await request.json()
+        city = str(body.get("city") or "").strip()
+        state = str(body.get("state") or "").strip()
+        country = str(body.get("country") or "").strip()
+        traveler_country = str(body.get("traveler_country") or body.get("booker_country") or "IN").strip()
+        traveler_currency = str(body.get("traveler_currency") or _currency_for_country(traveler_country)).upper()
+        start_date = str(body.get("start_date") or "").strip()
+        return_date = str(body.get("return_date") or "").strip()
+        adults = int(body.get("adults", 2))
+        rooms = max(1, int(body.get("rooms", 1)))
+        child_ages = [int(x) for x in (body.get("child_ages") or [])]
+        kids = int(body.get("kids", len(child_ages)))
+
+        if not city:
+            return {"status": "error", "message": "city is required.", "landmarks": [], "places": [], "hotels": []}
+        if not start_date:
+            start_date = (datetime.utcnow() + timedelta(days=3)).date().isoformat()
+        if not return_date:
+            return_date = (datetime.fromisoformat(start_date) + timedelta(days=4)).date().isoformat()
+        if return_date <= start_date:
+            return {"status": "error", "message": "return_date must be later than start_date.", "landmarks": [], "places": [], "hotels": []}
+        if kids != len(child_ages):
+            return {
+                "status": "error",
+                "message": "Child ages are required for provider-backed stay pricing.",
+                "required": ["child_ages"],
+                "landmarks": [],
+                "places": [],
+                "hotels": [],
+            }
+
+        destination, places = await _load_google_destination_places(city, state, country)
+        if not destination:
+            return {
+                "status": "unavailable",
+                "message": "Destination resolution is unavailable. Configure GOOGLE_PLACES_API_KEY or provide a provider-backed destination resolver.",
+                "destination": None,
+                "landmarks": [],
+                "places": [],
+                "hotels": [],
+                "currency": traveler_currency,
+                "destination_currency": _currency_for_country(country),
+            }
+
+        destination_country_currency = _currency_for_country(country)
+        stays = await _booking_search_stays(
+            destination=destination,
+            checkin=start_date,
+            checkout=return_date,
+            adults=adults,
+            rooms=rooms,
+            child_ages=child_ages,
+            traveler_country=traveler_country,
+            display_currency=traveler_currency,
+        )
 
         return {
             "status": "success",
-            "origin": origin,
-            "destination": destination,
-            "depart_date": depart_date,
-            "return_date": return_date if is_round_trip else None,
+            "destination": {
+                **destination,
+                "currency": destination_country_currency,
+                "currency_symbol": _currency_symbol(destination_country_currency),
+                "display_currency": traveler_currency,
+                "display_currency_symbol": _currency_symbol(traveler_currency),
+            },
+            "traveler_currency": traveler_currency,
+            "traveler_currency_symbol": _currency_symbol(traveler_currency),
+            "destination_currency": destination_country_currency,
+            "destination_currency_symbol": _currency_symbol(destination_country_currency),
+            "start_date": start_date,
+            "return_date": return_date,
             "adults": adults,
-            "cabin_class": cabin_class,
-            "currency": "INR",
-            "flights": adjusted_results
+            "kids": kids,
+            "child_ages": child_ages,
+            "places_provider": "Google Places",
+            "places_state": "VERIFIED" if places else "EMPTY",
+            "landmarks": places,
+            "places": places,
+            "hotels": stays.get("hotels", []),
+            "hotel_provider": stays.get("provider"),
+            "hotel_state": stays.get("status"),
+            "hotel_reason": stays.get("reason"),
+            "hotel_request_id": stays.get("request_id"),
+            "attribution_required": ["Google Maps", "Booking.com"],
         }
     except Exception as e:
-        return {"status": "error", "message": str(e), "flights": []}
+        print(f"[Destination Explore Error]: {e}")
+        return {"status": "error", "message": str(e), "landmarks": [], "places": [], "hotels": []}
+
 
 # -------------------------------------------------------------
 # 10. CONCIERGE MULTI-TURN TEXT HELPER
+# -------------------------------------------------------------
+
 # -------------------------------------------------------------
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
@@ -1226,7 +2203,7 @@ RAILWAY_INTERCHANGES = {
 
 RAILWAY_CACHE: Dict[str, Dict[str, Any]] = {}
 RAILWAY_CACHE_TTL_SECONDS = 300
-RAILWAY_HTTP_TIMEOUT_SECONDS = 6.0
+RAILWAY_HTTP_TIMEOUT_SECONDS = 10.0
 
 
 def _rail_normalize(value: Any) -> str:
@@ -2144,27 +3121,6 @@ async def railway_inquiry(request: Request):
             requested_line = str(route_payload.get("line") or "ALL").upper()
             requested_service = str(route_payload.get("service") or "ALL").upper()
 
-            # Route searches can be anchored to a user-selected clock time.
-            # When omitted, use the current local server time. This is a
-            # timetable lookup, not a live-running prediction.
-            requested_time_raw = route_payload.get("time") or route_payload.get("requested_time")
-            requested_time_minutes = route_payload.get("time_minutes")
-            if requested_time_minutes is not None:
-                try:
-                    requested_time_minutes = int(requested_time_minutes) % 1440
-                except Exception:
-                    requested_time_minutes = None
-            if requested_time_minutes is None and requested_time_raw:
-                requested_time_minutes = _rail_time_to_minutes(requested_time_raw)
-            if requested_time_minutes is None:
-                now_for_route = datetime.now()
-                requested_time_minutes = now_for_route.hour * 60 + now_for_route.minute
-
-            # Show a useful window around the requested time. For example, a
-            # 2:30 PM search covers 1:30 PM through 4:30 PM.
-            window_start = max(0, requested_time_minutes - 60)
-            window_end = min(1439, requested_time_minutes + 120)
-
             if _rail_normalize(from_station) == _rail_normalize(to_station):
                 return {
                     "status": "error",
@@ -2180,24 +3136,21 @@ async def railway_inquiry(request: Request):
             )
 
             if direct_line and not line_error:
+                now = datetime.now()
+                start_min = now.hour * 60 + now.minute
+                window_end = min(start_min + 180, 1439)
+
                 result = await _rail_fetch_timetable(
                     direct_line,
                     from_station,
                     to_station,
-                    window_start,
+                    start_min,
                     window_end,
                 )
 
                 trains = _rail_filter_trains(
                     list(result.get("trains", [])),
                     requested_service,
-                )
-                trains = [
-                    train for train in trains
-                    if window_start <= int(train.get("timestamp_minutes", -1)) <= window_end
-                ]
-                trains.sort(
-                    key=lambda train: int(train.get("timestamp_minutes", 0))
                 )
 
                 return {
@@ -2213,12 +3166,7 @@ async def railway_inquiry(request: Request):
                     "route_search": True,
                     "requires_interchange": False,
                     "service_filter": requested_service,
-                    "requested_time": _rail_minutes_to_12h(requested_time_minutes),
-                    "requested_time_minutes": requested_time_minutes,
-                    "window_start": _rail_minutes_to_12h(window_start),
-                    "window_end": _rail_minutes_to_12h(window_end),
-                    "current_time": _rail_minutes_to_12h(datetime.now().hour * 60 + datetime.now().minute),
-                    "scheduled_only": True,
+                    "current_time": _rail_minutes_to_12h(start_min),
                     "timetable_version": result.get(
                         "timetable_version",
                         RAILWAY_TIMETABLE_VERSIONS.get(direct_line, "Unknown"),
