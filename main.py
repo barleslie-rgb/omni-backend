@@ -1,6 +1,6 @@
 import os
-import io
 import asyncio
+import io
 import gc
 import json
 import re
@@ -1226,7 +1226,7 @@ RAILWAY_INTERCHANGES = {
 
 RAILWAY_CACHE: Dict[str, Dict[str, Any]] = {}
 RAILWAY_CACHE_TTL_SECONDS = 300
-RAILWAY_HTTP_TIMEOUT_SECONDS = 4.5
+RAILWAY_HTTP_TIMEOUT_SECONDS = 6.0
 
 
 def _rail_normalize(value: Any) -> str:
@@ -1508,44 +1508,6 @@ def _rail_find_header(headers: List[str], candidates: List[str]) -> Optional[int
     return None
 
 
-def _rail_extract_time_candidates(value: str) -> List[str]:
-    raw = str(value or "").strip()
-    if not raw:
-        return []
-    # Handles both 24-hour and AM/PM timetable cells.
-    return re.findall(r"\b\d{1,2}:\d{2}(?:\s*[APap][Mm])?\b", raw)
-
-
-def _rail_extract_service_identifier(cell: Any) -> str:
-    """Extract the source's service/train identifier without inventing a number."""
-    if cell is None:
-        return "—"
-    try:
-        texts = [cell.get_text(" ", strip=True)]
-        for node in cell.find_all(["button", "a", "span", "strong", "b"]):
-            value = node.get_text(" ", strip=True)
-            if value:
-                texts.append(value)
-        raw = " ".join(dict.fromkeys(texts))
-    except Exception:
-        raw = str(cell).strip()
-
-    raw = re.sub(r"\s+", " ", raw).strip(" -|")
-    if not raw:
-        return "—"
-
-    # Prefer a compact source identifier such as VR, BVI, CSMT, etc.
-    tokens = [x.strip("()[]{}|,-") for x in raw.split() if x.strip()]
-    for token in tokens:
-        if re.fullmatch(r"[A-Za-z]{1,8}\d{0,6}", token):
-            return token.upper()
-    for token in tokens:
-        if re.fullmatch(r"\d{1,6}", token):
-            return token
-    # Keep meaningful source text rather than replacing it with a fake number.
-    return tokens[0] if tokens else "—"
-
-
 def _rail_parse_timetable_html(
     html: str,
     line: str,
@@ -1553,7 +1515,7 @@ def _rail_parse_timetable_html(
     to_station: str,
     source_url: str,
 ) -> List[Dict[str, Any]]:
-    """Robustly parse Mumbai Lifeline timetable tables across layout variations."""
+    """Parse Mumbai Lifeline's timetable table without assuming a fixed layout."""
     if BeautifulSoup is None:
         return []
 
@@ -1565,66 +1527,41 @@ def _rail_parse_timetable_html(
     trains: List[Dict[str, Any]] = []
     requested_from_name = _rail_station_display_name(from_station)
     requested_to_name = _rail_station_display_name(to_station)
-    from_norms = {
-        _rail_normalize(requested_from_name),
-        _rail_normalize(from_station),
-        _rail_normalize(_rail_legacy_station_param(from_station)),
-    }
-    to_norms = {
-        _rail_normalize(requested_to_name),
-        _rail_normalize(to_station),
-        _rail_normalize(_rail_legacy_station_param(to_station)),
-    }
 
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
-        if len(rows) < 2:
+        if not rows:
             continue
 
         header_row_index: Optional[int] = None
         header_cells: List[str] = []
 
-        # Do not require the station name to be present in the header. Some
-        # source variants use station codes or abbreviated headings.
-        for row_index, row in enumerate(rows[:80]):
+        # The page contains navigation/summary rows before the real timetable.
+        # Search the first 60 rows for a row containing Train No and station data.
+        for row_index, row in enumerate(rows[:60]):
             cells = row.find_all(["th", "td"])
             candidate = [cell.get_text(" ", strip=True) for cell in cells]
             normalized = [_rail_normalize(x) for x in candidate]
-            has_train = any(
-                ("trainno" in x) or ("trainnumber" in x) or x == "train"
+            has_train = any(x in {"trainno", "trainnumber", "train"} for x in normalized)
+            has_station = any(
+                _rail_normalize(requested_from_name) in x
+                or _rail_normalize(from_station) in x
                 for x in normalized
             )
-            has_speed = any("speed" in x for x in normalized)
-            has_coach = any("coach" in x for x in normalized)
-            has_origin = any("origin" in x or "originating" in x for x in normalized)
-            has_time_header = any(
-                any(name and name in x for name in from_norms | to_norms)
-                for x in normalized
-            )
-            if has_train or (has_speed and has_coach) or (has_origin and has_time_header):
+            if has_train and has_station:
                 header_row_index = row_index
                 header_cells = candidate
                 break
 
-        # Some mobile/server-rendered variants have no conventional header.
-        if header_row_index is None:
-            for row_index, row in enumerate(rows[:20]):
-                cells = row.find_all(["th", "td"])
-                values = [c.get_text(" ", strip=True) for c in cells]
-                if len(values) >= 3 and sum(bool(_rail_extract_time_candidates(v)) for v in values) >= 1:
-                    header_row_index = row_index - 1 if row_index > 0 else 0
-                    header_cells = [c.get_text(" ", strip=True) for c in rows[header_row_index].find_all(["th", "td"])]
-                    break
-
         if header_row_index is None:
             continue
 
-        train_idx = _rail_find_header(header_cells, ["Train No", "Train Number", "Train", "Service"])
-        speed_idx = _rail_find_header(header_cells, ["Speed", "Type"])
-        coach_idx = _rail_find_header(header_cells, ["Coaches", "Coach"])
-        origin_idx = _rail_find_header(header_cells, ["Originating From", "Origin", "Starts"])
-        ending_idx = _rail_find_header(header_cells, ["Ending At", "Destination", "Ends"])
-        duration_idx = _rail_find_header(header_cells, ["Duration", "Travel Time"])
+        train_idx = _rail_find_header(header_cells, ["Train No", "Train Number", "Train"])
+        speed_idx = _rail_find_header(header_cells, ["Speed"])
+        coach_idx = _rail_find_header(header_cells, ["Coaches"])
+        origin_idx = _rail_find_header(header_cells, ["Originating From", "Origin"])
+        ending_idx = _rail_find_header(header_cells, ["Ending At", "Destination"])
+        duration_idx = _rail_find_header(header_cells, ["Duration"])
         from_time_idx = _rail_find_header(
             header_cells,
             [requested_from_name, from_station, _rail_legacy_station_param(from_station)],
@@ -1634,53 +1571,30 @@ def _rail_parse_timetable_html(
             [requested_to_name, to_station, _rail_legacy_station_param(to_station)],
         )
 
+        if train_idx is None or from_time_idx is None:
+            continue
+
         for row in rows[header_row_index + 1:]:
             cells = row.find_all(["th", "td"])
             values = [c.get_text(" ", strip=True) for c in cells]
-            if not values:
+            if not values or train_idx >= len(values) or from_time_idx >= len(values):
                 continue
 
-            # Determine departure column from the named header first. If that
-            # fails, choose the first column containing a valid time.
-            dep_idx = from_time_idx
-            if dep_idx is None or dep_idx >= len(values):
-                time_indices = [i for i, v in enumerate(values) if _rail_extract_time_candidates(v)]
-                if not time_indices:
-                    continue
-                dep_idx = time_indices[0]
+            train_cell = values[train_idx].strip()
+            dep_raw = values[from_time_idx].strip()
+            arr_raw = (
+                values[to_time_idx].strip()
+                if to_time_idx is not None and to_time_idx < len(values)
+                else ""
+            )
 
-            dep_candidates = _rail_extract_time_candidates(values[dep_idx])
-            if not dep_candidates:
+            if not train_cell or not dep_raw or dep_raw in {"—", "-", "–"}:
                 continue
-            dep_raw = dep_candidates[0]
+
             dep_min = _rail_time_to_minutes(dep_raw)
+            arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
             if dep_min is None:
                 continue
-
-            # Arrival is normally the next station column. Prefer the named
-            # destination column, otherwise use another time-bearing cell.
-            arr_raw = ""
-            if to_time_idx is not None and to_time_idx < len(values) and to_time_idx != dep_idx:
-                candidates = _rail_extract_time_candidates(values[to_time_idx])
-                if candidates:
-                    arr_raw = candidates[0]
-            if not arr_raw:
-                for i, value in enumerate(values):
-                    if i == dep_idx:
-                        continue
-                    candidates = _rail_extract_time_candidates(value)
-                    if candidates:
-                        arr_raw = candidates[0]
-                        break
-
-            arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
-            if arr_min is not None and arr_min < dep_min:
-                arr_min += 1440
-
-            train_cell = values[train_idx] if train_idx is not None and train_idx < len(values) else ""
-            identifier = _rail_extract_service_identifier(cells[train_idx] if train_idx is not None and train_idx < len(cells) else (cells[0] if cells else None))
-            if identifier == "—" and train_cell:
-                identifier = _rail_extract_service_identifier(cells[train_idx] if train_idx is not None and train_idx < len(cells) else None)
 
             speed = values[speed_idx] if speed_idx is not None and speed_idx < len(values) else ""
             coaches = values[coach_idx] if coach_idx is not None and coach_idx < len(values) else None
@@ -1688,25 +1602,22 @@ def _rail_parse_timetable_html(
             ending = values[ending_idx] if ending_idx is not None and ending_idx < len(values) else None
             duration = values[duration_idx] if duration_idx is not None and duration_idx < len(values) else None
 
-            # Never treat a raw station/time value as a train number.
-            if identifier in {requested_from_name, requested_to_name, dep_raw, arr_raw}:
-                identifier = "—"
+            service_type, service_label = _rail_detect_service(train_cell, speed)
+            cleaned_train_no = _rail_clean_train_no(train_cell)
+            if cleaned_train_no == "—":
+                cleaned_train_no = train_cell
 
-            service_type, service_label = _rail_detect_service(
-                f"{train_cell} {identifier}", speed
-            )
-            name_origin = origin or requested_from_name
-            name_destination = ending or requested_to_name
+            if arr_min is not None and arr_min < dep_min:
+                arr_min += 1440
 
             trains.append({
                 "time": dep_raw,
                 "departure_time": dep_raw,
-                "arrival_time": arr_raw or None,
+                "arrival_time": arr_raw if arr_raw not in {"", "—", "-", "–"} else None,
                 "timestamp_minutes": dep_min,
                 "arrival_minutes": arr_min,
-                "train_no": identifier,
-                "service_id": identifier,
-                "name": f"{name_origin} → {name_destination}",
+                "train_no": cleaned_train_no,
+                "name": f"{origin or requested_from_name} → {ending or requested_to_name}",
                 "service_type": service_type,
                 "service": service_label,
                 "category": service_label,
@@ -1735,17 +1646,17 @@ def _rail_parse_timetable_html(
         if trains:
             break
 
-    unique: Dict[Tuple[str, int, str, str], Dict[str, Any]] = {}
+    unique: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
     for train in trains:
         key = (
-            str(train.get("train_no", "—")),
+            str(train.get("train_no", "")),
             int(train.get("timestamp_minutes", -1)),
             str(train.get("destination", "")),
-            str(train.get("name", "")),
         )
         unique[key] = train
 
     return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
+
 
 def _rail_parse_mobile_timetable_html(
     html: str,
@@ -1830,16 +1741,22 @@ async def _rail_fetch_timetable(
     after_minutes: int,
     before_minutes: int,
 ) -> Dict[str, Any]:
-    """Fetch one timetable quickly, concurrently testing source variants."""
     line = str(line).upper()
     from_name = _rail_station_display_name(from_station)
     to_name = _rail_station_display_name(to_station)
-    source_urls = _rail_candidate_urls(line, from_station, to_station, after_minutes, before_minutes)
+
+    source_urls = _rail_candidate_urls(
+        line=line,
+        from_station=from_station,
+        to_station=to_station,
+        after_minutes=after_minutes,
+        before_minutes=before_minutes,
+    )
     primary_url = source_urls[0]
 
     cache_key = f"{line}|{from_name}|{to_name}|{after_minutes}|{before_minutes}"
     cached = _rail_cache_get(cache_key)
-    if cached is not None and cached.get("trains"):
+    if cached is not None:
         return cached
 
     result = {
@@ -1856,81 +1773,60 @@ async def _rail_fetch_timetable(
         "error": None,
     }
 
+    errors: List[str] = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36 OmniTouristOS/1.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    async def fetch_one(client: httpx.AsyncClient, url: str) -> Tuple[str, Optional[httpx.Response], Optional[str]]:
-        try:
-            response = await client.get(url)
-            if response.status_code != 200:
-                return url, response, f"HTTP {response.status_code}"
-            return url, response, None
-        except Exception as exc:
-            return url, None, f"{type(exc).__name__}: {exc}"
-
-    errors: List[str] = []
     try:
-        timeout = httpx.Timeout(
-            connect=2.5,
-            read=RAILWAY_HTTP_TIMEOUT_SECONDS,
-            write=2.5,
-            pool=2.5,
-        )
         async with httpx.AsyncClient(
             follow_redirects=True,
-            timeout=timeout,
+            timeout=RAILWAY_HTTP_TIMEOUT_SECONDS,
             headers=headers,
         ) as client:
-            # Run the three source variants together. This prevents the station
-            # board from serially waiting 10s + 10s + 10s for fallbacks.
-            responses = await asyncio.gather(*(fetch_one(client, url) for url in source_urls))
+            for index, url in enumerate(source_urls):
+                try:
+                    response = await client.get(url)
+                    if response.status_code != 200:
+                        errors.append(f"HTTP {response.status_code}: {url}")
+                        continue
 
-        # Prefer the modern timetable page, then legacy, then mobile fallback.
-        for url, response, error in responses:
-            if error:
-                errors.append(f"{error}: {url}")
-                continue
-            if response is None:
-                continue
+                    parsed = _rail_parse_timetable_html(
+                        html=response.text,
+                        line=line,
+                        from_station=from_station,
+                        to_station=to_station,
+                        source_url=str(response.url),
+                    )
 
-            parsed = _rail_parse_timetable_html(
-                html=response.text,
-                line=line,
-                from_station=from_station,
-                to_station=to_station,
-                source_url=str(response.url),
-            )
-            if not parsed and "/m/" in str(response.url):
-                parsed = _rail_parse_mobile_timetable_html(
-                    html=response.text,
-                    line=line,
-                    from_station=from_station,
-                    to_station=to_station,
-                    source_url=str(response.url),
-                )
+                    if not parsed and index == len(source_urls) - 1:
+                        parsed = _rail_parse_mobile_timetable_html(
+                            html=response.text,
+                            line=line,
+                            from_station=from_station,
+                            to_station=to_station,
+                            source_url=str(response.url),
+                        )
 
-            if parsed:
-                result["trains"] = parsed
-                result["source_url"] = str(response.url)
-                result["source_used"] = "mobile" if "/m/" in str(response.url) else "timetable"
-                result["error"] = None
-                result["source_errors"] = []
-                _rail_cache_set(cache_key, result)
-                return result
+                    if parsed:
+                        result["trains"] = parsed
+                        result["source_url"] = str(response.url)
+                        result["source_used"] = "mobile" if "/m/" in str(response.url) else "timetable"
+                        result["error"] = None
+                        _rail_cache_set(cache_key, result)
+                        return result
 
-            errors.append(f"No timetable rows parsed: {url}")
+                    errors.append(f"No timetable rows parsed: {url}")
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
 
     except Exception as exc:
         errors.append(f"{type(exc).__name__}: {exc}")
 
-    # Keep diagnostics for logs/debugging, but do not make the Flutter UI
-    # depend on verbose parser/URL details.
-    result["error"] = "Timetable temporarily unavailable."
-    result["source_errors"] = errors[-3:]
-    result["data_available"] = False
+    result["error"] = "Timetable source was reached, but no schedule rows could be parsed. " + " | ".join(errors[-3:])
+    result["source_errors"] = errors
     _rail_cache_set(cache_key, result)
     return result
 
@@ -2248,6 +2144,27 @@ async def railway_inquiry(request: Request):
             requested_line = str(route_payload.get("line") or "ALL").upper()
             requested_service = str(route_payload.get("service") or "ALL").upper()
 
+            # Route searches can be anchored to a user-selected clock time.
+            # When omitted, use the current local server time. This is a
+            # timetable lookup, not a live-running prediction.
+            requested_time_raw = route_payload.get("time") or route_payload.get("requested_time")
+            requested_time_minutes = route_payload.get("time_minutes")
+            if requested_time_minutes is not None:
+                try:
+                    requested_time_minutes = int(requested_time_minutes) % 1440
+                except Exception:
+                    requested_time_minutes = None
+            if requested_time_minutes is None and requested_time_raw:
+                requested_time_minutes = _rail_time_to_minutes(requested_time_raw)
+            if requested_time_minutes is None:
+                now_for_route = datetime.now()
+                requested_time_minutes = now_for_route.hour * 60 + now_for_route.minute
+
+            # Show a useful window around the requested time. For example, a
+            # 2:30 PM search covers 1:30 PM through 4:30 PM.
+            window_start = max(0, requested_time_minutes - 60)
+            window_end = min(1439, requested_time_minutes + 120)
+
             if _rail_normalize(from_station) == _rail_normalize(to_station):
                 return {
                     "status": "error",
@@ -2263,21 +2180,24 @@ async def railway_inquiry(request: Request):
             )
 
             if direct_line and not line_error:
-                now = datetime.now()
-                start_min = now.hour * 60 + now.minute
-                window_end = min(start_min + 180, 1439)
-
                 result = await _rail_fetch_timetable(
                     direct_line,
                     from_station,
                     to_station,
-                    start_min,
+                    window_start,
                     window_end,
                 )
 
                 trains = _rail_filter_trains(
                     list(result.get("trains", [])),
                     requested_service,
+                )
+                trains = [
+                    train for train in trains
+                    if window_start <= int(train.get("timestamp_minutes", -1)) <= window_end
+                ]
+                trains.sort(
+                    key=lambda train: int(train.get("timestamp_minutes", 0))
                 )
 
                 return {
@@ -2293,7 +2213,12 @@ async def railway_inquiry(request: Request):
                     "route_search": True,
                     "requires_interchange": False,
                     "service_filter": requested_service,
-                    "current_time": _rail_minutes_to_12h(start_min),
+                    "requested_time": _rail_minutes_to_12h(requested_time_minutes),
+                    "requested_time_minutes": requested_time_minutes,
+                    "window_start": _rail_minutes_to_12h(window_start),
+                    "window_end": _rail_minutes_to_12h(window_end),
+                    "current_time": _rail_minutes_to_12h(datetime.now().hour * 60 + datetime.now().minute),
+                    "scheduled_only": True,
                     "timetable_version": result.get(
                         "timetable_version",
                         RAILWAY_TIMETABLE_VERSIONS.get(direct_line, "Unknown"),
@@ -2382,14 +2307,11 @@ async def railway_inquiry(request: Request):
                     if _rail_normalize(target_name) == _rail_normalize(station_name):
                         continue
 
-                    # Fetch from the beginning of the published service day so the
-                    # response contains the full schedule. The backend derives
-                    # next_trains from current_min below.
                     result = await _rail_fetch_timetable(
                         line=line,
                         from_station=station,
                         to_station=target_name,
-                        after_minutes=0,
+                        after_minutes=board_start,
                         before_minutes=board_end,
                     )
 
@@ -2453,7 +2375,7 @@ async def railway_inquiry(request: Request):
                 "lines": unique_line_set,
                 "line_names": [_rail_line_name(line) for line in unique_line_set],
                 "current_time": _rail_minutes_to_12h(current_min),
-                "board_window": "00:00 AM – 11:59 PM",
+                "board_window": "03:30 AM – 11:59 PM",
                 "trains": deduped,
                 "next_trains": upcoming,
                 "train_count": len(deduped),
