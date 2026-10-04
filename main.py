@@ -1087,8 +1087,27 @@ async def _load_google_destination_places(city: str, state: str, country: str) -
             if place_id and place_id not in merged:
                 merged[place_id] = place
 
+    # Text Search normally returns photo resource names when places.photos is
+    # requested. Some place records still arrive without photos; hydrate those
+    # records through Place Details before giving up so the Explorer does not
+    # unnecessarily fall back to a blank image. Google documents that photos
+    # can be obtained from Text Search or Place Details.
+    place_values = list(merged.values())
+    missing_photo_places = [
+        place for place in place_values[:20]
+        if not (place.get("photos") or []) and place.get("id")
+    ]
+    if missing_photo_places:
+        hydrated = await asyncio.gather(
+            *[_google_place_details(str(place.get("id"))) for place in missing_photo_places],
+            return_exceptions=True,
+        )
+        for original, detail in zip(missing_photo_places, hydrated):
+            if isinstance(detail, dict) and detail.get("photos"):
+                original["photos"] = detail.get("photos") or []
+
     normalized: List[Dict[str, Any]] = []
-    for place in merged.values():
+    for place in place_values:
         item = _normalize_google_place(place, destination["latitude"], destination["longitude"])
         if item:
             normalized.append(item)
@@ -1490,53 +1509,62 @@ async def _search_travelpayouts_flights(
     if max_connections == 0:
         params["direct"] = "true"
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(TRAVELPAYOUTS_TIMEOUT_SECONDS, connect=6.0)
-        ) as client:
-            response = await client.get(
-                endpoint,
-                headers=_travelpayouts_headers(),
-                params=params,
-            )
+    async def _fetch(params_to_use: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(TRAVELPAYOUTS_TIMEOUT_SECONDS, connect=6.0)
+            ) as client:
+                response = await client.get(
+                    endpoint,
+                    headers=_travelpayouts_headers(),
+                    params=params_to_use,
+                )
+            if response.status_code != 200:
+                print(
+                    f"[Travelpayouts Search Notice] {response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+                return None, f"Provider returned HTTP {response.status_code}."
+            payload = response.json()
+            return (payload if isinstance(payload, dict) else None), None
+        except Exception as e:
+            print(f"[Travelpayouts Search Notice]: {e}")
+            return None, "Provider request failed or timed out."
 
-        if response.status_code != 200:
-            print(
-                f"[Travelpayouts Search Notice] {response.status_code}: "
-                f"{response.text[:500]}"
-            )
-            return {
-                "status": "unavailable",
-                "provider": "Aviasales Data API",
-                "reason": f"Provider returned HTTP {response.status_code}.",
-                "live_mode": False,
-                "flights": [],
-            }
-
-        payload = response.json()
-    except Exception as e:
-        print(f"[Travelpayouts Search Notice]: {e}")
+    payload, fetch_error = await _fetch(params)
+    if fetch_error:
         return {
             "status": "unavailable",
             "provider": "Aviasales Data API",
-            "reason": "Provider request failed or timed out.",
+            "reason": fetch_error,
             "live_mode": False,
             "flights": [],
         }
 
-    if not isinstance(payload, dict):
-        return {
-            "status": "empty",
-            "provider": "Aviasales Data API",
-            "reason": "Provider returned an invalid response.",
-            "live_mode": False,
-            "flights": [],
-        }
-
-    raw_prices = payload.get("data") or []
+    raw_prices = (payload or {}).get("data") or []
     if not isinstance(raw_prices, list):
         raw_prices = []
 
+    # The Data API is cached data, so an exact future round-trip can legitimately
+    # have no record even when the route itself has fares. In that case make a
+    # second month-level request and surface the nearest cached dates instead of
+    # making the user think the provider is broken.
+    fallback_mode = "EXACT_DATE"
+    requested_departure = departure_date
+    requested_return = return_date
+    if not raw_prices and len(departure_date) == 10:
+        month_params = dict(params)
+        month_params["departure_at"] = departure_date[:7]
+        if return_date and len(return_date) == 10:
+            month_params["return_at"] = return_date[:7]
+        month_payload, month_error = await _fetch(month_params)
+        if month_payload is not None:
+            month_prices = month_payload.get("data") or []
+            if isinstance(month_prices, list) and month_prices:
+                raw_prices = month_prices
+                fallback_mode = "NEAREST_CACHED_DATE"
+        elif month_error:
+            print(f"[Travelpayouts Fallback Notice]: {month_error}")
     normalized: List[Dict[str, Any]] = []
     seen: set = set()
 
@@ -1585,13 +1613,30 @@ async def _search_travelpayouts_flights(
     normalized.sort(key=lambda x: float(x.get("total_price") or 0))
     normalized = normalized[:50]
 
+    if normalized:
+        reason = (
+            None
+            if fallback_mode == "EXACT_DATE"
+            else "No exact cached fare was found; showing the closest cached fares available for the selected month."
+        )
+    else:
+        reason = "No cached provider fares were found for this route/date or its selected month."
+
+    for item in normalized:
+        item["requested_departure_date"] = requested_departure
+        item["requested_return_date"] = requested_return
+        item["date_match"] = fallback_mode
+
     return {
         "status": "success" if normalized else "empty",
         "provider": "Aviasales Data API",
         "offer_request_id": None,
         "live_mode": False,
-        "reason": None if normalized else "No cached provider fares were found for this route/date.",
+        "reason": reason,
         "data_freshness": "cached_up_to_48h",
+        "date_match": fallback_mode,
+        "requested_departure_date": requested_departure,
+        "requested_return_date": requested_return,
         "flights": normalized,
     }
 
