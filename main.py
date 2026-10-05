@@ -3499,7 +3499,10 @@ async def explore_chat(request: Request):
         except HTTPException:
             raise
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Unable to load Sarathi conversation context: {exc}")
+            # Conversation persistence/context is auxiliary. If Supabase is
+            # temporarily unavailable or a deployed schema is missing, keep the
+            # chat request alive and fall back to the client-provided history.
+            print(f"[Sarathi context warning]: {exc}")
 
     user_name_instruction = ""
     if authenticated_user:
@@ -5437,6 +5440,128 @@ async def _railradar_fetch_between(
     return result
 
 
+
+async def _railradar_fetch_station_live_board(
+    station_code: str,
+    *,
+    hours: int = 2,
+) -> Dict[str, Any]:
+    """Fetch RailRadar's live station board.
+
+    This is intentionally separate from the static station timetable endpoint.
+    For a commuter board we need trains that merely HALT at the selected station
+    (for example Virar -> Churchgate trains halting at Naigaon), plus the live
+    departure/platform/delay fields supplied by RailRadar.
+    """
+    station = str(station_code).strip().upper()
+    hours = hours if hours in {2, 4, 6, 8} else 2
+    source_url = f"{RAILRADAR_BASE_URL}/stations/{urllib.parse.quote(station)}/live"
+
+    status_code, payload, error = await _railradar_get(
+        f"stations/{urllib.parse.quote(station)}/live",
+        params={
+            "hours": str(hours),
+            "includeIntermediate": "false",
+        },
+    )
+
+    data = _rr_data(payload)
+    provider_trains = data.get("trains") if isinstance(data.get("trains"), list) else []
+    normalized: List[Dict[str, Any]] = []
+
+    for item in provider_trains:
+        if not isinstance(item, dict):
+            continue
+        train_obj = item.get("train")
+        stop = item.get("stop") if isinstance(item.get("stop"), dict) else {}
+        live = item.get("live") if isinstance(item.get("live"), dict) else {}
+        if not isinstance(train_obj, dict):
+            continue
+        if not _rr_is_mumbai_local(train_obj):
+            continue
+
+        expected_raw = live.get("expectedDepartureTime") or stop.get("departure") or stop.get("arrival")
+        minute = _rr_time_minutes(expected_raw)
+        if minute is None:
+            continue
+
+        service_type, service_label = _rr_service_type(train_obj)
+        train_no = str(train_obj.get("number") or "—")
+        train_name = str(train_obj.get("name") or "Mumbai Local")
+
+        destination = train_obj.get("destination")
+        if isinstance(destination, dict):
+            destination = destination.get("name") or destination.get("code")
+        source = train_obj.get("source")
+        if isinstance(source, dict):
+            source = source.get("name") or source.get("code")
+
+        live_type = str(live.get("type") or "scheduled").strip()
+        delay = live.get("delayMinutes")
+        platform = live.get("platform")
+        status = live_type.replace("-", " ").title() if live_type else "Scheduled"
+        status_msg = f"Live: {status}"
+        if delay is not None:
+            try:
+                status_msg = f"{status} • {int(delay)} min delay"
+            except Exception:
+                pass
+
+        normalized.append({
+            "time": _rr_time_display(expected_raw),
+            "departure_time": _rr_time_display(expected_raw),
+            "scheduled_departure_time": _rr_time_display(stop.get("departure")),
+            "arrival_time": _rr_time_display(stop.get("arrival")),
+            "timestamp_minutes": minute,
+            "arrival_minutes": _rr_time_minutes(stop.get("arrival")),
+            "train_no": train_no,
+            "number": train_no,
+            "name": train_name,
+            "train_name": train_name,
+            "service_type": service_type,
+            "service": service_label,
+            "category": str(train_obj.get("category") or train_obj.get("type") or service_label),
+            "platform": str(platform) if platform is not None else None,
+            "status": status,
+            "status_msg": status_msg,
+            "delay_minutes": delay,
+            "crowd": None,
+            "door_side": None,
+            "coaches": None,
+            "coach_count": None,
+            "composition": None,
+            "source": str(source or _rail_station_display_name(station)),
+            "destination": str(destination or "—"),
+            "origin": str(source or _rail_station_display_name(station)),
+            "ending_at": str(destination or "—"),
+            "duration": None,
+            "days": _rr_run_days(train_obj.get("runDays")),
+            "live": True,
+            "live_feed_available": True,
+            "live_type": live_type,
+            "expected_departure_at": live.get("expectedDepartureTime"),
+            "stop_sequence": stop.get("sequence"),
+            "data_source": source_url,
+            "data_source_type": "RailRadar Live Station API",
+        })
+
+    normalized.sort(key=lambda item: (int(item.get("timestamp_minutes", 0)), str(item.get("train_no", ""))))
+    return {
+        "trains": normalized,
+        "source_url": source_url,
+        "source_label": "RailRadar Live Station API",
+        "station_code": station,
+        "station_name": (
+            str(data.get("station", {}).get("name"))
+            if isinstance(data.get("station"), dict) and data.get("station", {}).get("name")
+            else _rail_station_display_name(station)
+        ),
+        "error": error,
+        "http_status": status_code or None,
+        "provider_count": len(provider_trains),
+    }
+
+
 async def _railradar_fetch_station_board(
     station_code: str,
     *,
@@ -5676,12 +5801,40 @@ async def railway_inquiry(request: Request):
             # Direct RailRadar route search. For Mumbai suburban pairs this is
             # the authoritative provider response and avoids the old HTML source.
             if direct_line and not line_error:
-                result = await _railradar_fetch_between(
+                # A commuter route must include trains that ORIGINATE elsewhere
+                # but HALT at the selected origin station (e.g. Virar -> Churchgate
+                # when the user selects Naigaon). The live station-board endpoint
+                # is the correct source for that use case.
+                station_live = await _railradar_fetch_station_live_board(
                     from_station,
-                    to_station,
-                    date_value=_ist_now().strftime("%Y-%m-%d"),
-                    live=False,
+                    hours=2,
                 )
+                station_trains = station_live.get("trains", [])
+
+                destination_norm = _rail_normalize(to_station)
+                trains = []
+                for train in station_trains:
+                    destination = _rail_normalize(str(train.get("destination") or ""))
+                    ending_at = _rail_normalize(str(train.get("ending_at") or ""))
+                    if destination_norm and destination_norm not in destination and destination_norm not in ending_at:
+                        # For Churchgate/CCG, allow the exact code/name variants.
+                        if to_station == "CCG" and "CHURCHGATE" not in f"{destination} {ending_at}" and "CCG" not in f"{destination} {ending_at}":
+                            continue
+                        elif to_station != "CCG":
+                            continue
+                    if _rr_route_matches_service(train, requested_service):
+                        trains.append(train)
+
+                result = {
+                    **station_live,
+                    "trains": trains,
+                    "source_url": station_live.get("source_url"),
+                    "source_label": "RailRadar Live Station API",
+                    "from": _rail_station_display_name(from_station),
+                    "to": _rail_station_display_name(to_station),
+                    "date": _ist_now().strftime("%Y-%m-%d"),
+                    "live": True,
+                }
 
                 if result.get("error") and not result.get("trains"):
                     return {
@@ -5811,7 +5964,9 @@ async def railway_inquiry(request: Request):
                     "trains": [],
                 }
 
-            result = await _railradar_fetch_station_board(station)
+            # Use RailRadar's live station board for the visible commuter board.
+            # The static timetable endpoint is retained for compatibility elsewhere.
+            result = await _railradar_fetch_station_live_board(station, hours=2)
             trains = list(result.get("trains", []))
 
             current = _ist_now()
