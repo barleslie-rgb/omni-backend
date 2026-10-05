@@ -946,6 +946,91 @@ async def google_place_photo(
         raise HTTPException(status_code=502, detail="Google photo service temporarily unavailable.")
 
 
+@app.get("/api/v1/place-photo-by-id")
+async def google_place_photo_by_id(
+    place_id: str = Query(...),
+    max_width: int = Query(1200, ge=320, le=4800),
+):
+    """Resolve the first current Google Places photo for a place ID and proxy it.
+
+    This is a second-level fallback for clients that receive a verified place ID
+    but do not receive photo resource names in the original explore response.
+    The Google API key remains server-side.
+    """
+    if not GOOGLE_PLACES_API_KEY:
+        raise HTTPException(status_code=503, detail="Google Places photo service is not configured.")
+
+    clean_id = str(place_id or "").strip()
+    if not clean_id:
+        raise HTTPException(status_code=400, detail="Place ID is required.")
+
+    place = await _google_place_details(clean_id)
+    if not place:
+        raise HTTPException(status_code=404, detail="Google place could not be resolved.")
+
+    photos = place.get("photos") or []
+    photo_names = [str(photo.get("name") or "").strip() for photo in photos if photo.get("name")]
+    if not photo_names:
+        raise HTTPException(status_code=404, detail="No Google photo is available for this place.")
+
+    photo_name = photo_names[0]
+    encoded_name = urllib.parse.quote(photo_name, safe="/")
+    endpoint = f"{GOOGLE_PLACES_BASE_URL}/{encoded_name}/media"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=True,
+        ) as client:
+            metadata_response = await client.get(
+                endpoint,
+                params={
+                    "maxWidthPx": int(max_width),
+                    "skipHttpRedirect": "true",
+                    "key": GOOGLE_PLACES_API_KEY,
+                },
+                headers={"Accept": "application/json"},
+            )
+            photo_uri = ""
+            if metadata_response.status_code == 200:
+                try:
+                    metadata = metadata_response.json()
+                    photo_uri = str(metadata.get("photoUri") or "").strip()
+                except Exception:
+                    photo_uri = ""
+
+            if photo_uri:
+                image_response = await client.get(photo_uri)
+            else:
+                image_response = await client.get(
+                    endpoint,
+                    params={"maxWidthPx": int(max_width), "key": GOOGLE_PLACES_API_KEY},
+                )
+
+        if image_response.status_code != 200:
+            detail = image_response.text[:300] if image_response.content else "empty response"
+            print(f"[Google Photo By ID Notice] {image_response.status_code}: {detail}")
+            raise HTTPException(status_code=502, detail="Google photo could not be retrieved.")
+
+        media_type = image_response.headers.get("content-type", "image/jpeg").split(";")[0]
+        if not media_type.startswith("image/"):
+            raise HTTPException(status_code=502, detail="Google returned an invalid photo response.")
+
+        return Response(
+            content=image_response.content,
+            media_type=media_type,
+            headers={
+                "Cache-Control": "public, max-age=900",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Google Photo By ID Notice]: {e}")
+        raise HTTPException(status_code=502, detail="Google photo service temporarily unavailable.")
+
+
 def _normalize_google_place(place: Dict[str, Any], origin_lat: float, origin_lng: float) -> Optional[Dict[str, Any]]:
     loc = place.get("location") or {}
     lat = loc.get("latitude")
@@ -1326,6 +1411,46 @@ def _duffel_cabin(value: str) -> str:
     return mapping.get(raw, "economy")
 
 
+def _build_aviasales_search_url(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: Optional[str],
+    adults: int,
+    children: int,
+    infants: int,
+    cabin_class: str,
+) -> str:
+    """Build an Aviasales route-search URL as a booking fallback.
+
+    This is intentionally a search/booking handoff, not a fabricated agency
+    ticket URL. The user completes the purchase on Aviasales/its agencies.
+    Travelpayouts documents the /search/PARAMS format and the required adult
+    passenger count.
+    """
+    def ddmm(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        try:
+            return datetime.fromisoformat(str(value)[:10]).strftime("%d%m")
+        except Exception:
+            return ""
+
+    cabin = {
+        "business": "c",
+        "premium_economy": "w",
+        "premium economy": "w",
+        "first": "f",
+        "first class": "f",
+    }.get(str(cabin_class or "economy").strip().lower(), "")
+    pax = f"{cabin}{max(1, int(adults or 1))}{max(0, int(children or 0))}{max(0, int(infants or 0))}"
+    params = f"{origin.upper()}{ddmm(departure_date)}{destination.upper()}"
+    if return_date:
+        params += f"{ddmm(return_date)}"
+    params += pax
+    return f"https://www.aviasales.com/search/{params}"
+
+
 def _normalize_travelpayouts_offer(
     offer: Dict[str, Any],
     origin: str,
@@ -1378,7 +1503,15 @@ def _normalize_travelpayouts_offer(
 
         flight_number = str(offer.get("flight_number") or "").strip()
         airline = str(offer.get("airline") or "").strip()
+        # Aviasales Data API can return a relative ticket/search link.
+        # Flutter's URL launcher requires an absolute URL, so normalize it.
+        # If no provider link is available, the app will use the safe route
+        # search fallback generated below.
         booking_link = str(offer.get("link") or "").strip()
+        if booking_link.startswith("/"):
+            booking_link = "https://www.aviasales.com" + booking_link
+        elif booking_link and not booking_link.startswith(("http://", "https://")):
+            booking_link = "https://www.aviasales.com/" + booking_link.lstrip("/")
 
         outbound_slice = {
             "origin": origin,
@@ -1608,6 +1741,26 @@ async def _search_travelpayouts_flights(
         if key in seen:
             continue
         seen.add(key)
+        # Data API results may not contain a directly usable ticket link.
+        # Provide a provider search handoff so every displayed result still has
+        # a real booking path instead of a dead/invalid button.
+        if not item.get("ticket_link"):
+            item["ticket_link"] = _build_aviasales_search_url(
+                origin=origin,
+                destination=destination,
+                departure_date=str(item.get("depart_datetime") or departure_date)[:10],
+                return_date=(str(item.get("return_depart_datetime") or return_date)[:10] if (item.get("return_depart_datetime") or return_date) else None),
+                adults=adults,
+                children=len(child_ages),
+                infants=0,
+                cabin_class=cabin_class,
+            )
+            item["booking_reference"] = item["ticket_link"]
+            item["booking_capable"] = True
+            item["booking_mode"] = "AVIASALES_ROUTE_SEARCH"
+        elif item.get("ticket_link"):
+            item["booking_mode"] = "PROVIDER_OR_AVIASALES_LINK"
+
         normalized.append(item)
 
     normalized.sort(key=lambda x: float(x.get("total_price") or 0))
