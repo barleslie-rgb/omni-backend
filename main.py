@@ -69,6 +69,15 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip().strip('"').str
 supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 # -------------------------------------------------------------
+# RAILRADAR API CONFIGURATION
+# -------------------------------------------------------------
+RAILRADAR_API_KEY = os.environ.get("RAILRADAR_API_KEY", "").strip().strip('"').strip("'")
+RAILRADAR_BASE_URL = os.environ.get(
+    "RAILRADAR_BASE_URL",
+    "https://api.railradar.in/v1"
+).strip().rstrip("/")
+
+# -------------------------------------------------------------
 # 1. LIVE BULLION BENCHMARK ENGINE
 # -------------------------------------------------------------
 _bullion_cache = {
@@ -4577,6 +4586,73 @@ async def _rail_cross_line_route(
         "source_label": RAILWAY_REFERENCE_LABEL,
     }
 
+
+
+@app.get("/api/v1/railradar-test")
+async def railradar_test(
+    date: Optional[str] = Query(None),
+    live: bool = Query(False),
+):
+    """
+    Temporary RailRadar connectivity diagnostic.
+
+    The API key remains server-side and is never returned to the client.
+    Remove this endpoint after RailRadar integration has been verified.
+    """
+    if not RAILRADAR_API_KEY:
+        return {
+            "status": "error",
+            "railradar_configured": False,
+            "message": "RAILRADAR_API_KEY is not configured on the backend.",
+        }
+
+    test_date = (date or datetime.now().strftime("%Y-%m-%d")).strip()
+    endpoint = f"{RAILRADAR_BASE_URL}/trains/between/NIG/CCG"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=8.0)
+        ) as client:
+            response = await client.get(
+                endpoint,
+                params={
+                    "type": "local",
+                    "date": test_date,
+                    "live": str(live).lower(),
+                },
+                headers={
+                    "Authorization": f"Bearer {RAILRADAR_API_KEY}",
+                    "Accept": "application/json",
+                },
+            )
+
+        try:
+            provider_data = response.json()
+        except Exception:
+            provider_data = {"raw_response": response.text[:5000]}
+
+        return {
+            "status": "success" if response.is_success else "error",
+            "railradar_configured": True,
+            "railradar_reachable": True,
+            "http_status": response.status_code,
+            "endpoint_tested": endpoint,
+            "route": "NIG -> CCG",
+            "date": test_date,
+            "live": live,
+            "provider_response": provider_data,
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "railradar_configured": True,
+            "railradar_reachable": False,
+            "route": "NIG -> CCG",
+            "date": test_date,
+            "live": live,
+            "message": f"RailRadar request failed: {type(exc).__name__}: {exc}",
+        }
 
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
