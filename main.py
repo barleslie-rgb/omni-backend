@@ -19,7 +19,6 @@ import requests
 from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import Response
 from places import router as places_router
-from services.destination_engine import router as destination_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -44,9 +43,6 @@ app = FastAPI(
 
 # Register the places router on the active app instance
 app.include_router(places_router)
-# Destination Engine v2 is mounted before legacy destination routes so the
-# new local-catalog-first architecture owns the stable public API contract.
-app.include_router(destination_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -386,6 +382,13 @@ TRAVELPAYOUTS_AVIASALES_BASE_URL = os.environ.get(
 ).rstrip("/")
 TRAVELPAYOUTS_TIMEOUT_SECONDS = max(5.0, min(float(os.environ.get("TRAVELPAYOUTS_TIMEOUT_SECONDS", "25")), 60.0))
 
+# Optional Aviasales/Travelpayouts White Label host. Configure this to a
+# Travelpayouts White Label whose project currency is INR. When set, booking
+# handoffs use this host instead of the public aviasales.com host, which lets
+# the White Label enforce the configured INR display currency without relying
+# on an undocumented Aviasales URL query parameter.
+AVIASALES_BOOKING_BASE_URL = os.environ.get("AVIASALES_BOOKING_BASE_URL", "").strip().rstrip("/")
+
 
 BOOKING_BASE_URL = os.environ.get("BOOKING_BASE_URL", "https://demandapi.booking.com/3.2").rstrip("/")
 BOOKING_API_KEY = os.environ.get("BOOKING_API_KEY", "").strip()
@@ -474,19 +477,6 @@ CURRENCY_SYMBOLS = {
 
 _fx_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _google_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-_open_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-_open_places_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
-_wikimedia_image_cache: Dict[str, Dict[str, Any]] = {}
-_wikimedia_semaphore = asyncio.Semaphore(3)
-_open_geo_semaphore = asyncio.Semaphore(1)
-_overpass_semaphore = asyncio.Semaphore(1)
-_google_places_disabled = False
-WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
-WIKIMEDIA_USER_AGENT = "OmniTouristOS/1.0 (destination image service)"
-WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
-OPEN_DATA_USER_AGENT = "OmniTouristOS/1.0 (destination explorer; contact via app)"
-NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/search"
-OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
 
 
 def _normalize_country_iso2(country: str) -> str:
@@ -671,132 +661,8 @@ def _booking_headers() -> Dict[str, str]:
     }
 
 
-async def _wikimedia_image_search(query: str, limit: int = 5) -> Dict[str, Any]:
-    """Find openly hosted destination images on Wikimedia Commons.
-
-    This is deliberately independent of Google Places billing/quota. Commons
-    exposes public MediaWiki APIs and the returned image URLs are direct HTTPS
-    URLs suitable for Flutter Image.network().
-    """
-    clean_query = re.sub(r"\s+", " ", str(query or "")).strip()
-    if not clean_query:
-        return {"images": [], "credits": []}
-
-    cache_key = clean_query.lower()
-    cached = _wikimedia_image_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrsearch": clean_query,
-        "gsrnamespace": "6",
-        "gsrlimit": str(max(1, min(int(limit), 6))),
-        "prop": "imageinfo",
-        "iiprop": "url|mime|extmetadata",
-        "iiurlwidth": "1200",
-        "origin": "*",
-    }
-
-    result: Dict[str, Any] = {"images": [], "credits": []}
-    try:
-        async with _wikimedia_semaphore:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=4.0)) as client:
-                response = await client.get(
-                    WIKIMEDIA_API_URL,
-                    params=params,
-                    headers={"User-Agent": WIKIMEDIA_USER_AGENT, "Accept": "application/json"},
-                )
-        if response.status_code != 200:
-            print(f"[Wikimedia Image Notice] {response.status_code}: {response.text[:300]}")
-            _wikimedia_image_cache[cache_key] = result
-            return result
-
-        payload = response.json() or {}
-        pages = ((payload.get("query") or {}).get("pages") or {})
-        seen: set = set()
-        for page in pages.values():
-            infos = page.get("imageinfo") or []
-            if not infos:
-                continue
-            info = infos[0] or {}
-            mime = str(info.get("mime") or "").lower()
-            image_url = str(info.get("thumburl") or info.get("url") or "").strip()
-            if not image_url.startswith(("https://", "http://")):
-                continue
-            if mime and not mime.startswith("image/"):
-                continue
-            if image_url in seen:
-                continue
-            seen.add(image_url)
-
-            metadata = info.get("extmetadata") or {}
-            artist = str((metadata.get("Artist") or {}).get("value") or "").strip()
-            license_name = str((metadata.get("LicenseShortName") or {}).get("value") or "").strip()
-            page_title = str(page.get("title") or "").strip()
-            page_id = page.get("pageid")
-            source_url = (
-                f"https://commons.wikimedia.org/wiki/Special:Redirect/file/"
-                f"{urllib.parse.quote(page_title.removeprefix('File:'), safe='') }"
-            ) if page_title else "https://commons.wikimedia.org/"
-
-            result["images"].append(image_url)
-            result["credits"].append({
-                "title": page_title,
-                "source_url": source_url,
-                "artist": re.sub(r"<[^>]+>", "", artist),
-                "license": re.sub(r"<[^>]+>", "", license_name),
-                "page_id": page_id,
-            })
-            if len(result["images"]) >= int(limit):
-                break
-    except Exception as e:
-        print(f"[Wikimedia Image Notice]: {e}")
-
-    _wikimedia_image_cache[cache_key] = result
-    return result
-
-
-async def _attach_wikimedia_images(
-    places: List[Dict[str, Any]],
-    city: str,
-    country: str,
-    limit_places: int = 15,
-) -> None:
-    """Attach open destination photos without changing provider place facts."""
-    targets = places[:max(0, int(limit_places))]
-    tasks = []
-    for item in targets:
-        name = str(item.get("name") or "").strip()
-        if not name:
-            tasks.append(asyncio.sleep(0, result={"images": [], "credits": []}))
-            continue
-        query = f"{name} {city} {country}".strip()
-        tasks.append(_wikimedia_image_search(query, 5))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for item, result in zip(targets, results):
-        if isinstance(result, Exception) or not isinstance(result, dict):
-            continue
-        images = result.get("images") or []
-        credits = result.get("credits") or []
-        if images:
-            item["images"] = images
-            item["image_provider"] = "Wikimedia Commons"
-            item["image_credits"] = credits
-            item["google_photo_names"] = []
-        else:
-            item["images"] = []
-            item["image_provider"] = "NONE"
-            item["image_credits"] = []
-            item["google_photo_names"] = []
-
-
 async def _google_text_search(query: str, max_result_count: int = 10) -> List[Dict[str, Any]]:
-    global _google_places_disabled
-    if _google_places_disabled or not GOOGLE_PLACES_API_KEY:
+    if not GOOGLE_PLACES_API_KEY:
         return []
 
     endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
@@ -833,9 +699,6 @@ async def _google_text_search(query: str, max_result_count: int = 10) -> List[Di
                 json=payload,
             )
         if response.status_code != 200:
-            if response.status_code in {401, 403} or "PERMISSION_DENIED" in response.text:
-                _google_places_disabled = True
-                print("[Google Places Fallback] Places API is unavailable/unauthorized; switching Destination Explorer to open-data providers.")
             print(f"[Google Places Notice] {response.status_code}: {response.text[:300]}")
             return []
         data = response.json()
@@ -907,256 +770,6 @@ async def _resolve_destination_with_google(city: str, state: str, country: str) 
     }
     _google_destination_cache[key] = resolved
     return resolved
-
-
-async def _resolve_destination_with_open_data(city: str, state: str, country: str) -> Optional[Dict[str, Any]]:
-    """Resolve a destination without Google using OpenStreetMap Nominatim.
-
-    This is a real geocoder lookup, not generated/synthetic destination data.
-    Requests are serialized to respect the public Nominatim service policy.
-    """
-    key = (city.strip().lower(), state.strip().lower(), country.strip().lower())
-    cached = _open_destination_cache.get(key)
-    if cached is not None:
-        return cached
-
-    query_parts = [city.strip()]
-    if state.strip():
-        query_parts.append(state.strip())
-    if country.strip():
-        query_parts.append(country.strip())
-
-    params = {
-        "q": ", ".join(x for x in query_parts if x),
-        "format": "jsonv2",
-        "addressdetails": "1",
-        "limit": "5",
-        "accept-language": "en",
-    }
-    try:
-        async with _open_geo_semaphore:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
-                response = await client.get(
-                    NOMINATIM_API_URL,
-                    params=params,
-                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
-                )
-        if response.status_code != 200:
-            print(f"[Open Geocoder Notice] {response.status_code}: {response.text[:300]}")
-            return None
-        results = response.json() or []
-        if not results:
-            return None
-
-        city_norm = re.sub(r"\\s+", " ", city.strip().lower())
-        country_norm = country.strip().lower()
-
-        def score(item: Dict[str, Any]) -> int:
-            display = str(item.get("display_name") or "").lower()
-            item_name = str(item.get("name") or "").lower()
-            item_type = str(item.get("type") or "").lower()
-            address = item.get("address") or {}
-            score_value = 0
-            if item_name == city_norm:
-                score_value += 100
-            elif city_norm and city_norm in display:
-                score_value += 40
-            if item_type in {"city", "town", "municipality", "village", "locality"}:
-                score_value += 40
-            if country_norm and country_norm in display:
-                score_value += 10
-            if address.get("city", "").lower() == city_norm:
-                score_value += 25
-            return score_value
-
-        chosen = max(results, key=score)
-        lat = chosen.get("lat")
-        lon = chosen.get("lon")
-        if lat is None or lon is None:
-            return None
-
-        resolved = {
-            "city": city,
-            "state": state,
-            "country": country,
-            "display_name": chosen.get("name") or city,
-            "place_id": f"osm:{chosen.get('osm_type','')}/{chosen.get('osm_id','')}",
-            "latitude": float(lat),
-            "longitude": float(lon),
-            "formatted_address": chosen.get("display_name"),
-            "google_maps_url": None,
-            "website_url": None,
-            "types": [str(chosen.get("type") or "")],
-            "address_components": chosen.get("address") or {},
-            "source": "OpenStreetMap Nominatim",
-            "data_state": "VERIFIED_OPEN_DATA",
-            "open_data": True,
-        }
-        _open_destination_cache[key] = resolved
-        return resolved
-    except Exception as e:
-        print(f"[Open Geocoder Notice]: {e}")
-        return None
-
-
-def _open_place_category(title: str, categories: List[str]) -> str:
-    text = f"{title} {' '.join(categories)}".lower()
-    if any(k in text for k in ["temple", "church", "mosque", "shrine", "fort", "castle", "monument", "historic", "heritage", "palace"]):
-        return "Heritage & Forts"
-    if any(k in text for k in ["beach", "park", "garden", "waterfall", "lake", "wildlife", "island", "mountain"]):
-        return "Nature & Wildlife"
-    if any(k in text for k in ["museum", "gallery", "theatre", "theater"]):
-        return "Arts & Culture"
-    if any(k in text for k in ["zoo", "aquarium", "amusement", "theme park", "tourist"]):
-        return "Family & Attractions"
-    return "Sights & Landmarks"
-
-
-async def _load_open_destination_places(city: str, state: str, country: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Load real attraction records from OpenStreetMap when Google is unavailable.
-
-    This deliberately avoids Wikipedia/Wikimedia search APIs because those public
-    endpoints can reject server-side traffic under their robot policy. Attraction
-    facts come from OSM objects themselves; photos are used only when the OSM object
-    already carries an image or wikimedia_commons tag.
-    """
-    key = (city.strip().lower(), state.strip().lower(), country.strip().lower())
-    if key in _open_places_cache:
-        destination = _open_destination_cache.get(key)
-        return destination, _open_places_cache[key]
-
-    destination = await _resolve_destination_with_open_data(city, state, country)
-    if not destination:
-        return None, []
-
-    lat = float(destination["latitude"])
-    lng = float(destination["longitude"])
-    radius_m = 20000
-    query = f"""
-[out:json][timeout:30];
-(
-  nwr(around:{radius_m},{lat},{lng})["tourism"~"^(attraction|museum|viewpoint|theme_park|zoo|aquarium|gallery|artwork|information)$"]["name"];
-  nwr(around:{radius_m},{lat},{lng})["historic"]["name"];
-  nwr(around:{radius_m},{lat},{lng})["natural"~"^(beach|waterfall|peak|cave)$"]["name"];
-  nwr(around:{radius_m},{lat},{lng})["leisure"~"^(park|garden|nature_reserve)$"]["name"];
-);
-out center tags;
-"""
-
-    try:
-        async with _overpass_semaphore:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=8.0)) as client:
-                response = await client.post(
-                    OVERPASS_API_URL,
-                    data={"data": query},
-                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
-                )
-        if response.status_code != 200:
-            print(f"[Overpass Notice] {response.status_code}: {response.text[:300]}")
-            return destination, []
-
-        elements = (response.json() or {}).get("elements") or []
-        normalized: List[Dict[str, Any]] = []
-        seen_names: set = set()
-        city_norm = city.strip().lower()
-
-        def tag_value(tags: Dict[str, Any], key_name: str) -> str:
-            return str(tags.get(key_name) or "").strip()
-
-        def image_from_tags(tags: Dict[str, Any]) -> Optional[str]:
-            direct = tag_value(tags, "image")
-            if direct.startswith(("https://", "http://")):
-                return direct
-            commons = tag_value(tags, "wikimedia_commons")
-            if commons.startswith("File:"):
-                filename = commons[5:].strip()
-                if filename:
-                    return "https://commons.wikimedia.org/wiki/Special:FilePath/" + urllib.parse.quote(filename, safe="")
-            return None
-
-        for element in elements:
-            tags = element.get("tags") or {}
-            name = tag_value(tags, "name")
-            if not name:
-                continue
-            name_norm = name.lower()
-            if name_norm == city_norm or name_norm in seen_names:
-                continue
-
-            if element.get("lat") is not None and element.get("lon") is not None:
-                item_lat = float(element["lat"])
-                item_lng = float(element["lon"])
-            else:
-                center = element.get("center") or {}
-                if center.get("lat") is None or center.get("lon") is None:
-                    continue
-                item_lat = float(center["lat"])
-                item_lng = float(center["lon"])
-
-            distance = _place_distance_km(item_lat, item_lng, lat, lng)
-            if distance > 25:
-                continue
-
-            tourism = tag_value(tags, "tourism")
-            historic = tag_value(tags, "historic")
-            natural = tag_value(tags, "natural")
-            leisure = tag_value(tags, "leisure")
-            categories = [x for x in [tourism, historic, natural, leisure, tag_value(tags, "attraction")] if x]
-            category = _open_place_category(name, categories)
-
-            website = tag_value(tags, "website") or tag_value(tags, "contact:website")
-            wikidata = tag_value(tags, "wikidata")
-            wikipedia = tag_value(tags, "wikipedia")
-            source_url = website if website.startswith(("https://", "http://")) else f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}"
-            image_url = image_from_tags(tags)
-
-            item = {
-                "name": name,
-                "category": category,
-                "distance": f"{distance:.1f} km from Center",
-                "distance_km": round(distance, 2),
-                "distance_type": "straight_line",
-                "timing": tag_value(tags, "opening_hours") or "See official source",
-                "entry": "Free / see official source" if tag_value(tags, "fee").lower() in {"no", "0"} else "See official source",
-                "lat": item_lat,
-                "lng": item_lng,
-                "history": "Verified OpenStreetMap feature record.",
-                "best_food": "",
-                "things_to_do": "",
-                "best_time": "",
-                "warnings": "Check the official venue/source for current access, hours and local conditions.",
-                "rating": None,
-                "reviews": None,
-                "images": [image_url] if image_url else [],
-                "google_photo_names": [],
-                "image_provider": "OpenStreetMap-linked image" if image_url else "NONE",
-                "image_credits": [{"title": name, "source_url": source_url, "artist": "", "license": "See source page"}] if image_url else [],
-                "maps_url": f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}",
-                "website_url": source_url,
-                "place_id": f"osm:{element.get('type','')}/{element.get('id','')}",
-                "source": "OpenStreetMap Open Data",
-                "data_state": "VERIFIED_OPEN_DATA",
-                "provider_verified": True,
-                "attribution_required": "OpenStreetMap" + (" + Wikimedia Commons" if image_url and "commons.wikimedia.org" in image_url else ""),
-                "osm_tags": {
-                    "tourism": tourism,
-                    "historic": historic,
-                    "natural": natural,
-                    "leisure": leisure,
-                    "wikidata": wikidata,
-                    "wikipedia": wikipedia,
-                },
-            }
-            normalized.append(item)
-            seen_names.add(name_norm)
-
-        normalized.sort(key=lambda x: (-(1 if x.get("images") else 0), float(x.get("distance_km") or 999), str(x.get("name") or "")))
-        normalized = normalized[:30]
-        _open_places_cache[key] = normalized
-        return destination, normalized
-    except Exception as e:
-        print(f"[Overpass Notice]: {e}")
-        return destination, []
 
 
 def _place_category(place: Dict[str, Any]) -> str:
@@ -1340,91 +953,6 @@ async def google_place_photo(
         raise HTTPException(status_code=502, detail="Google photo service temporarily unavailable.")
 
 
-@app.get("/api/v1/place-photo-by-id")
-async def google_place_photo_by_id(
-    place_id: str = Query(...),
-    max_width: int = Query(1200, ge=320, le=4800),
-):
-    """Resolve the first current Google Places photo for a place ID and proxy it.
-
-    This is a second-level fallback for clients that receive a verified place ID
-    but do not receive photo resource names in the original explore response.
-    The Google API key remains server-side.
-    """
-    if not GOOGLE_PLACES_API_KEY:
-        raise HTTPException(status_code=503, detail="Google Places photo service is not configured.")
-
-    clean_id = str(place_id or "").strip()
-    if not clean_id:
-        raise HTTPException(status_code=400, detail="Place ID is required.")
-
-    place = await _google_place_details(clean_id)
-    if not place:
-        raise HTTPException(status_code=404, detail="Google place could not be resolved.")
-
-    photos = place.get("photos") or []
-    photo_names = [str(photo.get("name") or "").strip() for photo in photos if photo.get("name")]
-    if not photo_names:
-        raise HTTPException(status_code=404, detail="No Google photo is available for this place.")
-
-    photo_name = photo_names[0]
-    encoded_name = urllib.parse.quote(photo_name, safe="/")
-    endpoint = f"{GOOGLE_PLACES_BASE_URL}/{encoded_name}/media"
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=5.0),
-            follow_redirects=True,
-        ) as client:
-            metadata_response = await client.get(
-                endpoint,
-                params={
-                    "maxWidthPx": int(max_width),
-                    "skipHttpRedirect": "true",
-                    "key": GOOGLE_PLACES_API_KEY,
-                },
-                headers={"Accept": "application/json"},
-            )
-            photo_uri = ""
-            if metadata_response.status_code == 200:
-                try:
-                    metadata = metadata_response.json()
-                    photo_uri = str(metadata.get("photoUri") or "").strip()
-                except Exception:
-                    photo_uri = ""
-
-            if photo_uri:
-                image_response = await client.get(photo_uri)
-            else:
-                image_response = await client.get(
-                    endpoint,
-                    params={"maxWidthPx": int(max_width), "key": GOOGLE_PLACES_API_KEY},
-                )
-
-        if image_response.status_code != 200:
-            detail = image_response.text[:300] if image_response.content else "empty response"
-            print(f"[Google Photo By ID Notice] {image_response.status_code}: {detail}")
-            raise HTTPException(status_code=502, detail="Google photo could not be retrieved.")
-
-        media_type = image_response.headers.get("content-type", "image/jpeg").split(";")[0]
-        if not media_type.startswith("image/"):
-            raise HTTPException(status_code=502, detail="Google returned an invalid photo response.")
-
-        return Response(
-            content=image_response.content,
-            media_type=media_type,
-            headers={
-                "Cache-Control": "public, max-age=900",
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"[Google Photo By ID Notice]: {e}")
-        raise HTTPException(status_code=502, detail="Google photo service temporarily unavailable.")
-
-
 def _normalize_google_place(place: Dict[str, Any], origin_lat: float, origin_lng: float) -> Optional[Dict[str, Any]]:
     loc = place.get("location") or {}
     lat = loc.get("latitude")
@@ -1457,10 +985,8 @@ def _normalize_google_place(place: Dict[str, Any], origin_lat: float, origin_lng
         "warnings": "",
         "rating": rating,
         "reviews": rating_count,
-        "images": [],
-        "google_photo_names": [],
-        "image_provider": "Wikimedia Commons",
-        "image_credits": [],
+        "images": _google_photo_proxy_urls(photo_names[:5]),
+        "google_photo_names": photo_names[:5],
         "maps_url": place.get("googleMapsUri"),
         "website_url": place.get("websiteUri"),
         "place_id": place.get("id"),
@@ -1500,10 +1026,8 @@ def _normalize_google_hotel(place: Dict[str, Any], center_lat: float, center_lng
         "amenities": "Verified hotel/place listing",
         "lat": float(lat),
         "lng": float(lng),
-        "images": [],
-        "google_photo_names": [],
-        "image_provider": "NONE",
-        "image_credits": [],
+        "images": _google_photo_proxy_urls(photo_names[:5]),
+        "google_photo_names": photo_names[:5],
         "address": place.get("formattedAddress") or "",
         "city": city,
         "accommodation_id": place.get("id"),
@@ -1570,11 +1094,24 @@ async def _load_google_destination_places(city: str, state: str, country: str) -
             if place_id and place_id not in merged:
                 merged[place_id] = place
 
-    # Do not hydrate every card through Google Place Details. That endpoint
-    # consumes the daily GetPlaceRequest quota and was the source of the 429
-    # RESOURCE_EXHAUSTED errors seen in Render. Destination photos are now
-    # supplied independently from Wikimedia Commons.
+    # Text Search normally returns photo resource names when places.photos is
+    # requested. Some place records still arrive without photos; hydrate those
+    # records through Place Details before giving up so the Explorer does not
+    # unnecessarily fall back to a blank image. Google documents that photos
+    # can be obtained from Text Search or Place Details.
     place_values = list(merged.values())
+    missing_photo_places = [
+        place for place in place_values[:20]
+        if not (place.get("photos") or []) and place.get("id")
+    ]
+    if missing_photo_places:
+        hydrated = await asyncio.gather(
+            *[_google_place_details(str(place.get("id"))) for place in missing_photo_places],
+            return_exceptions=True,
+        )
+        for original, detail in zip(missing_photo_places, hydrated):
+            if isinstance(detail, dict) and detail.get("photos"):
+                original["photos"] = detail.get("photos") or []
 
     normalized: List[Dict[str, Any]] = []
     for place in place_values:
@@ -1583,9 +1120,7 @@ async def _load_google_destination_places(city: str, state: str, country: str) -
             normalized.append(item)
 
     normalized.sort(key=lambda x: (-(float(x.get("rating") or 0)), -(int(x.get("reviews") or 0))))
-    normalized = normalized[:20]
-    await _attach_wikimedia_images(normalized, city, country, limit_places=15)
-    return destination, normalized
+    return destination, normalized[:20]
 
 
 async def _booking_search_stays(
@@ -1835,7 +1370,14 @@ def _build_aviasales_search_url(
     if return_date:
         params += f"{ddmm(return_date)}"
     params += pax
-    return f"https://www.aviasales.com/search/{params}"
+
+    # Travelpayouts documents /search/PARAMS as the Aviasales handoff format.
+    # A White Label host can be configured with INR in Travelpayouts and is the
+    # supported way to make the external results page use a fixed currency.
+    # Keep the public Aviasales host as a safe fallback until the White Label
+    # URL is configured in Render.
+    base_url = AVIASALES_BOOKING_BASE_URL or "https://www.aviasales.com"
+    return f"{base_url}/search/{params}"
 
 
 def _normalize_travelpayouts_offer(
@@ -2128,10 +1670,26 @@ async def _search_travelpayouts_flights(
         if key in seen:
             continue
         seen.add(key)
-        # Data API results may not contain a directly usable ticket link.
-        # Provide a provider search handoff so every displayed result still has
-        # a real booking path instead of a dead/invalid button.
-        if not item.get("ticket_link"):
+        # Data API links may carry a provider-specific expected_price_currency
+        # (for example USD). If an INR-configured Travelpayouts White Label is
+        # configured, deliberately use a fresh route-search handoff instead of
+        # forwarding that cached currency-specific link. This keeps the external
+        # booking/search page aligned with the app's INR experience.
+        if AVIASALES_BOOKING_BASE_URL:
+            item["ticket_link"] = _build_aviasales_search_url(
+                origin=origin,
+                destination=destination,
+                departure_date=str(item.get("depart_datetime") or departure_date)[:10],
+                return_date=(str(item.get("return_depart_datetime") or return_date)[:10] if (item.get("return_depart_datetime") or return_date) else None),
+                adults=adults,
+                children=len(child_ages),
+                infants=0,
+                cabin_class=cabin_class,
+            )
+            item["booking_reference"] = item["ticket_link"]
+            item["booking_capable"] = True
+            item["booking_mode"] = "AVIASALES_INR_WHITE_LABEL"
+        elif not item.get("ticket_link"):
             item["ticket_link"] = _build_aviasales_search_url(
                 origin=origin,
                 destination=destination,
@@ -2450,27 +2008,26 @@ async def place_details(request: Request):
         if not return_date:
             return_date = (datetime.fromisoformat(start_date) + timedelta(days=4)).date().isoformat()
 
-        # Do not call Google Place Details here. It consumes the daily
-        # GetPlaceRequest quota and caused HTTP 429 RESOURCE_EXHAUSTED in the
-        # deployed service. The destination card already contains the verified
-        # provider facts needed for this screen, so details are built from the
-        # card payload plus Omni travel intelligence.
-        place = {
-            "displayName": {"text": name},
-            "primaryTypeDisplayName": {"text": category},
-            "formattedAddress": str(body.get("address") or ""),
-            "location": {
-                "latitude": body.get("lat"),
-                "longitude": body.get("lng"),
-            },
-            "rating": body.get("rating"),
-            "userRatingCount": body.get("reviews"),
-            "regularOpeningHours": {"weekdayDescriptions": [str(body.get("timing"))]} if body.get("timing") else {},
-            "googleMapsUri": body.get("maps_url"),
-            "websiteUri": body.get("website_url"),
-            "photos": [],
-            "types": [],
-        }
+        place = await _google_place_details(place_id) if place_id else None
+        if not place:
+            # The card itself is still valid; details can be synthesized from the
+            # provider-backed card fields without pretending a second provider lookup succeeded.
+            place = {
+                "displayName": {"text": name},
+                "primaryTypeDisplayName": {"text": category},
+                "formattedAddress": str(body.get("address") or ""),
+                "location": {
+                    "latitude": body.get("lat"),
+                    "longitude": body.get("lng"),
+                },
+                "rating": body.get("rating"),
+                "userRatingCount": body.get("reviews"),
+                "regularOpeningHours": {"weekdayDescriptions": [str(body.get("timing"))]} if body.get("timing") else {},
+                "googleMapsUri": body.get("maps_url"),
+                "websiteUri": body.get("website_url"),
+                "photos": [],
+                "types": [],
+            }
 
         display_name = str((place.get("displayName") or {}).get("text") or name)
         primary_label = str((place.get("primaryTypeDisplayName") or {}).get("text") or category)
@@ -2483,9 +2040,6 @@ async def place_details(request: Request):
         hours = _compact_hours(place) or str(body.get("timing") or "")
         rating = place.get("rating") if place.get("rating") is not None else body.get("rating")
         reviews = place.get("userRatingCount") if place.get("userRatingCount") is not None else body.get("reviews")
-
-        open_images = [str(x).strip() for x in (body.get("images") or []) if str(x).strip().startswith(("https://", "http://"))]
-        image_credits = body.get("image_credits") if isinstance(body.get("image_credits"), list) else []
 
         try:
             ai = await ask_fast_json(
@@ -2584,8 +2138,6 @@ async def place_details(request: Request):
                         "hotels": google_hotels,
                     }
 
-        places_provider = str(body.get("places_provider") or body.get("source") or "").strip()
-
         return {
             "status": "success",
             "place": {
@@ -2613,21 +2165,17 @@ async def place_details(request: Request):
                 "local_tips": _ai_list(ai.get("local_tips"), 8),
                 "visit_plans": normalized_plans,
                 "intelligence_state": "AI-GUIDED",
-                "images": open_images,
-                "google_photo_names": [],
-                "image_provider": "Wikimedia Commons" if open_images else "NONE",
-                "image_credits": image_credits,
-                "source": "Provider facts + OpenStreetMap-linked imagery + Omni travel intelligence",
-                "data_state": "VERIFIED_PROVIDER_FACTS_PLUS_AI_GUIDANCE",
+                "images": _google_photo_proxy_urls(photo_names[:5]),
+                "google_photo_names": photo_names[:5],
+                "source": "Google Places + Omni travel intelligence",
+                "data_state": "VERIFIED",
                 "details_state": "AI_GUIDED_WITH_VERIFIED_PROVIDER_FACTS",
             },
             "hotels": nearby_stays.get("hotels", []),
             "hotel_state": nearby_stays.get("status"),
             "hotel_provider": nearby_stays.get("provider"),
             "hotel_reason": nearby_stays.get("reason"),
-            "attribution_required": (["Google Maps", "Booking.com"]
-                                     if places_provider == "Google Places"
-                                     else ["OpenStreetMap", "Wikimedia Commons", "Booking.com"]),
+            "attribution_required": ["Google Maps", "Booking.com"],
         }
     except Exception as e:
         print(f"[Place Details Error]: {e}")
@@ -2669,25 +2217,10 @@ async def explore_city(request: Request):
             }
 
         destination, places = await _load_google_destination_places(city, state, country)
-        places_provider = "Google Places"
-        if not destination:
-            # Google Places is optional. If its key/quota/permissions are unavailable,
-            # continue with real open-data destination records rather than returning
-            # the misleading "no verified attractions" state.
-            destination, places = await _load_open_destination_places(city, state, country)
-            places_provider = "Wikipedia/Wikimedia + OpenStreetMap"
-        elif _google_places_disabled:
-            # Google resolved the destination before the circuit breaker tripped.
-            # Keep the already-resolved destination but use open records for attractions.
-            open_destination, open_places = await _load_open_destination_places(city, state, country)
-            if open_destination:
-                destination, places = open_destination, open_places
-                places_provider = "Wikipedia/Wikimedia + OpenStreetMap"
-
         if not destination:
             return {
                 "status": "unavailable",
-                "message": "Destination resolution is unavailable from Google Places and the open-data destination providers.",
+                "message": "Destination resolution is unavailable. Configure GOOGLE_PLACES_API_KEY or provide a provider-backed destination resolver.",
                 "destination": None,
                 "landmarks": [],
                 "places": [],
@@ -2707,7 +2240,7 @@ async def explore_city(request: Request):
             traveler_country=traveler_country,
             display_currency=traveler_currency,
         )
-        if not stays.get("hotels") and not _google_places_disabled:
+        if not stays.get("hotels"):
             google_hotels = await _load_google_hotels(
                 f"{city}, {country}",
                 float(destination["latitude"]),
@@ -2740,7 +2273,7 @@ async def explore_city(request: Request):
             "adults": adults,
             "kids": kids,
             "child_ages": child_ages,
-            "places_provider": places_provider,
+            "places_provider": "Google Places",
             "places_state": "VERIFIED" if places else "EMPTY",
             "landmarks": places,
             "places": places,
@@ -2749,7 +2282,7 @@ async def explore_city(request: Request):
             "hotel_state": stays.get("status"),
             "hotel_reason": stays.get("reason"),
             "hotel_request_id": stays.get("request_id"),
-            "attribution_required": ["OpenStreetMap", "Google Maps", "Booking.com"],
+            "attribution_required": ["Google Maps", "Booking.com"],
         }
     except Exception as e:
         print(f"[Destination Explore Error]: {e}")
