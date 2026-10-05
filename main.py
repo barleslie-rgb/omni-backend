@@ -3326,14 +3326,22 @@ async def sarathi_get_conversation(conversation_id: str, request: Request):
             .limit(SARATHI_RAW_MESSAGE_LIMIT)
             .execute()
         )
-        memory = (
-            supabase.table("sarathi_conversation_memory")
-            .select("summary, summarized_message_count, updated_at")
-            .eq("conversation_id", conversation_id)
-            .eq("user_id", user["id"])
-            .maybe_single()
-            .execute()
-        ).data or {}
+        # Conversation memory is optional. A missing table/column, RLS issue,
+        # or temporary Supabase problem must not make an otherwise valid
+        # conversation return HTTP 500. The raw messages remain usable.
+        memory = {}
+        try:
+            memory = (
+                supabase.table("sarathi_conversation_memory")
+                .select("summary, summarized_message_count, updated_at")
+                .eq("conversation_id", conversation_id)
+                .eq("user_id", user["id"])
+                .maybe_single()
+                .execute()
+            ).data or {}
+        except Exception as memory_exc:
+            print(f"[Sarathi memory warning]: {memory_exc}")
+
         return {
             "status": "success",
             "conversation": conv.data,
