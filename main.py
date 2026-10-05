@@ -475,12 +475,14 @@ _open_places_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
 _wikimedia_image_cache: Dict[str, Dict[str, Any]] = {}
 _wikimedia_semaphore = asyncio.Semaphore(3)
 _open_geo_semaphore = asyncio.Semaphore(1)
+_overpass_semaphore = asyncio.Semaphore(1)
 _google_places_disabled = False
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIMEDIA_USER_AGENT = "OmniTouristOS/1.0 (destination image service)"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 OPEN_DATA_USER_AGENT = "OmniTouristOS/1.0 (destination explorer; contact via app)"
 NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/search"
+OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
 
 
 def _normalize_country_iso2(country: str) -> str:
@@ -1007,7 +1009,13 @@ def _open_place_category(title: str, categories: List[str]) -> str:
 
 
 async def _load_open_destination_places(city: str, state: str, country: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Load real attraction records from Wikipedia/Wikimedia when Google is unavailable."""
+    """Load real attraction records from OpenStreetMap when Google is unavailable.
+
+    This deliberately avoids Wikipedia/Wikimedia search APIs because those public
+    endpoints can reject server-side traffic under their robot policy. Attraction
+    facts come from OSM objects themselves; photos are used only when the OSM object
+    already carries an image or wikimedia_commons tag.
+    """
     key = (city.strip().lower(), state.strip().lower(), country.strip().lower())
     if key in _open_places_cache:
         destination = _open_destination_cache.get(key)
@@ -1017,117 +1025,133 @@ async def _load_open_destination_places(city: str, state: str, country: str) -> 
     if not destination:
         return None, []
 
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "geosearch",
-        "ggsprimary": "all",
-        "ggsradius": "20000",
-        "ggslimit": "50",
-        "ggsnamespace": "0",
-        "ggscoord": f"{destination['latitude']}|{destination['longitude']}",
-        "prop": "coordinates|pageimages|info|categories",
-        "inprop": "url",
-        "piprop": "thumbnail",
-        "pithumbsize": "1000",
-        "cllimit": "10",
-        "clshow": "!hidden",
-        "colimit": "1",
-    }
+    lat = float(destination["latitude"])
+    lng = float(destination["longitude"])
+    radius_m = 20000
+    query = f"""
+[out:json][timeout:30];
+(
+  nwr(around:{radius_m},{lat},{lng})["tourism"~"^(attraction|museum|viewpoint|theme_park|zoo|aquarium|gallery|artwork|information)$"]["name"];
+  nwr(around:{radius_m},{lat},{lng})["historic"]["name"];
+  nwr(around:{radius_m},{lat},{lng})["natural"~"^(beach|waterfall|peak|cave)$"]["name"];
+  nwr(around:{radius_m},{lat},{lng})["leisure"~"^(park|garden|nature_reserve)$"]["name"];
+);
+out center tags;
+"""
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
-            response = await client.get(
-                WIKIPEDIA_API_URL,
-                params=params,
-                headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
-            )
+        async with _overpass_semaphore:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=8.0)) as client:
+                response = await client.post(
+                    OVERPASS_API_URL,
+                    data={"data": query},
+                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
+                )
         if response.status_code != 200:
-            print(f"[Wikipedia GeoSearch Notice] {response.status_code}: {response.text[:300]}")
+            print(f"[Overpass Notice] {response.status_code}: {response.text[:300]}")
             return destination, []
 
-        pages = ((response.json() or {}).get("query") or {}).get("pages") or {}
+        elements = (response.json() or {}).get("elements") or []
         normalized: List[Dict[str, Any]] = []
         seen_names: set = set()
         city_norm = city.strip().lower()
 
-        for page in pages.values():
-            title = str(page.get("title") or "").strip()
-            if not title:
+        def tag_value(tags: Dict[str, Any], key_name: str) -> str:
+            return str(tags.get(key_name) or "").strip()
+
+        def image_from_tags(tags: Dict[str, Any]) -> Optional[str]:
+            direct = tag_value(tags, "image")
+            if direct.startswith(("https://", "http://")):
+                return direct
+            commons = tag_value(tags, "wikimedia_commons")
+            if commons.startswith("File:"):
+                filename = commons[5:].strip()
+                if filename:
+                    return "https://commons.wikimedia.org/wiki/Special:FilePath/" + urllib.parse.quote(filename, safe="")
+            return None
+
+        for element in elements:
+            tags = element.get("tags") or {}
+            name = tag_value(tags, "name")
+            if not name:
                 continue
-            title_norm = title.lower()
-            if title_norm in seen_names or title_norm == city_norm:
-                continue
-            if title_norm.startswith(("list of ", "category:", "timeline of ", "history of ")):
+            name_norm = name.lower()
+            if name_norm == city_norm or name_norm in seen_names:
                 continue
 
-            coords = page.get("coordinates") or []
-            if not coords:
-                continue
-            coord = coords[0] or {}
-            lat = coord.get("lat")
-            lng = coord.get("lon")
-            if lat is None or lng is None:
-                continue
-
-            raw_categories = page.get("categories") or []
-            categories = [str(c.get("title") or "") for c in raw_categories if isinstance(c, dict)]
-            category_text = " ".join(categories).lower()
-            attraction_hint = any(k in f"{title_norm} {category_text}" for k in [
-                "tourist", "attraction", "landmark", "museum", "temple", "church", "mosque",
-                "shrine", "monument", "fort", "castle", "palace", "park", "garden", "beach",
-                "waterfall", "zoo", "aquarium", "theatre", "theater", "heritage", "historic",
-            ])
-            if not attraction_hint:
-                # Keep notable geosearch pages, but reject obviously geographic/admin pages.
-                if any(k in title_norm for k in ["city", "district", "province", "emirate", "state of", "country"]):
+            if element.get("lat") is not None and element.get("lon") is not None:
+                item_lat = float(element["lat"])
+                item_lng = float(element["lon"])
+            else:
+                center = element.get("center") or {}
+                if center.get("lat") is None or center.get("lon") is None:
                     continue
+                item_lat = float(center["lat"])
+                item_lng = float(center["lon"])
 
-            distance = _place_distance_km(float(lat), float(lng), destination["latitude"], destination["longitude"])
+            distance = _place_distance_km(item_lat, item_lng, lat, lng)
             if distance > 25:
                 continue
 
-            thumb = ((page.get("thumbnail") or {}).get("source") or "").strip()
-            page_url = str(page.get("fullurl") or f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}")
+            tourism = tag_value(tags, "tourism")
+            historic = tag_value(tags, "historic")
+            natural = tag_value(tags, "natural")
+            leisure = tag_value(tags, "leisure")
+            categories = [x for x in [tourism, historic, natural, leisure, tag_value(tags, "attraction")] if x]
+            category = _open_place_category(name, categories)
+
+            website = tag_value(tags, "website") or tag_value(tags, "contact:website")
+            wikidata = tag_value(tags, "wikidata")
+            wikipedia = tag_value(tags, "wikipedia")
+            source_url = website if website.startswith(("https://", "http://")) else f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}"
+            image_url = image_from_tags(tags)
+
             item = {
-                "name": title,
-                "category": _open_place_category(title, categories),
+                "name": name,
+                "category": category,
                 "distance": f"{distance:.1f} km from Center",
                 "distance_km": round(distance, 2),
                 "distance_type": "straight_line",
-                "timing": "See official source",
-                "entry": "See official source",
-                "lat": float(lat),
-                "lng": float(lng),
-                "history": "Documented destination/place entry from Wikipedia/Wikimedia open data.",
+                "timing": tag_value(tags, "opening_hours") or "See official source",
+                "entry": "Free / see official source" if tag_value(tags, "fee").lower() in {"no", "0"} else "See official source",
+                "lat": item_lat,
+                "lng": item_lng,
+                "history": "Verified OpenStreetMap feature record.",
                 "best_food": "",
                 "things_to_do": "",
                 "best_time": "",
                 "warnings": "Check the official venue/source for current access, hours and local conditions.",
                 "rating": None,
                 "reviews": None,
-                "images": [thumb] if thumb.startswith(("https://", "http://")) else [],
+                "images": [image_url] if image_url else [],
                 "google_photo_names": [],
-                "image_provider": "Wikimedia/Wikipedia" if thumb else "NONE",
-                "image_credits": [{"title": title, "source_url": page_url, "artist": "", "license": "See source page"}] if thumb else [],
-                "maps_url": f"https://www.openstreetmap.org/?mlat={float(lat)}&mlon={float(lng)}#map=16/{float(lat)}/{float(lng)}",
-                "website_url": page_url,
-                "place_id": f"wikipedia:{page.get('pageid')}",
-                "source": "Wikipedia/Wikimedia Open Data",
+                "image_provider": "OpenStreetMap-linked image" if image_url else "NONE",
+                "image_credits": [{"title": name, "source_url": source_url, "artist": "", "license": "See source page"}] if image_url else [],
+                "maps_url": f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}",
+                "website_url": source_url,
+                "place_id": f"osm:{element.get('type','')}/{element.get('id','')}",
+                "source": "OpenStreetMap Open Data",
                 "data_state": "VERIFIED_OPEN_DATA",
                 "provider_verified": True,
-                "attribution_required": "Wikipedia/Wikimedia + OpenStreetMap",
+                "attribution_required": "OpenStreetMap" + (" + Wikimedia Commons" if image_url and "commons.wikimedia.org" in image_url else ""),
+                "osm_tags": {
+                    "tourism": tourism,
+                    "historic": historic,
+                    "natural": natural,
+                    "leisure": leisure,
+                    "wikidata": wikidata,
+                    "wikipedia": wikipedia,
+                },
             }
             normalized.append(item)
-            seen_names.add(title_norm)
+            seen_names.add(name_norm)
 
-        normalized.sort(key=lambda x: (-(1 if x.get("images") else 0), float(x.get("distance_km") or 999)))
-        normalized = normalized[:20]
-        await _attach_wikimedia_images(normalized, city, country, limit_places=15)
+        normalized.sort(key=lambda x: (-(1 if x.get("images") else 0), float(x.get("distance_km") or 999), str(x.get("name") or "")))
+        normalized = normalized[:30]
         _open_places_cache[key] = normalized
         return destination, normalized
     except Exception as e:
-        print(f"[Wikipedia GeoSearch Notice]: {e}")
+        print(f"[Overpass Notice]: {e}")
         return destination, []
 
 
@@ -2456,9 +2480,8 @@ async def place_details(request: Request):
         rating = place.get("rating") if place.get("rating") is not None else body.get("rating")
         reviews = place.get("userRatingCount") if place.get("userRatingCount") is not None else body.get("reviews")
 
-        image_result = await _wikimedia_image_search(f"{display_name} {city} {country}", 5)
-        open_images = image_result.get("images") or []
-        image_credits = image_result.get("credits") or []
+        open_images = [str(x).strip() for x in (body.get("images") or []) if str(x).strip().startswith(("https://", "http://"))]
+        image_credits = body.get("image_credits") if isinstance(body.get("image_credits"), list) else []
 
         try:
             ai = await ask_fast_json(
@@ -2588,7 +2611,7 @@ async def place_details(request: Request):
                 "google_photo_names": [],
                 "image_provider": "Wikimedia Commons" if open_images else "NONE",
                 "image_credits": image_credits,
-                "source": "Provider facts + Wikimedia Commons + Omni travel intelligence",
+                "source": "Provider facts + OpenStreetMap-linked imagery + Omni travel intelligence",
                 "data_state": "VERIFIED_PROVIDER_FACTS_PLUS_AI_GUIDANCE",
                 "details_state": "AI_GUIDED_WITH_VERIFIED_PROVIDER_FACTS",
             },
@@ -2720,7 +2743,7 @@ async def explore_city(request: Request):
             "hotel_state": stays.get("status"),
             "hotel_reason": stays.get("reason"),
             "hotel_request_id": stays.get("request_id"),
-            "attribution_required": ["Google Maps", "Booking.com", "Wikimedia Commons"],
+            "attribution_required": ["OpenStreetMap", "Google Maps", "Booking.com"],
         }
     except Exception as e:
         print(f"[Destination Explore Error]: {e}")
