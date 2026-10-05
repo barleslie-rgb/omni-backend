@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 
 import httpx
 import requests
@@ -3782,6 +3783,199 @@ def _rail_find_header(headers: List[str], candidates: List[str]) -> Optional[int
     return None
 
 
+class _RailHTMLTableParser(HTMLParser):
+    """Small stdlib HTML table extractor used when BeautifulSoup is unavailable."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: List[List[List[str]]] = []
+        self._table: Optional[List[List[str]]] = None
+        self._row: Optional[List[str]] = None
+        self._cell: Optional[List[str]] = None
+        self._cell_tag: Optional[str] = None
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            if self._table is None:
+                self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+            self._cell_tag = tag
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            value = re.sub(r"\s+", " ", "".join(self._cell)).strip()
+            self._row.append(value)
+            self._cell = None
+            self._cell_tag = None
+        elif tag == "tr" and self._row is not None and self._table is not None:
+            if self._row:
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+
+
+def _rail_html_tables(html: str) -> List[List[List[str]]]:
+    """Return HTML tables as simple row/cell lists with a stdlib fallback."""
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            output: List[List[List[str]]] = []
+            for table in soup.find_all("table"):
+                rows: List[List[str]] = []
+                for row in table.find_all("tr"):
+                    cells = [
+                        re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
+                        for cell in row.find_all(["th", "td"])
+                    ]
+                    if cells:
+                        rows.append(cells)
+                if rows:
+                    output.append(rows)
+            return output
+        except Exception:
+            pass
+
+    parser = _RailHTMLTableParser()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return []
+    return parser.tables
+
+
+def _rail_header_score(cell: str) -> int:
+    norm = _rail_normalize(cell)
+    if norm in {"trainno", "trainnumber", "train"}:
+        return 5
+    if "trainno" in norm or "trainnumber" in norm:
+        return 4
+    if norm in {"speed", "coaches", "duration", "originatingfrom", "endingat"}:
+        return 2
+    return 0
+
+
+def _rail_station_header_index(headers: List[str], station: str) -> Optional[int]:
+    aliases = [
+        _rail_station_display_name(station),
+        str(station or ""),
+        _rail_legacy_station_param(station),
+        _rail_slug_from_station(station),
+    ]
+    normalized_aliases = [_rail_normalize(x) for x in aliases if x]
+    for idx, header in enumerate(headers):
+        norm = _rail_normalize(header)
+        if not norm:
+            continue
+        if any(alias and (alias == norm or alias in norm or norm in alias) for alias in normalized_aliases):
+            return idx
+    return None
+
+
+def _rail_merge_header_rows(rows: List[List[str]], start: int, end: int) -> List[str]:
+    """Merge a multi-row table header while preserving column positions."""
+    width = max((len(rows[i]) for i in range(start, end + 1)), default=0)
+    merged = [""] * width
+    for i in range(start, end + 1):
+        row = rows[i]
+        for col in range(width):
+            value = row[col].strip() if col < len(row) else ""
+            if value and value not in {"-", "—", "–"}:
+                if not merged[col]:
+                    merged[col] = value
+                elif _rail_normalize(value) != _rail_normalize(merged[col]):
+                    merged[col] = f"{merged[col]} {value}".strip()
+    return merged
+
+
+def _rail_train_from_row(
+    values: List[str],
+    line: str,
+    requested_from_name: str,
+    requested_to_name: str,
+    train_idx: Optional[int],
+    speed_idx: Optional[int],
+    coach_idx: Optional[int],
+    origin_idx: Optional[int],
+    ending_idx: Optional[int],
+    duration_idx: Optional[int],
+    from_time_idx: int,
+    to_time_idx: Optional[int],
+    source_url: str,
+) -> Optional[Dict[str, Any]]:
+    def value_at(index: Optional[int]) -> str:
+        return values[index].strip() if index is not None and index < len(values) else ""
+
+    train_cell = value_at(train_idx)
+    dep_raw = value_at(from_time_idx)
+    arr_raw = value_at(to_time_idx)
+    if not dep_raw or dep_raw in {"—", "-", "–"}:
+        return None
+
+    dep_min = _rail_time_to_minutes(dep_raw)
+    if dep_min is None:
+        return None
+    arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
+    if arr_min is not None and arr_min < dep_min:
+        arr_min += 1440
+
+    speed = value_at(speed_idx)
+    coaches = value_at(coach_idx) or None
+    origin = value_at(origin_idx) or None
+    ending = value_at(ending_idx) or None
+    duration = value_at(duration_idx) or None
+
+    service_type, service_label = _rail_detect_service(train_cell, speed)
+    cleaned_train_no = _rail_clean_train_no(train_cell)
+    if cleaned_train_no == "—" and train_cell:
+        cleaned_train_no = train_cell
+
+    return {
+        "time": dep_raw,
+        "departure_time": dep_raw,
+        "arrival_time": arr_raw if arr_raw not in {"", "—", "-", "–"} else None,
+        "timestamp_minutes": dep_min,
+        "arrival_minutes": arr_min,
+        "train_no": cleaned_train_no,
+        "name": f"{origin or requested_from_name} → {ending or requested_to_name}",
+        "service_type": service_type,
+        "service": service_label,
+        "category": service_label,
+        "platform": None,
+        "platform_note": "Platform not published in this timetable response.",
+        "status": "Scheduled",
+        "status_msg": "Scheduled timetable entry",
+        "delay_minutes": None,
+        "crowd": None,
+        "door_side": None,
+        "coaches": coaches,
+        "coach_count": coaches,
+        "composition": coaches,
+        "source": requested_from_name,
+        "destination": requested_to_name,
+        "origin": origin,
+        "ending_at": ending,
+        "duration": duration,
+        "days": _rail_days_from_label(train_cell),
+        "live": False,
+        "data_source": source_url,
+        "data_source_type": RAILWAY_REFERENCE_LABEL,
+        "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+    }
+
+
 def _rail_parse_timetable_html(
     html: str,
     line: str,
@@ -3789,46 +3983,59 @@ def _rail_parse_timetable_html(
     to_station: str,
     source_url: str,
 ) -> List[Dict[str, Any]]:
-    """Parse Mumbai Lifeline's timetable table without assuming a fixed layout."""
-    if BeautifulSoup is None:
+    """Parse Mumbai Lifeline tables, including multi-row headers and layout changes."""
+    tables = _rail_html_tables(html)
+    if not tables:
         return []
 
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception:
-        return []
-
-    trains: List[Dict[str, Any]] = []
     requested_from_name = _rail_station_display_name(from_station)
     requested_to_name = _rail_station_display_name(to_station)
+    trains: List[Dict[str, Any]] = []
 
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
+    for rows in tables:
         if not rows:
             continue
 
+        # Locate the real timetable header. It may be split over two rows.
         header_row_index: Optional[int] = None
-        header_cells: List[str] = []
+        station_row_index: Optional[int] = None
+        header_end = -1
 
-        # The page contains navigation/summary rows before the real timetable.
-        # Search the first 60 rows for a row containing Train No and station data.
-        for row_index, row in enumerate(rows[:60]):
-            cells = row.find_all(["th", "td"])
-            candidate = [cell.get_text(" ", strip=True) for cell in cells]
-            normalized = [_rail_normalize(x) for x in candidate]
-            has_train = any(x in {"trainno", "trainnumber", "train"} for x in normalized)
-            has_station = any(
-                _rail_normalize(requested_from_name) in x
-                or _rail_normalize(from_station) in x
-                for x in normalized
-            )
-            if has_train and has_station:
-                header_row_index = row_index
-                header_cells = candidate
+        for row_index, row in enumerate(rows[:80]):
+            score = sum(_rail_header_score(cell) for cell in row)
+            if score < 4:
+                continue
+            header_row_index = row_index
+            if _rail_station_header_index(row, from_station) is not None:
+                station_row_index = row_index
+                header_end = row_index
                 break
+            for look_ahead in range(row_index + 1, min(row_index + 4, len(rows))):
+                if _rail_station_header_index(rows[look_ahead], from_station) is not None:
+                    station_row_index = look_ahead
+                    header_end = look_ahead
+                    break
+            break
+
+        if header_row_index is None:
+            # Some legacy tables omit the literal Train No heading. Find a row
+            # that contains the requested station and several time-like cells.
+            for row_index, row in enumerate(rows[:80]):
+                if _rail_station_header_index(row, from_station) is None:
+                    continue
+                time_count = sum(1 for cell in row if _rail_time_to_minutes(cell) is not None)
+                if time_count >= 1:
+                    header_row_index = max(0, row_index - 1)
+                    station_row_index = row_index
+                    header_end = row_index
+                    break
 
         if header_row_index is None:
             continue
+
+        if station_row_index is None:
+            station_row_index = header_row_index
+        header_cells = _rail_merge_header_rows(rows, header_row_index, header_end)
 
         train_idx = _rail_find_header(header_cells, ["Train No", "Train Number", "Train"])
         speed_idx = _rail_find_header(header_cells, ["Speed"])
@@ -3836,88 +4043,47 @@ def _rail_parse_timetable_html(
         origin_idx = _rail_find_header(header_cells, ["Originating From", "Origin"])
         ending_idx = _rail_find_header(header_cells, ["Ending At", "Destination"])
         duration_idx = _rail_find_header(header_cells, ["Duration"])
-        from_time_idx = _rail_find_header(
-            header_cells,
-            [requested_from_name, from_station, _rail_legacy_station_param(from_station)],
-        )
-        to_time_idx = _rail_find_header(
-            header_cells,
-            [requested_to_name, to_station, _rail_legacy_station_param(to_station)],
-        )
+        from_time_idx = _rail_station_header_index(header_cells, from_station)
+        to_time_idx = _rail_station_header_index(header_cells, to_station)
 
-        if train_idx is None or from_time_idx is None:
+        # If the merged header failed, use the station-specific header row.
+        if from_time_idx is None:
+            from_time_idx = _rail_station_header_index(rows[station_row_index], from_station)
+        if to_time_idx is None:
+            to_time_idx = _rail_station_header_index(rows[station_row_index], to_station)
+
+        if from_time_idx is None:
             continue
 
-        for row in rows[header_row_index + 1:]:
-            cells = row.find_all(["th", "td"])
-            values = [c.get_text(" ", strip=True) for c in cells]
-            if not values or train_idx >= len(values) or from_time_idx >= len(values):
+        data_start = max(header_row_index, station_row_index) + 1
+        table_trains: List[Dict[str, Any]] = []
+        for row in rows[data_start:]:
+            values = [re.sub(r"\s+", " ", str(v or "")).strip() for v in row]
+            if not values:
                 continue
-
-            train_cell = values[train_idx].strip()
-            dep_raw = values[from_time_idx].strip()
-            arr_raw = (
-                values[to_time_idx].strip()
-                if to_time_idx is not None and to_time_idx < len(values)
-                else ""
+            parsed = _rail_train_from_row(
+                values=values,
+                line=line,
+                requested_from_name=requested_from_name,
+                requested_to_name=requested_to_name,
+                train_idx=train_idx,
+                speed_idx=speed_idx,
+                coach_idx=coach_idx,
+                origin_idx=origin_idx,
+                ending_idx=ending_idx,
+                duration_idx=duration_idx,
+                from_time_idx=from_time_idx,
+                to_time_idx=to_time_idx,
+                source_url=source_url,
             )
+            if parsed:
+                table_trains.append(parsed)
 
-            if not train_cell or not dep_raw or dep_raw in {"—", "-", "–"}:
-                continue
-
-            dep_min = _rail_time_to_minutes(dep_raw)
-            arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
-            if dep_min is None:
-                continue
-
-            speed = values[speed_idx] if speed_idx is not None and speed_idx < len(values) else ""
-            coaches = values[coach_idx] if coach_idx is not None and coach_idx < len(values) else None
-            origin = values[origin_idx] if origin_idx is not None and origin_idx < len(values) else None
-            ending = values[ending_idx] if ending_idx is not None and ending_idx < len(values) else None
-            duration = values[duration_idx] if duration_idx is not None and duration_idx < len(values) else None
-
-            service_type, service_label = _rail_detect_service(train_cell, speed)
-            cleaned_train_no = _rail_clean_train_no(train_cell)
-            if cleaned_train_no == "—":
-                cleaned_train_no = train_cell
-
-            if arr_min is not None and arr_min < dep_min:
-                arr_min += 1440
-
-            trains.append({
-                "time": dep_raw,
-                "departure_time": dep_raw,
-                "arrival_time": arr_raw if arr_raw not in {"", "—", "-", "–"} else None,
-                "timestamp_minutes": dep_min,
-                "arrival_minutes": arr_min,
-                "train_no": cleaned_train_no,
-                "name": f"{origin or requested_from_name} → {ending or requested_to_name}",
-                "service_type": service_type,
-                "service": service_label,
-                "category": service_label,
-                "platform": None,
-                "platform_note": "Platform not published in this timetable response.",
-                "status": "Scheduled",
-                "status_msg": "Scheduled timetable entry",
-                "delay_minutes": None,
-                "crowd": None,
-                "door_side": None,
-                "coaches": coaches,
-                "coach_count": coaches,
-                "composition": coaches,
-                "source": requested_from_name,
-                "destination": requested_to_name,
-                "origin": origin,
-                "ending_at": ending,
-                "duration": duration,
-                "days": _rail_days_from_label(train_cell),
-                "live": False,
-                "data_source": source_url,
-                "data_source_type": RAILWAY_REFERENCE_LABEL,
-                "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
-            })
-
-        if trains:
+        if table_trains:
+            trains.extend(table_trains)
+            # Prefer the first real timetable table; navigation tables should
+            # never prevent later data from being considered, but once a table
+            # has produced valid rows it is already authoritative for this URL.
             break
 
     unique: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
@@ -3928,8 +4094,23 @@ def _rail_parse_timetable_html(
             str(train.get("destination", "")),
         )
         unique[key] = train
-
     return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
+
+
+def _rail_strip_html_to_lines(html: str) -> List[str]:
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text("\n", strip=True)
+            return [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+        except Exception:
+            pass
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    text = re.sub(r"</(p|div|li|tr|h[1-6])\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text, flags=re.I)
+    text = re.sub(r"&amp;", "&", text, flags=re.I)
+    return [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
 
 
 def _rail_parse_mobile_timetable_html(
@@ -3939,31 +4120,37 @@ def _rail_parse_mobile_timetable_html(
     to_station: str,
     source_url: str,
 ) -> List[Dict[str, Any]]:
-    """Parse the lightweight Mumbai Lifeline timetable as a final fallback."""
-    if BeautifulSoup is None:
-        return []
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text("\n", strip=True)
-    except Exception:
+    """Parse Mumbai Lifeline's lightweight timetable even without BeautifulSoup."""
+    lines = _rail_strip_html_to_lines(html)
+    if not lines:
         return []
 
-    station = re.escape(_rail_station_display_name(from_station))
+    requested_from = _rail_station_display_name(from_station)
+    requested_from_norm = _rail_normalize(requested_from)
+    trains: List[Dict[str, Any]] = []
+
+    # Mobile pages normally contain lines such as:
+    # "Virar to Churchgate 7:09 am 7:27 am". Some variants insert extra
+    # whitespace or omit the selected station, so accept any station-to-dest
+    # pair with two recognizable times and then validate the origin.
+    time_re = r"(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))"
     pattern = re.compile(
-        rf"^{station}\s+to\s+(.+?)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)$",
+        rf"^(.+?)\s+to\s+(.+?)\s+{time_re}\s+{time_re}$",
         re.I,
     )
 
-    trains: List[Dict[str, Any]] = []
-    for raw_line in text.splitlines():
-        line_text = re.sub(r"\s+", " ", raw_line).strip()
-        match = pattern.match(line_text)
+    for raw_line in lines:
+        match = pattern.match(raw_line)
         if not match:
             continue
+        origin = match.group(1).strip()
+        destination = match.group(2).strip()
+        dep_raw = match.group(3).strip()
+        arr_raw = match.group(4).strip()
 
-        destination = match.group(1).strip()
-        dep_raw = match.group(2).strip()
-        arr_raw = match.group(3).strip()
+        if _rail_normalize(origin) != requested_from_norm:
+            continue
+
         dep_min = _rail_time_to_minutes(dep_raw)
         arr_min = _rail_time_to_minutes(arr_raw)
         if dep_min is None:
@@ -3978,7 +4165,7 @@ def _rail_parse_mobile_timetable_html(
             "timestamp_minutes": dep_min,
             "arrival_minutes": arr_min,
             "train_no": "—",
-            "name": f"{_rail_station_display_name(from_station)} → {destination}",
+            "name": f"{requested_from} → {destination}",
             "service_type": "S",
             "service": "Scheduled local",
             "category": "Scheduled local",
@@ -3989,9 +4176,9 @@ def _rail_parse_mobile_timetable_html(
             "coaches": None,
             "coach_count": None,
             "composition": None,
-            "source": _rail_station_display_name(from_station),
+            "source": requested_from,
             "destination": destination,
-            "origin": _rail_station_display_name(from_station),
+            "origin": requested_from,
             "ending_at": destination,
             "duration": None,
             "days": "As published",
@@ -4015,6 +4202,7 @@ async def _rail_fetch_timetable(
     after_minutes: int,
     before_minutes: int,
 ) -> Dict[str, Any]:
+    """Fetch and normalize scheduled railway data without changing the API contract."""
     line = str(line).upper()
     from_name = _rail_station_display_name(from_station)
     to_name = _rail_station_display_name(to_station)
@@ -4045,6 +4233,7 @@ async def _rail_fetch_timetable(
         "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
         "retrieved_at": datetime.now().astimezone().isoformat(),
         "error": None,
+        "source_errors": [],
     }
 
     errors: List[str] = []
@@ -4052,7 +4241,19 @@ async def _rail_fetch_timetable(
         "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36 OmniTouristOS/1.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
     }
+
+    def in_window(train: Dict[str, Any]) -> bool:
+        minute = train.get("timestamp_minutes")
+        if minute is None:
+            return False
+        minute = int(minute) % 1440
+        start = int(after_minutes) % 1440
+        end = int(before_minutes) % 1440
+        if start <= end:
+            return start <= minute <= end
+        return minute >= start or minute <= end
 
     try:
         async with httpx.AsyncClient(
@@ -4064,7 +4265,7 @@ async def _rail_fetch_timetable(
                 try:
                     response = await client.get(url)
                     if response.status_code != 200:
-                        errors.append(f"HTTP {response.status_code}: {url}")
+                        errors.append(f"HTTP {response.status_code} from timetable source")
                         continue
 
                     parsed = _rail_parse_timetable_html(
@@ -4075,7 +4276,10 @@ async def _rail_fetch_timetable(
                         source_url=str(response.url),
                     )
 
-                    if not parsed and index == len(source_urls) - 1:
+                    # The mobile page is deliberately a fallback for every
+                    # response, not only the final URL. This protects us if the
+                    # provider returns a 200 page with a changed HTML layout.
+                    if not parsed:
                         parsed = _rail_parse_mobile_timetable_html(
                             html=response.text,
                             line=line,
@@ -4084,25 +4288,39 @@ async def _rail_fetch_timetable(
                             source_url=str(response.url),
                         )
 
+                    parsed = [train for train in parsed if in_window(train)]
                     if parsed:
                         result["trains"] = parsed
                         result["source_url"] = str(response.url)
                         result["source_used"] = "mobile" if "/m/" in str(response.url) else "timetable"
                         result["error"] = None
+                        result["source_errors"] = []
                         _rail_cache_set(cache_key, result)
                         return result
 
-                    errors.append(f"No timetable rows parsed: {url}")
+                    errors.append("Timetable page reached but no matching scheduled rows were parsed")
                 except Exception as exc:
-                    errors.append(f"{type(exc).__name__}: {exc}")
+                    errors.append(f"{type(exc).__name__} while reading timetable source")
 
     except Exception as exc:
-        errors.append(f"{type(exc).__name__}: {exc}")
+        errors.append(f"{type(exc).__name__} while opening timetable source")
 
-    result["error"] = "Timetable source was reached, but no schedule rows could be parsed. " + " | ".join(errors[-3:])
-    result["source_errors"] = errors
+    # Keep diagnostic details in server logs rather than leaking URLs/errors to
+    # the mobile UI. The API still exposes source_errors for backward compatibility.
+    result["error"] = "The timetable source is temporarily unavailable or its format changed."
+    result["source_errors"] = errors[-5:]
+    print(
+        "[Omni Rail] timetable parse failure",
+        {
+            "line": line,
+            "from": from_name,
+            "to": to_name,
+            "errors": errors[-5:],
+        },
+    )
     _rail_cache_set(cache_key, result)
     return result
+
 
 def _rail_filter_trains(
     trains: List[Dict[str, Any]],
