@@ -1,0 +1,131 @@
+{
+  "version": 1,
+  "description": "Curated seed catalog for Omni TouristOS. Coordinates are approximate map anchors; time/fee fields intentionally avoid hard-coded live claims.",
+  "destinations": {
+    "mumbai||india": {
+      "destination": {
+        "city": "Mumbai",
+        "state": "Maharashtra",
+        "country": "India",
+        "display_name": "Mumbai",
+        "latitude": 19.0760,
+        "longitude": 72.8777,
+        "formatted_address": "Mumbai, Maharashtra, India",
+        "source": "Omni TouristOS Local Destination Catalog",
+        "data_state": "VERIFIED_LOCAL_CATALOG"
+      },
+      "places": [
+        {"name":"Gateway of India","category":"Heritage & Forts","lat":18.9220,"lng":72.8347,"overview":"Mumbai's landmark waterfront arch and a major starting point for exploring South Mumbai.","things_to_do":["See the landmark and waterfront","Explore Colaba nearby","Check official ferry information for onward visits"],"best_food":["Try local snacks and Maharashtrian dishes in the Colaba area"],"best_time":"Early morning or later afternoon can be more comfortable outdoors."},
+        {"name":"Marine Drive","category":"Nature & Wildlife","lat":18.9432,"lng":72.8236,"overview":"Mumbai's iconic seafront promenade overlooking the Arabian Sea.","things_to_do":["Walk the promenade","Watch sunset conditions","Explore nearby South Mumbai sights"],"best_food":["Sample Mumbai street snacks from reputable vendors nearby"],"best_time":"Late afternoon through evening is popular; check local weather before going."},
+        {"name":"Chhatrapati Shivaji Maharaj Terminus","category":"Heritage & Forts","lat":18.9402,"lng":72.8356,"overview":"A historic railway terminus and one of Mumbai's best-known architectural landmarks.","things_to_do":["See the exterior architecture","Explore the Fort area","Combine with nearby heritage stops"],"best_food":["Try local South Mumbai cafes and traditional eateries"],"best_time":"Daylight hours are useful for architecture-focused visits."},
+        {"name":"Elephanta Caves","category":"Heritage & Forts","lat":18.9633,"lng":72.9317,"overview":"A major archaeological and rock-cut heritage destination on Elephanta Island.","things_to_do":["Explore the cave complex","Allow time for the ferry journey","Carry water and comfortable footwear"],"best_food":["Keep meals simple before the island trip and verify available vendors"],"best_time":"Start earlier to allow for ferry and walking time."},
+        {"name":"Sanjay Gandhi National Park","category":"Nature & Wildlife","lat":19.2147,"lng":72.9106,"overview":"A large green protected area within the Mumbai metropolitan region.","things_to_do":["Explore designated trails and visitor areas","Check current park access rules","Plan enough daylight time"],"best_food":["Carry water and use permitted food areas"],"best_time":"Morning is practical for outdoor activity; verify current conditions."},
+        {"name":"Siddhivinayak Temple","category":"Sacred & Spiritual","lat":19.0169,"lng":72.8300,"overview":"A prominent Hindu temple in central Mumbai dedicated to Lord Ganesha.","things_to_do":["Plan for queues","Follow temple dress and photography rules","Check official timings before visiting"],"best_food":["Try reputable vegetarian Maharashtrian options nearby"],"best_time":"Check official opening and crowd information before travel."}
+      ]
+    },
+    "vasai-virar||india": {
+      "destination": {
+        "city": "Vasai-Virar",
+        "state": "Maharashtra",
+        "country": "India",
+        "display_name": "Vasai-Virar",
+        "latitude": 19.3919,
+        "longitude": 72.8397,
+        "formatted_address": "Vasai-Virar, Maharashtra, India",
+        "source": "Omni TouristOS Local Destination Catalog",
+        "data_state": "VERIFIED_LOCAL_CATALOG"
+      },
+      "places": [
+        {"name":"Tungareshwar Temple","category":"Sacred & Spiritual","lat":19.4210,"lng":72.8315,"overview":"A temple destination in the Tungareshwar forested hill area near Vasai.","things_to_do":["Visit the temple respectfully","Check trail and access conditions","Carry water for hill walks"],"best_food":["Carry water and use permitted food stops"],"best_time":"Morning is generally practical for outdoor walking; verify local conditions."},
+        {"name":"Tungareshwar Waterfalls","category":"Nature & Wildlife","lat":19.4160,"lng":72.8240,"overview":"A seasonal waterfall area associated with the Tungareshwar hills.","things_to_do":["Check seasonal water flow","Use marked or safer paths","Avoid slippery rock areas"],"best_food":["Carry water and use permitted food areas"],"best_time":"Water conditions are seasonal; verify local weather and access before visiting."},
+        {"name":"Vasai Fort","category":"Heritage & Forts","lat":19.3370,"lng":72.8064,"overview":"A major historic fortification and heritage site on the Vasai coast.","things_to_do":["Walk the fort precinct","Explore remaining structures","Allow time for outdoor walking"],"best_food":["Try local coastal Maharashtrian food from reputable nearby places"],"best_time":"Morning or late afternoon can be more comfortable for an outdoor heritage visit."},
+        {"name":"Arnala Beach","category":"Nature & Wildlife","lat":19.4563,"lng":72.7440,"overview":"A coastal beach destination north of Vasai.","things_to_do":["Walk the beach","Check local sea and weather conditions","Combine with nearby coastal sights"],"best_food":["Choose reputable local seafood or vegetarian options"],"best_time":"Late afternoon can be pleasant, subject to weather and tide conditions."},
+        {"name":"Jivdani Temple","category":"Sacred & Spiritual","lat":19.4622,"lng":72.8095,"overview":"A hilltop temple associated with Virar and known for its climb and views.","things_to_do":["Plan for the climb","Carry water","Check current access and queue conditions"],"best_food":["Use reputable vegetarian eateries in the Virar area"],"best_time":"Start early to make the climb more comfortable."}
+      ]
+    },
+    "dubai||united arab emirates": {
+      "destination": {
+        "city": "Dubai",
+        "state": "Dubai",
+        "country": "United Arab Emirates",
+        "display_name": "Dubai",
+        "latitude": 25.2048,
+        "longitude": 55.2708,
+        "formatted_address": "Dubai, United Arab Emirates",
+        "source": "Omni TouristOS Local Destination Catalog",
+        "data_state": "VERIFIED_LOCAL_CATALOG"
+      },
+      "places": [
+        {"name":"Burj Khalifa","category":"Family & Attractions","lat":25.1972,"lng":55.2744,"overview":"Dubai's landmark supertall skyscraper and a central Downtown Dubai attraction.","things_to_do":["Visit observation experiences","Explore Downtown Dubai","Check timed-entry requirements"],"best_food":["Explore restaurants in Downtown Dubai"],"best_time":"Outdoor heat is lower in cooler months; verify current visitor-slot availability."},
+        {"name":"The Dubai Fountain","category":"Family & Attractions","lat":25.1950,"lng":55.2750,"overview":"A major Downtown Dubai fountain attraction beside Burj Khalifa and Dubai Mall.","things_to_do":["Watch the fountain area","Explore the surrounding promenade","Combine with Dubai Mall and Burj Khalifa"],"best_food":["Use the wide range of restaurants around Dubai Mall and Downtown"],"best_time":"Evening is popular; check the current performance schedule."},
+        {"name":"Dubai Mall","category":"Culinary & Bazaars","lat":25.1975,"lng":55.2796,"overview":"A major shopping and entertainment destination in Downtown Dubai.","things_to_do":["Shop and explore entertainment areas","Visit the aquarium area","Connect the visit with Burj Khalifa"],"best_food":["Choose from the broad restaurant selection inside the mall"],"best_time":"Useful in daytime heat or evening; allow several hours for a full visit."},
+        {"name":"Jumeirah Mosque","category":"Sacred & Spiritual","lat":25.2341,"lng":55.2972,"overview":"A prominent mosque and cultural landmark in Dubai.","things_to_do":["Check visitor-program availability","Follow photography and dress guidance","Learn about local culture"],"best_food":["Explore reputable restaurants in Jumeirah"],"best_time":"Confirm visitor times and cultural-program schedules before visiting."},
+        {"name":"Museum of the Future","category":"Arts & Culture","lat":25.2194,"lng":55.2818,"overview":"A contemporary Dubai landmark focused on future-oriented exhibitions and experiences.","things_to_do":["Explore exhibitions","Allow time for immersive displays","Check timed-entry information"],"best_food":["Explore nearby DIFC and Downtown dining"],"best_time":"Indoor visits are practical throughout the year; reserve timed entry when required."},
+        {"name":"Palm Jumeirah","category":"Nature & Wildlife","lat":25.1124,"lng":55.1390,"overview":"Dubai's iconic man-made island development with beaches, resorts and viewpoints.","things_to_do":["Explore the island","Visit beach or resort areas with permitted access","See skyline viewpoints"],"best_food":["Explore the many restaurants across Palm Jumeirah"],"best_time":"Late afternoon and evening are popular for outdoor views."}
+      ]
+    },
+    "goa||india": {
+      "destination": {
+        "city": "Goa",
+        "state": "Goa",
+        "country": "India",
+        "display_name": "Goa",
+        "latitude": 15.2993,
+        "longitude": 74.1240,
+        "formatted_address": "Goa, India",
+        "source": "Omni TouristOS Local Destination Catalog",
+        "data_state": "VERIFIED_LOCAL_CATALOG"
+      },
+      "places": [
+        {"name":"Basilica of Bom Jesus","category":"Sacred & Spiritual","lat":15.5009,"lng":73.9112,"overview":"A renowned historic basilica in Old Goa and a major heritage landmark.","things_to_do":["Explore the basilica","Combine with Old Goa churches","Respect site rules"],"best_food":["Try Goan vegetarian and non-vegetarian specialties from reputable restaurants"],"best_time":"Morning or late afternoon is useful for an Old Goa heritage circuit."},
+        {"name":"Fort Aguada","category":"Heritage & Forts","lat":15.4922,"lng":73.7739,"overview":"A historic coastal fort complex overlooking the Arabian Sea.","things_to_do":["Explore the fort area","See coastal viewpoints","Plan around outdoor heat"],"best_food":["Try local Goan cuisine around Sinquerim and Candolim"],"best_time":"Early morning or late afternoon is more comfortable for outdoor exploration."},
+        {"name":"Calangute Beach","category":"Nature & Wildlife","lat":15.5439,"lng":73.7553,"overview":"One of Goa's best-known beaches with a busy tourist atmosphere.","things_to_do":["Walk the beach","Enjoy permitted water activities","Explore nearby markets and cafes"],"best_food":["Try reputable Goan seafood and local snacks"],"best_time":"Late afternoon and evening are popular; follow beach and sea-safety guidance."},
+        {"name":"Baga Beach","category":"Nature & Wildlife","lat":15.5556,"lng":73.7515,"overview":"A popular North Goa beach known for its lively tourism scene.","things_to_do":["Walk the coastline","Explore nearby shops and nightlife areas","Check local sea conditions"],"best_food":["Choose reputable restaurants and beach shacks"],"best_time":"Late afternoon into evening is busy; choose quieter times if preferred."},
+        {"name":"Chapora Fort","category":"Heritage & Forts","lat":15.6130,"lng":73.7397,"overview":"A hilltop fort with broad views across the North Goa coast.","things_to_do":["Walk the fort remains","See the coastal viewpoints","Wear comfortable footwear"],"best_food":["Explore local Goan restaurants in Vagator and nearby areas"],"best_time":"Late afternoon is popular for views; check weather before the climb."},
+        {"name":"Dudhsagar Falls","category":"Nature & Wildlife","lat":15.3144,"lng":74.3149,"overview":"A major waterfall destination in the Western Ghats region of Goa.","things_to_do":["Check access arrangements","Plan for a longer excursion","Follow forest and wildlife rules"],"best_food":["Carry suitable provisions according to permitted access rules"],"best_time":"Season and access conditions strongly affect the experience; verify before departure."}
+      ]
+    },
+    "delhi||india": {
+      "destination": {
+        "city": "Delhi",
+        "state": "Delhi",
+        "country": "India",
+        "display_name": "Delhi",
+        "latitude": 28.6139,
+        "longitude": 77.2090,
+        "formatted_address": "Delhi, India",
+        "source": "Omni TouristOS Local Destination Catalog",
+        "data_state": "VERIFIED_LOCAL_CATALOG"
+      },
+      "places": [
+        {"name":"India Gate","category":"Heritage & Forts","lat":28.6129,"lng":77.2295,"overview":"A major national war memorial and landmark in central Delhi.","things_to_do":["See the memorial area","Walk the surrounding grounds where permitted","Combine with central Delhi sights"],"best_food":["Explore reputable North Indian restaurants in central Delhi"],"best_time":"Early morning or evening is usually more comfortable outdoors."},
+        {"name":"Red Fort","category":"Heritage & Forts","lat":28.6562,"lng":77.2410,"overview":"A major Mughal-era fort complex and UNESCO World Heritage landmark.","things_to_do":["Explore the fort complex","Allow time for security and walking","Combine with Old Delhi"],"best_food":["Explore reputable Old Delhi food destinations"],"best_time":"Morning is practical for an outdoor heritage circuit; verify current entry information."},
+        {"name":"Qutub Minar","category":"Heritage & Forts","lat":28.5244,"lng":77.1855,"overview":"A landmark medieval minaret and archaeological complex in South Delhi.","things_to_do":["Explore the monument complex","See surrounding structures","Allow time for walking"],"best_food":["Explore nearby South Delhi restaurants"],"best_time":"Morning or late afternoon is suitable for outdoor exploration."},
+        {"name":"Humayun's Tomb","category":"Heritage & Forts","lat":28.5933,"lng":77.2507,"overview":"A major Mughal garden-tomb complex and important Delhi heritage site.","things_to_do":["Explore the tomb and gardens","Photograph the architecture","Combine with nearby heritage sites"],"best_food":["Explore reputable restaurants in central and south Delhi"],"best_time":"Morning or late afternoon is comfortable for the gardens."},
+        {"name":"Lotus Temple","category":"Sacred & Spiritual","lat":28.5535,"lng":77.2588,"overview":"A distinctive Bahá'í House of Worship known for its lotus-inspired architecture.","things_to_do":["See the architecture","Experience the quiet worship space","Follow visitor guidelines"],"best_food":["Try reputable vegetarian restaurants nearby"],"best_time":"Check current visiting days and hours before going."},
+        {"name":"Akshardham","category":"Sacred & Spiritual","lat":28.6127,"lng":77.2773,"overview":"A large temple and cultural complex in Delhi.","things_to_do":["Explore the complex","Allow time for security procedures","Check photography and entry rules"],"best_food":["Use permitted food facilities and reputable vegetarian options"],"best_time":"Plan around the site's current operating schedule."}
+      ]
+    },
+    "singapore||singapore": {
+      "destination": {
+        "city": "Singapore",
+        "state": "Singapore",
+        "country": "Singapore",
+        "display_name": "Singapore",
+        "latitude": 1.3521,
+        "longitude": 103.8198,
+        "formatted_address": "Singapore",
+        "source": "Omni TouristOS Local Destination Catalog",
+        "data_state": "VERIFIED_LOCAL_CATALOG"
+      },
+      "places": [
+        {"name":"Gardens by the Bay","category":"Nature & Wildlife","lat":1.2816,"lng":103.8636,"overview":"A major waterfront garden attraction in central Singapore.","things_to_do":["Explore the gardens","Visit conservatory attractions","See the Supertree area"],"best_food":["Explore nearby Marina Bay dining options"],"best_time":"Late afternoon into evening is popular; check the current event schedule."},
+        {"name":"Marina Bay Sands","category":"Family & Attractions","lat":1.2834,"lng":103.8607,"overview":"A major integrated resort and skyline landmark at Marina Bay.","things_to_do":["Explore the public areas","See the Marina Bay skyline","Combine with nearby attractions"],"best_food":["Choose from the wide dining selection around Marina Bay"],"best_time":"Evening is popular for skyline views."},
+        {"name":"Merlion Park","category":"Sights & Landmarks","lat":1.2868,"lng":103.8545,"overview":"A classic Singapore photo stop beside Marina Bay.","things_to_do":["See the Merlion","Walk the waterfront","Combine with Marina Bay attractions"],"best_food":["Explore nearby Marina Bay and Fullerton dining"],"best_time":"Early morning or evening can be more comfortable outdoors."},
+        {"name":"Sentosa Island","category":"Family & Attractions","lat":1.2494,"lng":103.8303,"overview":"A resort island with beaches, entertainment and family attractions.","things_to_do":["Explore beach areas","Visit entertainment attractions","Plan a half-day or full-day visit"],"best_food":["Use the island's broad restaurant selection"],"best_time":"A full day works well if combining several attractions."},
+        {"name":"Singapore Zoo","category":"Nature & Wildlife","lat":1.4043,"lng":103.7930,"overview":"A major wildlife attraction in the Mandai area.","things_to_do":["Explore animal habitats","Plan for outdoor walking","Check current feeding and keeper programs"],"best_food":["Use permitted food facilities inside or near the attraction"],"best_time":"Morning is often practical for a wildlife-focused visit."},
+        {"name":"Chinatown Singapore","category":"Culinary & Bazaars","lat":1.2838,"lng":103.8436,"overview":"A historic urban district known for heritage streets, temples, markets and food.","things_to_do":["Explore heritage streets","Visit cultural sites","Try local food"],"best_food":["Sample reputable hawker and Chinese-Singaporean dishes"],"best_time":"Late afternoon and evening work well for food and street exploration."}
+      ]
+    }
+  }
+}

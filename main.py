@@ -19,6 +19,7 @@ import requests
 from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import Response
 from places import router as places_router
+from services.destination_engine import router as destination_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -43,6 +44,9 @@ app = FastAPI(
 
 # Register the places router on the active app instance
 app.include_router(places_router)
+# Destination Engine v2 is mounted before legacy destination routes so the
+# new local-catalog-first architecture owns the stable public API contract.
+app.include_router(destination_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -2580,6 +2584,8 @@ async def place_details(request: Request):
                         "hotels": google_hotels,
                     }
 
+        places_provider = str(body.get("places_provider") or body.get("source") or "").strip()
+
         return {
             "status": "success",
             "place": {
@@ -2619,9 +2625,9 @@ async def place_details(request: Request):
             "hotel_state": nearby_stays.get("status"),
             "hotel_provider": nearby_stays.get("provider"),
             "hotel_reason": nearby_stays.get("reason"),
-            "attribution_required": (["Google Maps", "Booking.com", "Wikimedia Commons"]
+            "attribution_required": (["Google Maps", "Booking.com"]
                                      if places_provider == "Google Places"
-                                     else ["OpenStreetMap", "Wikipedia", "Wikimedia Commons", "Booking.com"]),
+                                     else ["OpenStreetMap", "Wikimedia Commons", "Booking.com"]),
         }
     except Exception as e:
         print(f"[Place Details Error]: {e}")
