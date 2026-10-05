@@ -470,10 +470,17 @@ CURRENCY_SYMBOLS = {
 
 _fx_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 _google_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_open_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+_open_places_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
 _wikimedia_image_cache: Dict[str, Dict[str, Any]] = {}
 _wikimedia_semaphore = asyncio.Semaphore(3)
+_open_geo_semaphore = asyncio.Semaphore(1)
+_google_places_disabled = False
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIMEDIA_USER_AGENT = "OmniTouristOS/1.0 (destination image service)"
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+OPEN_DATA_USER_AGENT = "OmniTouristOS/1.0 (destination explorer; contact via app)"
+NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/search"
 
 
 def _normalize_country_iso2(country: str) -> str:
@@ -782,7 +789,8 @@ async def _attach_wikimedia_images(
 
 
 async def _google_text_search(query: str, max_result_count: int = 10) -> List[Dict[str, Any]]:
-    if not GOOGLE_PLACES_API_KEY:
+    global _google_places_disabled
+    if _google_places_disabled or not GOOGLE_PLACES_API_KEY:
         return []
 
     endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
@@ -819,6 +827,9 @@ async def _google_text_search(query: str, max_result_count: int = 10) -> List[Di
                 json=payload,
             )
         if response.status_code != 200:
+            if response.status_code in {401, 403} or "PERMISSION_DENIED" in response.text:
+                _google_places_disabled = True
+                print("[Google Places Fallback] Places API is unavailable/unauthorized; switching Destination Explorer to open-data providers.")
             print(f"[Google Places Notice] {response.status_code}: {response.text[:300]}")
             return []
         data = response.json()
@@ -890,6 +901,234 @@ async def _resolve_destination_with_google(city: str, state: str, country: str) 
     }
     _google_destination_cache[key] = resolved
     return resolved
+
+
+async def _resolve_destination_with_open_data(city: str, state: str, country: str) -> Optional[Dict[str, Any]]:
+    """Resolve a destination without Google using OpenStreetMap Nominatim.
+
+    This is a real geocoder lookup, not generated/synthetic destination data.
+    Requests are serialized to respect the public Nominatim service policy.
+    """
+    key = (city.strip().lower(), state.strip().lower(), country.strip().lower())
+    cached = _open_destination_cache.get(key)
+    if cached is not None:
+        return cached
+
+    query_parts = [city.strip()]
+    if state.strip():
+        query_parts.append(state.strip())
+    if country.strip():
+        query_parts.append(country.strip())
+
+    params = {
+        "q": ", ".join(x for x in query_parts if x),
+        "format": "jsonv2",
+        "addressdetails": "1",
+        "limit": "5",
+        "accept-language": "en",
+    }
+    try:
+        async with _open_geo_semaphore:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+                response = await client.get(
+                    NOMINATIM_API_URL,
+                    params=params,
+                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
+                )
+        if response.status_code != 200:
+            print(f"[Open Geocoder Notice] {response.status_code}: {response.text[:300]}")
+            return None
+        results = response.json() or []
+        if not results:
+            return None
+
+        city_norm = re.sub(r"\\s+", " ", city.strip().lower())
+        country_norm = country.strip().lower()
+
+        def score(item: Dict[str, Any]) -> int:
+            display = str(item.get("display_name") or "").lower()
+            item_name = str(item.get("name") or "").lower()
+            item_type = str(item.get("type") or "").lower()
+            address = item.get("address") or {}
+            score_value = 0
+            if item_name == city_norm:
+                score_value += 100
+            elif city_norm and city_norm in display:
+                score_value += 40
+            if item_type in {"city", "town", "municipality", "village", "locality"}:
+                score_value += 40
+            if country_norm and country_norm in display:
+                score_value += 10
+            if address.get("city", "").lower() == city_norm:
+                score_value += 25
+            return score_value
+
+        chosen = max(results, key=score)
+        lat = chosen.get("lat")
+        lon = chosen.get("lon")
+        if lat is None or lon is None:
+            return None
+
+        resolved = {
+            "city": city,
+            "state": state,
+            "country": country,
+            "display_name": chosen.get("name") or city,
+            "place_id": f"osm:{chosen.get('osm_type','')}/{chosen.get('osm_id','')}",
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "formatted_address": chosen.get("display_name"),
+            "google_maps_url": None,
+            "website_url": None,
+            "types": [str(chosen.get("type") or "")],
+            "address_components": chosen.get("address") or {},
+            "source": "OpenStreetMap Nominatim",
+            "data_state": "VERIFIED_OPEN_DATA",
+            "open_data": True,
+        }
+        _open_destination_cache[key] = resolved
+        return resolved
+    except Exception as e:
+        print(f"[Open Geocoder Notice]: {e}")
+        return None
+
+
+def _open_place_category(title: str, categories: List[str]) -> str:
+    text = f"{title} {' '.join(categories)}".lower()
+    if any(k in text for k in ["temple", "church", "mosque", "shrine", "fort", "castle", "monument", "historic", "heritage", "palace"]):
+        return "Heritage & Forts"
+    if any(k in text for k in ["beach", "park", "garden", "waterfall", "lake", "wildlife", "island", "mountain"]):
+        return "Nature & Wildlife"
+    if any(k in text for k in ["museum", "gallery", "theatre", "theater"]):
+        return "Arts & Culture"
+    if any(k in text for k in ["zoo", "aquarium", "amusement", "theme park", "tourist"]):
+        return "Family & Attractions"
+    return "Sights & Landmarks"
+
+
+async def _load_open_destination_places(city: str, state: str, country: str) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load real attraction records from Wikipedia/Wikimedia when Google is unavailable."""
+    key = (city.strip().lower(), state.strip().lower(), country.strip().lower())
+    if key in _open_places_cache:
+        destination = _open_destination_cache.get(key)
+        return destination, _open_places_cache[key]
+
+    destination = await _resolve_destination_with_open_data(city, state, country)
+    if not destination:
+        return None, []
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "geosearch",
+        "ggsprimary": "all",
+        "ggsradius": "20000",
+        "ggslimit": "50",
+        "ggsnamespace": "0",
+        "ggscoord": f"{destination['latitude']}|{destination['longitude']}",
+        "prop": "coordinates|pageimages|info|categories",
+        "inprop": "url",
+        "piprop": "thumbnail",
+        "pithumbsize": "1000",
+        "cllimit": "10",
+        "clshow": "!hidden",
+        "colimit": "1",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+            response = await client.get(
+                WIKIPEDIA_API_URL,
+                params=params,
+                headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
+            )
+        if response.status_code != 200:
+            print(f"[Wikipedia GeoSearch Notice] {response.status_code}: {response.text[:300]}")
+            return destination, []
+
+        pages = ((response.json() or {}).get("query") or {}).get("pages") or {}
+        normalized: List[Dict[str, Any]] = []
+        seen_names: set = set()
+        city_norm = city.strip().lower()
+
+        for page in pages.values():
+            title = str(page.get("title") or "").strip()
+            if not title:
+                continue
+            title_norm = title.lower()
+            if title_norm in seen_names or title_norm == city_norm:
+                continue
+            if title_norm.startswith(("list of ", "category:", "timeline of ", "history of ")):
+                continue
+
+            coords = page.get("coordinates") or []
+            if not coords:
+                continue
+            coord = coords[0] or {}
+            lat = coord.get("lat")
+            lng = coord.get("lon")
+            if lat is None or lng is None:
+                continue
+
+            raw_categories = page.get("categories") or []
+            categories = [str(c.get("title") or "") for c in raw_categories if isinstance(c, dict)]
+            category_text = " ".join(categories).lower()
+            attraction_hint = any(k in f"{title_norm} {category_text}" for k in [
+                "tourist", "attraction", "landmark", "museum", "temple", "church", "mosque",
+                "shrine", "monument", "fort", "castle", "palace", "park", "garden", "beach",
+                "waterfall", "zoo", "aquarium", "theatre", "theater", "heritage", "historic",
+            ])
+            if not attraction_hint:
+                # Keep notable geosearch pages, but reject obviously geographic/admin pages.
+                if any(k in title_norm for k in ["city", "district", "province", "emirate", "state of", "country"]):
+                    continue
+
+            distance = _place_distance_km(float(lat), float(lng), destination["latitude"], destination["longitude"])
+            if distance > 25:
+                continue
+
+            thumb = ((page.get("thumbnail") or {}).get("source") or "").strip()
+            page_url = str(page.get("fullurl") or f"https://en.wikipedia.org/wiki/{urllib.parse.quote(title.replace(' ', '_'))}")
+            item = {
+                "name": title,
+                "category": _open_place_category(title, categories),
+                "distance": f"{distance:.1f} km from Center",
+                "distance_km": round(distance, 2),
+                "distance_type": "straight_line",
+                "timing": "See official source",
+                "entry": "See official source",
+                "lat": float(lat),
+                "lng": float(lng),
+                "history": "Documented destination/place entry from Wikipedia/Wikimedia open data.",
+                "best_food": "",
+                "things_to_do": "",
+                "best_time": "",
+                "warnings": "Check the official venue/source for current access, hours and local conditions.",
+                "rating": None,
+                "reviews": None,
+                "images": [thumb] if thumb.startswith(("https://", "http://")) else [],
+                "google_photo_names": [],
+                "image_provider": "Wikimedia/Wikipedia" if thumb else "NONE",
+                "image_credits": [{"title": title, "source_url": page_url, "artist": "", "license": "See source page"}] if thumb else [],
+                "maps_url": f"https://www.openstreetmap.org/?mlat={float(lat)}&mlon={float(lng)}#map=16/{float(lat)}/{float(lng)}",
+                "website_url": page_url,
+                "place_id": f"wikipedia:{page.get('pageid')}",
+                "source": "Wikipedia/Wikimedia Open Data",
+                "data_state": "VERIFIED_OPEN_DATA",
+                "provider_verified": True,
+                "attribution_required": "Wikipedia/Wikimedia + OpenStreetMap",
+            }
+            normalized.append(item)
+            seen_names.add(title_norm)
+
+        normalized.sort(key=lambda x: (-(1 if x.get("images") else 0), float(x.get("distance_km") or 999)))
+        normalized = normalized[:20]
+        await _attach_wikimedia_images(normalized, city, country, limit_places=15)
+        _open_places_cache[key] = normalized
+        return destination, normalized
+    except Exception as e:
+        print(f"[Wikipedia GeoSearch Notice]: {e}")
+        return destination, []
 
 
 def _place_category(place: Dict[str, Any]) -> str:
@@ -2357,7 +2596,9 @@ async def place_details(request: Request):
             "hotel_state": nearby_stays.get("status"),
             "hotel_provider": nearby_stays.get("provider"),
             "hotel_reason": nearby_stays.get("reason"),
-            "attribution_required": ["Google Maps", "Booking.com", "Wikimedia Commons"],
+            "attribution_required": (["Google Maps", "Booking.com", "Wikimedia Commons"]
+                                     if places_provider == "Google Places"
+                                     else ["OpenStreetMap", "Wikipedia", "Wikimedia Commons", "Booking.com"]),
         }
     except Exception as e:
         print(f"[Place Details Error]: {e}")
@@ -2399,10 +2640,25 @@ async def explore_city(request: Request):
             }
 
         destination, places = await _load_google_destination_places(city, state, country)
+        places_provider = "Google Places"
+        if not destination:
+            # Google Places is optional. If its key/quota/permissions are unavailable,
+            # continue with real open-data destination records rather than returning
+            # the misleading "no verified attractions" state.
+            destination, places = await _load_open_destination_places(city, state, country)
+            places_provider = "Wikipedia/Wikimedia + OpenStreetMap"
+        elif _google_places_disabled:
+            # Google resolved the destination before the circuit breaker tripped.
+            # Keep the already-resolved destination but use open records for attractions.
+            open_destination, open_places = await _load_open_destination_places(city, state, country)
+            if open_destination:
+                destination, places = open_destination, open_places
+                places_provider = "Wikipedia/Wikimedia + OpenStreetMap"
+
         if not destination:
             return {
                 "status": "unavailable",
-                "message": "Destination resolution is unavailable. Configure GOOGLE_PLACES_API_KEY or provide a provider-backed destination resolver.",
+                "message": "Destination resolution is unavailable from Google Places and the open-data destination providers.",
                 "destination": None,
                 "landmarks": [],
                 "places": [],
@@ -2422,7 +2678,7 @@ async def explore_city(request: Request):
             traveler_country=traveler_country,
             display_currency=traveler_currency,
         )
-        if not stays.get("hotels"):
+        if not stays.get("hotels") and not _google_places_disabled:
             google_hotels = await _load_google_hotels(
                 f"{city}, {country}",
                 float(destination["latitude"]),
@@ -2455,7 +2711,7 @@ async def explore_city(request: Request):
             "adults": adults,
             "kids": kids,
             "child_ages": child_ages,
-            "places_provider": "Google Places",
+            "places_provider": places_provider,
             "places_state": "VERIFIED" if places else "EMPTY",
             "landmarks": places,
             "places": places,
