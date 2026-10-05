@@ -4797,6 +4797,76 @@ def _rr_live_normalize(payload: Dict[str, Any], train_query: str) -> Dict[str, A
     status = str(data.get("status") or current.get("status") or "unknown").replace("_", " ").title()
     is_live = bool(data.get("isLive", True))
 
+    # RailRadar supplies the full live route with scheduled/actual stop times.
+    # Normalize those provider-backed timestamps so the Flutter UI can show
+    # "left X ago" and a trustworthy next-stop ETA without inventing values.
+    route = data.get("route") if isinstance(data.get("route"), list) else []
+    current_sequence = current.get("sequence")
+    route_current = None
+    route_previous = None
+    route_next = None
+    if route:
+        for stop in route:
+            if not isinstance(stop, dict):
+                continue
+            if str(stop.get("stationCode") or "") == str(current.get("stationCode") or ""):
+                if current_sequence is None or stop.get("sequence") == current_sequence:
+                    route_current = stop
+                    break
+        if route_current is None and current_sequence is not None:
+            for stop in route:
+                if isinstance(stop, dict) and stop.get("sequence") == current_sequence:
+                    route_current = stop
+                    break
+        if route_current is not None:
+            seq = route_current.get("sequence")
+            for stop in route:
+                if not isinstance(stop, dict):
+                    continue
+                stop_seq = stop.get("sequence")
+                if isinstance(seq, (int, float)) and isinstance(stop_seq, (int, float)):
+                    if stop_seq < seq:
+                        route_previous = stop
+                    elif stop_seq > seq and route_next is None:
+                        route_next = stop
+
+    if route_next is None and next_halt:
+        for stop in route:
+            if isinstance(stop, dict) and str(stop.get("stationCode") or "") == str(next_halt.get("stationCode") or ""):
+                route_next = stop
+                break
+
+    def _iso_time(value: Any) -> Optional[str]:
+        return str(value).strip() if value not in (None, "") else None
+
+    last_departure_station = current_label
+    last_departure_at = None
+    if isinstance(route_current, dict) and route_current.get("actualDeparture"):
+        last_departure_at = _iso_time(route_current.get("actualDeparture"))
+    elif isinstance(route_previous, dict) and route_previous.get("actualDeparture"):
+        last_departure_station = station_label(route_previous) or last_departure_station
+        last_departure_at = _iso_time(route_previous.get("actualDeparture"))
+
+    next_eta_at = None
+    if isinstance(route_next, dict):
+        next_eta_at = _iso_time(route_next.get("actualArrival")) or _iso_time(route_next.get("scheduledArrival"))
+    if next_eta_at is None and isinstance(next_halt, dict):
+        next_eta_at = _iso_time(next_halt.get("actualArrival")) or _iso_time(next_halt.get("scheduledArrival"))
+
+    def _minutes_until(iso_value: Optional[str]) -> Optional[int]:
+        if not iso_value:
+            return None
+        try:
+            target = datetime.fromisoformat(iso_value.replace("Z", "+00:00"))
+            now = _ist_now()
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=now.tzinfo)
+            return max(0, int(round((target - now).total_seconds() / 60.0)))
+        except Exception:
+            return None
+
+    next_eta_minutes = _minutes_until(next_eta_at)
+
     return {
         "status": "success",
         "type": "live_train",
@@ -4818,6 +4888,14 @@ def _rr_live_normalize(payload: Dict[str, Any], train_query: str) -> Dict[str, A
         "last_updated_at": data.get("lastUpdatedAt"),
         "speed_kmh": current.get("speedKmh"),
         "bearing_degrees": current.get("bearingDegrees"),
+        "segment_progress": current.get("segmentProgress"),
+        "current_is_actual_position": current.get("isActualPosition"),
+        "last_departure_station": last_departure_station,
+        "last_departure_at": last_departure_at,
+        "next_eta_at": next_eta_at,
+        "next_eta_minutes": next_eta_minutes,
+        "next_station_code": (route_next or next_halt).get("stationCode") if isinstance((route_next or next_halt), dict) else None,
+        "route": route,
     }
 
 
@@ -5204,11 +5282,14 @@ async def railway_inquiry(request: Request):
             # Direct RailRadar route search. For Mumbai suburban pairs this is
             # the authoritative provider response and avoids the old HTML source.
             if direct_line and not line_error:
+                # This is a live passenger-departure board: never send the
+                # whole day's timetable to Flutter. RailRadar enriches the
+                # selected route with live departure/delay/platform fields.
                 result = await _railradar_fetch_between(
                     from_station,
                     to_station,
                     date_value=_ist_now().strftime("%Y-%m-%d"),
-                    live=False,
+                    live=True,
                 )
 
                 if result.get("error") and not result.get("trains"):
@@ -5236,30 +5317,19 @@ async def railway_inquiry(request: Request):
                     if _rr_route_matches_service(train, requested_service)
                 ]
 
-                # The Flutter planner sends the requested clock time. Respect it
-                # instead of silently replacing it with the server's current time.
-                requested_minutes = route_payload.get("time_minutes")
-                try:
-                    requested_minutes = int(requested_minutes) if requested_minutes is not None else None
-                except Exception:
-                    requested_minutes = None
+                # Always anchor the board to the actual current IST time.
+                # The Flutter screen refreshes this endpoint continuously, so the
+                # window naturally moves forward as the clock advances.
+                now_ist = _ist_now()
+                current_minutes = now_ist.hour * 60 + now_ist.minute
+                window_start = current_minutes
+                window_end = min(current_minutes + 60, 1439)
 
-                if requested_minutes is None:
-                    requested_minutes = _ist_now().hour * 60 + _ist_now().minute
-
-                window_start = max(0, requested_minutes - 60)
-                window_end = min(1439, requested_minutes + 120)
-
-                around_time = [
+                display_trains = [
                     train
                     for train in trains
                     if window_start <= int(train.get("timestamp_minutes", 0)) <= window_end
                 ]
-
-                # If the requested time is near a boundary or provider has only
-                # a sparse result set, retain the full provider result rather than
-                # displaying an empty board.
-                display_trains = around_time or trains
 
                 return {
                     "status": "success",
@@ -5274,17 +5344,18 @@ async def railway_inquiry(request: Request):
                     "route_search": True,
                     "requires_interchange": False,
                     "service_filter": requested_service,
-                    "requested_time": _rail_minutes_to_12h(requested_minutes),
+                    "requested_time": _rail_minutes_to_12h(current_minutes),
                     "window_start": _rail_minutes_to_12h(window_start),
                     "window_end": _rail_minutes_to_12h(window_end),
-                    "current_time": _rail_minutes_to_12h(
-                        _ist_now().hour * 60 + _ist_now().minute
-                    ),
+                    "current_time": _rail_minutes_to_12h(current_minutes),
+                    "live_window_minutes": 60,
+                    "live_refresh_recommended_seconds": 45,
                     "data_source": result.get("source_url"),
                     "data_source_label": "RailRadar API",
                     "source_notice": (
-                        "Scheduled Mumbai suburban timetable data is supplied by RailRadar. "
-                        "Live delay/platform values are shown only when a live RailRadar field is present."
+                        "Live Mumbai suburban route departures are supplied by RailRadar. "
+                        "Only trains departing from the current time through the next 60 minutes are returned. "
+                        "Platform and delay are shown only when RailRadar supplies live values."
                     ),
                     "source_error": result.get("error"),
                 }
@@ -5366,11 +5437,12 @@ async def railway_inquiry(request: Request):
                 )
             )
 
+            board_end = min(current_min + 60, 1439)
             upcoming = [
                 train
                 for train in deduped
-                if int(train.get("timestamp_minutes", 0)) >= current_min
-            ][:12]
+                if current_min <= int(train.get("timestamp_minutes", 0)) <= board_end
+            ]
 
             unique_line_set: List[str] = []
             for line in station_lines:
@@ -5391,8 +5463,11 @@ async def railway_inquiry(request: Request):
                 "lines": unique_line_set,
                 "line_names": [_rail_line_name(line) for line in unique_line_set],
                 "current_time": _rail_minutes_to_12h(current_min),
-                "board_window": "Full scheduled day",
-                "trains": deduped[:450],
+                "board_window": "Next 60 minutes",
+                "window_start": _rail_minutes_to_12h(current_min),
+                "window_end": _rail_minutes_to_12h(board_end),
+                "live_window_minutes": 60,
+                "trains": upcoming,
                 "next_trains": upcoming,
                 "train_count": len(deduped),
                 "source_urls": [result.get("source_url")] if result.get("source_url") else [],
