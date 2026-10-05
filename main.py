@@ -9,7 +9,7 @@ import uuid
 import base64
 import zipfile
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
@@ -3376,11 +3376,13 @@ async def delete_direct_conversation(request: Request):
 # -------------------------------------------------------------
 
 RAILWAY_REFERENCE_BASE = "https://www.mumbailifeline.com"
-RAILWAY_REFERENCE_LABEL = "Mumbai Lifeline public timetable reference"
+# Legacy constants retained because the older helper functions remain in this
+# file for compatibility, but Omni Rail now uses RailRadar for its live API.
+RAILWAY_REFERENCE_LABEL = "RailRadar API"
 RAILWAY_TIMETABLE_VERSIONS = {
-    "W": "May 2026",
-    "C": "2024",
-    "H": "May 2026",
+    "W": "RailRadar",
+    "C": "RailRadar",
+    "H": "RailRadar",
 }
 
 # Short, stable station master used by the app.  The timetable source uses
@@ -4204,131 +4206,8 @@ def _rail_parse_mobile_timetable_html(
     return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
 
 
-async def _rail_fetch_timetable(
-    line: str,
-    from_station: str,
-    to_station: str,
-    after_minutes: int,
-    before_minutes: int,
-) -> Dict[str, Any]:
-    """Fetch and normalize scheduled railway data without changing the API contract."""
-    line = str(line).upper()
-    from_name = _rail_station_display_name(from_station)
-    to_name = _rail_station_display_name(to_station)
-
-    source_urls = _rail_candidate_urls(
-        line=line,
-        from_station=from_station,
-        to_station=to_station,
-        after_minutes=after_minutes,
-        before_minutes=before_minutes,
-    )
-    primary_url = source_urls[0]
-
-    cache_key = f"{line}|{from_name}|{to_name}|{after_minutes}|{before_minutes}"
-    cached = _rail_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    result = {
-        "trains": [],
-        "source_url": primary_url,
-        "source_urls": source_urls,
-        "source_label": RAILWAY_REFERENCE_LABEL,
-        "line": line,
-        "line_name": _rail_line_name(line),
-        "from": from_name,
-        "to": to_name,
-        "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
-        "retrieved_at": datetime.now().astimezone().isoformat(),
-        "error": None,
-        "source_errors": [],
-    }
-
-    errors: List[str] = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36 OmniTouristOS/1.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-    }
-
-    def in_window(train: Dict[str, Any]) -> bool:
-        minute = train.get("timestamp_minutes")
-        if minute is None:
-            return False
-        minute = int(minute) % 1440
-        start = int(after_minutes) % 1440
-        end = int(before_minutes) % 1440
-        if start <= end:
-            return start <= minute <= end
-        return minute >= start or minute <= end
-
-    try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=RAILWAY_HTTP_TIMEOUT_SECONDS,
-            headers=headers,
-        ) as client:
-            for index, url in enumerate(source_urls):
-                try:
-                    response = await client.get(url)
-                    if response.status_code != 200:
-                        errors.append(f"HTTP {response.status_code} from timetable source")
-                        continue
-
-                    parsed = _rail_parse_timetable_html(
-                        html=response.text,
-                        line=line,
-                        from_station=from_station,
-                        to_station=to_station,
-                        source_url=str(response.url),
-                    )
-
-                    # The mobile page is deliberately a fallback for every
-                    # response, not only the final URL. This protects us if the
-                    # provider returns a 200 page with a changed HTML layout.
-                    if not parsed:
-                        parsed = _rail_parse_mobile_timetable_html(
-                            html=response.text,
-                            line=line,
-                            from_station=from_station,
-                            to_station=to_station,
-                            source_url=str(response.url),
-                        )
-
-                    parsed = [train for train in parsed if in_window(train)]
-                    if parsed:
-                        result["trains"] = parsed
-                        result["source_url"] = str(response.url)
-                        result["source_used"] = "mobile" if "/m/" in str(response.url) else "timetable"
-                        result["error"] = None
-                        result["source_errors"] = []
-                        _rail_cache_set(cache_key, result)
-                        return result
-
-                    errors.append("Timetable page reached but no matching scheduled rows were parsed")
-                except Exception as exc:
-                    errors.append(f"{type(exc).__name__} while reading timetable source")
-
-    except Exception as exc:
-        errors.append(f"{type(exc).__name__} while opening timetable source")
-
-    # Keep diagnostic details in server logs rather than leaking URLs/errors to
-    # the mobile UI. The API still exposes source_errors for backward compatibility.
-    result["error"] = "The timetable source is temporarily unavailable or its format changed."
-    result["source_errors"] = errors[-5:]
-    print(
-        "[Omni Rail] timetable parse failure",
-        {
-            "line": line,
-            "from": from_name,
-            "to": to_name,
-            "errors": errors[-5:],
-        },
-    )
-    _rail_cache_set(cache_key, result)
-    return result
+# RailRadar replaces the former HTML timetable fetcher. The compatibility
+# wrapper is defined later, after the RailRadar normalization helpers.
 
 
 def _rail_filter_trains(
@@ -4588,17 +4467,631 @@ async def _rail_cross_line_route(
 
 
 
+
+def _ist_now() -> datetime:
+    """Return current India Standard Time regardless of Render's host timezone."""
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+
+def _railradar_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {RAILRADAR_API_KEY}",
+        "Accept": "application/json",
+        "User-Agent": "OmniTouristOS/1.0",
+    }
+
+
+async def _railradar_get(
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout_seconds: float = 20.0,
+) -> Tuple[int, Dict[str, Any], Optional[str]]:
+    """
+    Server-side RailRadar GET wrapper.
+
+    The API key never leaves Render. The Flutter app only sees our normalized
+    /api/v1/railway-inquiry contract.
+    """
+    if not RAILRADAR_API_KEY:
+        return 0, {}, "RAILRADAR_API_KEY is not configured on the backend."
+
+    endpoint = f"{RAILRADAR_BASE_URL}/{str(path).lstrip('/')}"
+    try:
+        timeout = httpx.Timeout(timeout_seconds, connect=min(8.0, timeout_seconds))
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                endpoint,
+                params=params or {},
+                headers=_railradar_headers(),
+            )
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"raw_response": response.text[:5000]}
+
+        if not isinstance(payload, dict):
+            payload = {"raw_response": payload}
+
+        if not response.is_success:
+            error_obj = payload.get("error")
+            if isinstance(error_obj, dict):
+                message = str(error_obj.get("message") or error_obj.get("code") or "RailRadar request failed.")
+            else:
+                message = f"RailRadar returned HTTP {response.status_code}."
+            return response.status_code, payload, message
+
+        return response.status_code, payload, None
+
+    except Exception as exc:
+        return 0, {}, f"RailRadar request failed: {type(exc).__name__}: {exc}"
+
+
+def _rr_data(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _rr_time_minutes(value: Any) -> Optional[int]:
+    """Convert RailRadar HH:MM / ISO timestamps into minutes after midnight."""
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    # ISO timestamps such as 2026-10-05T06:30:00+05:30.
+    if "T" in raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone(timedelta(hours=5, minutes=30)))
+            return parsed.hour * 60 + parsed.minute
+        except Exception:
+            pass
+
+    match = re.search(r"\b(\d{1,2}):(\d{2})\b", raw)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _rr_time_display(value: Any) -> Optional[str]:
+    minutes = _rr_time_minutes(value)
+    if minutes is None:
+        return None
+    return _rail_minutes_to_12h(minutes)
+
+
+def _rr_service_type(train: Dict[str, Any]) -> Tuple[str, str]:
+    name = str(train.get("name") or "").strip()
+    train_type = str(train.get("type") or "").strip()
+    category = str(train.get("category") or "").strip()
+    text = f"{name} {train_type} {category}".upper()
+
+    if "LADIES" in text or "WOMEN" in text:
+        return "LADIES", "Ladies Local"
+    if re.search(r"\bAC\b", text) or "AC LOCAL" in text:
+        return "AC", "AC Local"
+    if "FAST" in text:
+        return "F", "Fast Local"
+    if "SLOW" in text:
+        return "S", "Slow Local"
+    if "LOCAL" in text or "SUBURBAN" in text or "MEMU" in text:
+        return "LOCAL", "Local"
+    return "LOCAL", train_type or "Local"
+
+
+def _rr_is_mumbai_local(train: Dict[str, Any]) -> bool:
+    """Identify suburban/local services without inventing a classification."""
+    name = str(train.get("name") or "").upper()
+    train_type = str(train.get("type") or "").upper()
+    category = str(train.get("category") or "").upper()
+    text = f"{name} {train_type} {category}"
+    return any(token in text for token in ("LOCAL", "SUBURBAN", "MEMU", "FAST", "SLOW", "LADIES"))
+
+
+def _rr_run_days(value: Any) -> str:
+    if isinstance(value, list):
+        days = [str(x).strip().title() for x in value if str(x).strip()]
+        return ", ".join(days) if days else "As published"
+    return str(value).strip() if value else "As published"
+
+
+def _rr_normalize_between_train(
+    item: Dict[str, Any],
+    from_station: str,
+    to_station: str,
+    source_url: str,
+) -> Optional[Dict[str, Any]]:
+    train = item.get("train")
+    from_stop = item.get("from")
+    to_stop = item.get("to")
+
+    if not isinstance(train, dict):
+        return None
+    if not isinstance(from_stop, dict):
+        from_stop = {}
+    if not isinstance(to_stop, dict):
+        to_stop = {}
+
+    dep_raw = from_stop.get("departure")
+    arr_raw = to_stop.get("arrival")
+    dep_min = _rr_time_minutes(dep_raw)
+    if dep_min is None:
+        return None
+
+    arr_min = _rr_time_minutes(arr_raw)
+    if arr_min is not None and arr_min < dep_min:
+        arr_min += 1440
+
+    service_type, service_label = _rr_service_type(train)
+    train_no = str(train.get("number") or "—")
+    train_name = str(train.get("name") or f"{_rail_station_display_name(from_station)} → {_rail_station_display_name(to_station)}")
+
+    live = item.get("live")
+    if not isinstance(live, dict):
+        live = {}
+
+    delay = live.get("delayMinutes")
+    platform = live.get("platform")
+    live_type = str(live.get("type") or "").strip()
+
+    status = "Scheduled"
+    status_msg = "Scheduled timetable entry"
+    is_live = bool(live)
+    if live_type:
+        status = live_type.replace("-", " ").title()
+        status_msg = f"RailRadar live status: {status}"
+    if delay is not None:
+        try:
+            delay_int = int(delay)
+            status_msg = f"{status} • {delay_int} min delay"
+        except Exception:
+            pass
+
+    return {
+        "time": _rr_time_display(dep_raw),
+        "departure_time": _rr_time_display(dep_raw),
+        "arrival_time": _rr_time_display(arr_raw),
+        "timestamp_minutes": dep_min,
+        "arrival_minutes": arr_min,
+        "train_no": train_no,
+        "number": train_no,
+        "name": train_name,
+        "train_name": train_name,
+        "service_type": service_type,
+        "service": service_label,
+        "category": str(train.get("category") or train.get("type") or service_label),
+        "platform": str(platform) if platform is not None else None,
+        "status": status,
+        "status_msg": status_msg,
+        "delay_minutes": delay,
+        "crowd": None,
+        "door_side": None,
+        "coaches": None,
+        "coach_count": None,
+        "composition": None,
+        "source": _rail_station_display_name(from_station),
+        "destination": _rail_station_display_name(to_station),
+        "origin": _rail_station_display_name(from_station),
+        "ending_at": _rail_station_display_name(to_station),
+        "duration": (
+            f"{int(item.get('duration')) // 60}h {int(item.get('duration')) % 60}m"
+            if isinstance(item.get("duration"), (int, float)) and int(item.get("duration")) >= 60
+            else (
+                f"{int(item.get('duration'))} min"
+                if isinstance(item.get("duration"), (int, float))
+                else None
+            )
+        ),
+        "days": _rr_run_days(train.get("runDays")),
+        "live": is_live,
+        "live_feed_available": is_live,
+        "data_source": source_url,
+        "data_source_type": "RailRadar API",
+    }
+
+
+def _rr_normalize_station_train(
+    item: Dict[str, Any],
+    station_code: str,
+    source_url: str,
+) -> Optional[Dict[str, Any]]:
+    train = item.get("train")
+    stop = item.get("stop")
+
+    if not isinstance(train, dict):
+        return None
+    if not isinstance(stop, dict):
+        stop = {}
+
+    dep_raw = stop.get("departure")
+    arr_raw = stop.get("arrival")
+    chosen_raw = dep_raw or arr_raw
+    minute = _rr_time_minutes(chosen_raw)
+    if minute is None:
+        return None
+
+    service_type, service_label = _rr_service_type(train)
+    train_no = str(train.get("number") or "—")
+    train_name = str(train.get("name") or "Mumbai Local")
+    destination = train.get("destination")
+    if isinstance(destination, dict):
+        destination = destination.get("name") or destination.get("code")
+    source = train.get("source")
+    if isinstance(source, dict):
+        source = source.get("name") or source.get("code")
+
+    return {
+        "time": _rr_time_display(chosen_raw),
+        "departure_time": _rr_time_display(dep_raw),
+        "arrival_time": _rr_time_display(arr_raw),
+        "timestamp_minutes": minute,
+        "arrival_minutes": _rr_time_minutes(arr_raw),
+        "train_no": train_no,
+        "number": train_no,
+        "name": train_name,
+        "train_name": train_name,
+        "service_type": service_type,
+        "service": service_label,
+        "category": str(train.get("category") or train.get("type") or service_label),
+        "platform": None,
+        "status": "Scheduled",
+        "status_msg": "Scheduled timetable entry",
+        "delay_minutes": None,
+        "crowd": None,
+        "door_side": None,
+        "coaches": None,
+        "coach_count": None,
+        "composition": None,
+        "source": str(source or _rail_station_display_name(station_code)),
+        "destination": str(destination or "—"),
+        "origin": str(source or _rail_station_display_name(station_code)),
+        "ending_at": str(destination or "—"),
+        "duration": None,
+        "days": _rr_run_days(train.get("runDays")),
+        "live": False,
+        "live_feed_available": False,
+        "stop_sequence": stop.get("sequence"),
+        "stop_type": stop.get("stopType"),
+        "data_source": source_url,
+        "data_source_type": "RailRadar API",
+    }
+
+
+def _rr_live_normalize(payload: Dict[str, Any], train_query: str) -> Dict[str, Any]:
+    data = _rr_data(payload)
+    train = data.get("train") if isinstance(data.get("train"), dict) else {}
+    current = data.get("currentLocation") if isinstance(data.get("currentLocation"), dict) else {}
+    previous = data.get("previousHalt") if isinstance(data.get("previousHalt"), dict) else {}
+    next_halt = data.get("nextHalt") if isinstance(data.get("nextHalt"), dict) else {}
+
+    def station_label(obj: Dict[str, Any]) -> Optional[str]:
+        return str(obj.get("stationName") or obj.get("stationCode") or "").strip() or None
+
+    delay = data.get("delayMinutes")
+    platform = current.get("platform") or next_halt.get("platform")
+
+    # Some responses expose platform only inside route entries.
+    if platform is None:
+        route = data.get("route")
+        if isinstance(route, list):
+            for stop in route:
+                if not isinstance(stop, dict):
+                    continue
+                if str(stop.get("stationCode") or "") == str(current.get("stationCode") or ""):
+                    platform = stop.get("platform")
+                    if platform is not None:
+                        break
+
+    current_label = station_label(current) or station_label(previous)
+    next_label = station_label(next_halt)
+
+    status = str(data.get("status") or current.get("status") or "unknown").replace("_", " ").title()
+    is_live = bool(data.get("isLive", True))
+
+    return {
+        "status": "success",
+        "type": "live_train",
+        "train_no": str(data.get("trainNumber") or train.get("number") or train_query),
+        "train_name": str(data.get("trainName") or train.get("name") or "Mumbai Local"),
+        "current_station": current_label,
+        "next_station": next_label,
+        "platform": str(platform) if platform is not None else None,
+        "door_side": None,
+        "delay_minutes": delay,
+        "crowd": None,
+        "status_msg": f"RailRadar: {status}" if is_live else "RailRadar has no live movement fix for this run.",
+        "status": status,
+        "live": is_live,
+        "live_feed_available": is_live,
+        "current_location": current_label,
+        "next_stop": next_label,
+        "data_source_label": "RailRadar API",
+        "last_updated_at": data.get("lastUpdatedAt"),
+        "speed_kmh": current.get("speedKmh"),
+        "bearing_degrees": current.get("bearingDegrees"),
+    }
+
+
+def _rr_pnr_normalize(payload: Dict[str, Any], pnr: str) -> Dict[str, Any]:
+    data = _rr_data(payload)
+
+    def first(*keys: str) -> Any:
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    train = data.get("train")
+    if not isinstance(train, dict):
+        train = {}
+
+    from_station = first("fromStation", "from", "source")
+    to_station = first("toStation", "to", "destination")
+
+    def station_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return value.get("name") or value.get("code")
+        return value
+
+    passengers = data.get("passengers")
+    if not isinstance(passengers, list):
+        passengers = data.get("passengerDetails")
+    if not isinstance(passengers, list):
+        passengers = []
+
+    return {
+        "status": "success",
+        "type": "pnr",
+        "pnr": str(first("pnrNumber", "pnr") or pnr),
+        "train_no": str(first("trainNumber", "trainNo") or train.get("number") or "—"),
+        "train_name": str(first("trainName") or train.get("name") or "—"),
+        "from_station": station_value(from_station) or "—",
+        "to_station": station_value(to_station) or "—",
+        "journey_date": str(first("journeyDate", "date") or "—"),
+        "booking_status": str(first("bookingStatus", "status", "chartStatus") or "Status unavailable"),
+        "status": str(first("bookingStatus", "status", "chartStatus") or "Status unavailable"),
+        "status_msg": str(first("statusMessage", "message") or "PNR status returned by RailRadar."),
+        "passengers": passengers,
+        "live": True,
+        "data_source_label": "RailRadar API",
+    }
+
+
+def _rr_route_matches_service(train: Dict[str, Any], wanted: str) -> bool:
+    wanted = str(wanted or "ALL").upper()
+    if wanted in {"", "ALL"}:
+        return True
+    service_type = str(train.get("service_type") or "").upper()
+    service = str(train.get("service") or "").upper()
+    category = str(train.get("category") or "").upper()
+    text = f"{service_type} {service} {category}"
+    if wanted == "FAST":
+        return "FAST" in text or service_type == "F"
+    if wanted == "SLOW":
+        return "SLOW" in text or service_type == "S"
+    if wanted == "AC":
+        return "AC" in text or service_type == "AC"
+    if wanted == "LADIES":
+        return "LADIES" in text or "WOMEN" in text or service_type == "LADIES"
+    return True
+
+
+async def _railradar_fetch_between(
+    from_station: str,
+    to_station: str,
+    *,
+    date_value: Optional[str] = None,
+    live: bool = False,
+) -> Dict[str, Any]:
+    from_code = str(from_station).strip().upper()
+    to_code = str(to_station).strip().upper()
+    date_value = date_value or _ist_now().strftime("%Y-%m-%d")
+
+    source_url = f"{RAILRADAR_BASE_URL}/trains/between/{urllib.parse.quote(from_code)}/{urllib.parse.quote(to_code)}"
+    cache_key = f"railradar-between|{from_code}|{to_code}|{date_value}|{live}"
+
+    if not live:
+        cached = _rail_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    params: Dict[str, Any] = {
+        "type": "local",
+        "category": "Suburban",
+        "date": date_value,
+        "live": str(bool(live)).lower(),
+    }
+
+    status_code, payload, error = await _railradar_get(
+        f"trains/between/{urllib.parse.quote(from_code)}/{urllib.parse.quote(to_code)}",
+        params=params,
+    )
+
+    # If a provider build rejects the optional category filter, retry with the
+    # documented type=local filter alone.
+    if error and status_code == 400:
+        params.pop("category", None)
+        status_code, payload, error = await _railradar_get(
+            f"trains/between/{urllib.parse.quote(from_code)}/{urllib.parse.quote(to_code)}",
+            params=params,
+        )
+
+    data = _rr_data(payload)
+    provider_trains = data.get("trains") if isinstance(data.get("trains"), list) else []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in provider_trains:
+        if not isinstance(item, dict):
+            continue
+        train = _rr_normalize_between_train(
+            item,
+            from_station=from_code,
+            to_station=to_code,
+            source_url=source_url,
+        )
+        if train:
+            normalized.append(train)
+
+    normalized.sort(key=lambda item: int(item.get("timestamp_minutes", 0)))
+
+    result = {
+        "trains": normalized,
+        "source_url": source_url,
+        "source_label": "RailRadar API",
+        "line": _rail_lines_for_station(from_code)[0] if _rail_lines_for_station(from_code) else "ALL",
+        "line_name": _rail_line_name(_rail_lines_for_station(from_code)[0]) if _rail_lines_for_station(from_code) else "Mumbai Suburban Network",
+        "from": _rail_station_display_name(from_code),
+        "to": _rail_station_display_name(to_code),
+        "date": date_value,
+        "live": live,
+        "error": error,
+        "http_status": status_code or None,
+        "provider_count": len(provider_trains),
+    }
+
+    if not live:
+        _rail_cache_set(cache_key, result)
+
+    return result
+
+
+async def _railradar_fetch_station_board(
+    station_code: str,
+    *,
+    include_intermediate: bool = False,
+) -> Dict[str, Any]:
+    station = str(station_code).strip().upper()
+    source_url = f"{RAILRADAR_BASE_URL}/stations/{urllib.parse.quote(station)}/trains"
+    cache_key = f"railradar-station|{station}|{include_intermediate}"
+
+    cached = _rail_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    status_code, payload, error = await _railradar_get(
+        f"stations/{urllib.parse.quote(station)}/trains",
+        params={"includeIntermediate": str(bool(include_intermediate)).lower()},
+    )
+
+    data = _rr_data(payload)
+    provider_trains = data.get("trains") if isinstance(data.get("trains"), list) else []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in provider_trains:
+        if not isinstance(item, dict):
+            continue
+        train_obj = item.get("train")
+        if not isinstance(train_obj, dict):
+            continue
+
+        # This screen is specifically Mumbai suburban. RailRadar's station
+        # board can also contain non-suburban trains at interchange stations.
+        if not _rr_is_mumbai_local(train_obj):
+            continue
+
+        train = _rr_normalize_station_train(item, station, source_url)
+        if train:
+            normalized.append(train)
+
+    # Some provider responses may not expose an explicit "Local" type even for
+    # suburban records. Only then fall back to the returned rows rather than
+    # fabricating a classification.
+    if not normalized and provider_trains:
+        for item in provider_trains:
+            if not isinstance(item, dict):
+                continue
+            train = _rr_normalize_station_train(item, station, source_url)
+            if train:
+                normalized.append(train)
+
+    normalized.sort(
+        key=lambda item: (
+            int(item.get("timestamp_minutes", 0)),
+            str(item.get("train_no", "")),
+        )
+    )
+
+    result = {
+        "trains": normalized,
+        "source_url": source_url,
+        "source_label": "RailRadar API",
+        "station_code": station,
+        "station_name": (
+            str(data.get("station", {}).get("name"))
+            if isinstance(data.get("station"), dict) and data.get("station", {}).get("name")
+            else _rail_station_display_name(station)
+        ),
+        "error": error,
+        "http_status": status_code or None,
+        "provider_count": len(provider_trains),
+    }
+    _rail_cache_set(cache_key, result)
+    return result
+
+
+
+async def _rail_fetch_timetable(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> Dict[str, Any]:
+    """
+    Compatibility wrapper for the existing interchange engine.
+
+    The old implementation scraped a public timetable website. It is now
+    backed by RailRadar while preserving the same normalized return shape.
+    """
+    result = await _railradar_fetch_between(
+        from_station=from_station,
+        to_station=to_station,
+        date_value=_ist_now().strftime("%Y-%m-%d"),
+        live=False,
+    )
+
+    trains = []
+    for train in result.get("trains", []):
+        minute = train.get("timestamp_minutes")
+        if minute is None:
+            continue
+        minute = int(minute) % 1440
+        start = int(after_minutes) % 1440
+        end = int(before_minutes) % 1440
+        if start <= end:
+            in_window = start <= minute <= end
+        else:
+            in_window = minute >= start or minute <= end
+        if in_window:
+            item = dict(train)
+            item["line"] = line
+            item["line_name"] = _rail_line_name(line)
+            trains.append(item)
+
+    return {
+        **result,
+        "trains": trains,
+        "line": line,
+        "line_name": _rail_line_name(line),
+    }
+
+
 @app.get("/api/v1/railradar-test")
 async def railradar_test(
     date: Optional[str] = Query(None),
     live: bool = Query(False),
 ):
-    """
-    Temporary RailRadar connectivity diagnostic.
-
-    The API key remains server-side and is never returned to the client.
-    Remove this endpoint after RailRadar integration has been verified.
-    """
+    """Server-side RailRadar connectivity diagnostic for NIG -> CCG."""
     if not RAILRADAR_API_KEY:
         return {
             "status": "error",
@@ -4606,68 +5099,38 @@ async def railradar_test(
             "message": "RAILRADAR_API_KEY is not configured on the backend.",
         }
 
-    test_date = (date or datetime.now().strftime("%Y-%m-%d")).strip()
-    endpoint = f"{RAILRADAR_BASE_URL}/trains/between/NIG/CCG"
+    test_date = (date or _ist_now().strftime("%Y-%m-%d")).strip()
+    result = await _railradar_fetch_between(
+        "NIG",
+        "CCG",
+        date_value=test_date,
+        live=live,
+    )
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(20.0, connect=8.0)
-        ) as client:
-            response = await client.get(
-                endpoint,
-                params={
-                    "type": "local",
-                    "date": test_date,
-                    "live": str(live).lower(),
-                },
-                headers={
-                    "Authorization": f"Bearer {RAILRADAR_API_KEY}",
-                    "Accept": "application/json",
-                },
-            )
+    return {
+        "status": "success" if not result.get("error") else "error",
+        "railradar_configured": True,
+        "railradar_reachable": result.get("http_status") is not None,
+        "http_status": result.get("http_status"),
+        "endpoint_tested": result.get("source_url"),
+        "route": "NIG -> CCG",
+        "date": test_date,
+        "live": live,
+        "train_count": len(result.get("trains", [])),
+        "provider_count": result.get("provider_count", 0),
+        "error": result.get("error"),
+        "provider_normalized_trains": result.get("trains", [])[:20],
+    }
 
-        try:
-            provider_data = response.json()
-        except Exception:
-            provider_data = {"raw_response": response.text[:5000]}
-
-        return {
-            "status": "success" if response.is_success else "error",
-            "railradar_configured": True,
-            "railradar_reachable": True,
-            "http_status": response.status_code,
-            "endpoint_tested": endpoint,
-            "route": "NIG -> CCG",
-            "date": test_date,
-            "live": live,
-            "provider_response": provider_data,
-        }
-
-    except Exception as exc:
-        return {
-            "status": "error",
-            "railradar_configured": True,
-            "railradar_reachable": False,
-            "route": "NIG -> CCG",
-            "date": test_date,
-            "live": live,
-            "message": f"RailRadar request failed: {type(exc).__name__}: {exc}",
-        }
 
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
     """
-    Backward-compatible railway gateway.
+    Backward-compatible Omni Rail gateway.
 
-    Supported query_type values:
-      - station_board
-      - route_search
-      - live_train
-      - pnr
-
-    The Flutter client can continue using the same endpoint and payload shape.
+    Flutter continues to call /api/v1/railway-inquiry. RailRadar stays behind
+    this server endpoint; the API key is never embedded in the app.
     """
-
     try:
         content_type = request.headers.get("content-type", "").lower()
 
@@ -4688,10 +5151,22 @@ async def railway_inquiry(request: Request):
 
         normalized_type = query_type.strip().lower()
 
+        if not RAILRADAR_API_KEY:
+            return {
+                "status": "error",
+                "type": normalized_type,
+                "message": "Railway service is not configured on the backend. Add RAILRADAR_API_KEY in Render.",
+                "trains": [],
+            }
+
         # ----------------------------- ROUTE SEARCH -----------------------------
         if normalized_type == "route_search":
             try:
-                route_payload = json.loads(str(query_value)) if query_value else {}
+                route_payload = (
+                    query_value
+                    if isinstance(query_value, dict)
+                    else json.loads(str(query_value)) if query_value else {}
+                )
             except Exception:
                 route_payload = {}
 
@@ -4699,15 +5174,15 @@ async def railway_inquiry(request: Request):
                 route_payload.get("from")
                 or route_payload.get("source")
                 or route_payload.get("from_station")
-                or "BSR"
-            ).strip()
+                or "NIG"
+            ).strip().upper()
 
             to_station = str(
                 route_payload.get("to")
                 or route_payload.get("destination")
                 or route_payload.get("to_station")
-                or "DDR"
-            ).strip()
+                or "CCG"
+            ).strip().upper()
 
             requested_line = str(route_payload.get("line") or "ALL").upper()
             requested_service = str(route_payload.get("service") or "ALL").upper()
@@ -4726,52 +5201,96 @@ async def railway_inquiry(request: Request):
                 requested_line,
             )
 
+            # Direct RailRadar route search. For Mumbai suburban pairs this is
+            # the authoritative provider response and avoids the old HTML source.
             if direct_line and not line_error:
-                now = datetime.now()
-                start_min = now.hour * 60 + now.minute
-                window_end = min(start_min + 180, 1439)
-
-                result = await _rail_fetch_timetable(
-                    direct_line,
+                result = await _railradar_fetch_between(
                     from_station,
                     to_station,
-                    start_min,
-                    window_end,
+                    date_value=_ist_now().strftime("%Y-%m-%d"),
+                    live=False,
                 )
 
-                trains = _rail_filter_trains(
-                    list(result.get("trains", [])),
-                    requested_service,
-                )
+                if result.get("error") and not result.get("trains"):
+                    return {
+                        "status": "error",
+                        "type": "route_search",
+                        "station_code": from_station,
+                        "station_name": _rail_station_display_name(from_station),
+                        "from": _rail_station_display_name(from_station),
+                        "to": _rail_station_display_name(to_station),
+                        "line": direct_line,
+                        "line_name": _rail_line_name(direct_line),
+                        "trains": [],
+                        "route_search": True,
+                        "requires_interchange": False,
+                        "service_filter": requested_service,
+                        "message": str(result.get("error")),
+                        "source_error": str(result.get("error")),
+                        "data_source_label": "RailRadar API",
+                    }
+
+                trains = [
+                    train
+                    for train in result.get("trains", [])
+                    if _rr_route_matches_service(train, requested_service)
+                ]
+
+                # The Flutter planner sends the requested clock time. Respect it
+                # instead of silently replacing it with the server's current time.
+                requested_minutes = route_payload.get("time_minutes")
+                try:
+                    requested_minutes = int(requested_minutes) if requested_minutes is not None else None
+                except Exception:
+                    requested_minutes = None
+
+                if requested_minutes is None:
+                    requested_minutes = _ist_now().hour * 60 + _ist_now().minute
+
+                window_start = max(0, requested_minutes - 60)
+                window_end = min(1439, requested_minutes + 120)
+
+                around_time = [
+                    train
+                    for train in trains
+                    if window_start <= int(train.get("timestamp_minutes", 0)) <= window_end
+                ]
+
+                # If the requested time is near a boundary or provider has only
+                # a sparse result set, retain the full provider result rather than
+                # displaying an empty board.
+                display_trains = around_time or trains
 
                 return {
                     "status": "success",
                     "type": "route_search",
-                    "station_code": str(from_station).upper(),
+                    "station_code": from_station,
                     "station_name": _rail_station_display_name(from_station),
                     "from": _rail_station_display_name(from_station),
                     "to": _rail_station_display_name(to_station),
                     "line": direct_line,
                     "line_name": _rail_line_name(direct_line),
-                    "trains": trains,
+                    "trains": display_trains[:100],
                     "route_search": True,
                     "requires_interchange": False,
                     "service_filter": requested_service,
-                    "current_time": _rail_minutes_to_12h(start_min),
-                    "timetable_version": result.get(
-                        "timetable_version",
-                        RAILWAY_TIMETABLE_VERSIONS.get(direct_line, "Unknown"),
+                    "requested_time": _rail_minutes_to_12h(requested_minutes),
+                    "window_start": _rail_minutes_to_12h(window_start),
+                    "window_end": _rail_minutes_to_12h(window_end),
+                    "current_time": _rail_minutes_to_12h(
+                        _ist_now().hour * 60 + _ist_now().minute
                     ),
                     "data_source": result.get("source_url"),
-                    "data_source_label": RAILWAY_REFERENCE_LABEL,
+                    "data_source_label": "RailRadar API",
                     "source_notice": (
-                        "Timetable values are from a public timetable reference; "
-                        "they are scheduled values, not a live delay feed."
+                        "Scheduled Mumbai suburban timetable data is supplied by RailRadar. "
+                        "Live delay/platform values are shown only when a live RailRadar field is present."
                     ),
                     "source_error": result.get("error"),
                 }
 
-            # Try an interchange journey when the selected stations span lines.
+            # Cross-line journeys retain the existing Omni Rail interchange
+            # algorithm, but its underlying timetable fetch now uses RailRadar.
             from_lines = _rail_lines_for_station(from_station)
             to_lines = _rail_lines_for_station(to_station)
 
@@ -4790,12 +5309,11 @@ async def railway_inquiry(request: Request):
                 cross_line["type"] = "route_search"
                 cross_line["route_search"] = True
                 cross_line["current_time"] = _rail_minutes_to_12h(
-                    datetime.now().hour * 60 + datetime.now().minute
+                    _ist_now().hour * 60 + _ist_now().minute
                 )
-                cross_line["data_source_label"] = RAILWAY_REFERENCE_LABEL
+                cross_line["data_source_label"] = "RailRadar API"
                 cross_line["source_notice"] = (
-                    "Connected journeys are assembled from scheduled public timetable "
-                    "entries; connection times are timetable-based, not live platform data."
+                    "Connected journeys are assembled from RailRadar scheduled timetable entries."
                 )
                 return cross_line
 
@@ -4808,8 +5326,7 @@ async def railway_inquiry(request: Request):
 
         # ----------------------------- STATION BOARD -----------------------------
         if normalized_type == "station_board":
-            station = str(query_value or "BSR").strip().upper()
-            station_name = _rail_station_display_name(station)
+            station = str(query_value or "NIG").strip().upper()
             station_lines = _rail_lines_for_station(station)
 
             if not station_lines:
@@ -4817,94 +5334,54 @@ async def railway_inquiry(request: Request):
                     "status": "error",
                     "type": "station_board",
                     "station_code": station,
-                    "station_name": station_name,
+                    "station_name": _rail_station_display_name(station),
                     "message": "Station not found in the Omni Rail station directory.",
                     "trains": [],
                 }
 
-            now = datetime.now()
-            current_min = now.hour * 60 + now.minute
-            board_start = 3 * 60 + 30
-            board_end = 23 * 60 + 59
+            result = await _railradar_fetch_station_board(station)
+            trains = list(result.get("trains", []))
 
-            all_trains: List[Dict[str, Any]] = []
-            source_urls: List[str] = []
-            source_errors: List[str] = []
+            current = _ist_now()
+            current_min = current.hour * 60 + current.minute
 
-            # A station can be an interchange (e.g. Dadar / Kurla / CSMT).
-            # Return both line boards rather than silently selecting one.
-            unique_line_set: List[str] = []
-            for line in station_lines:
-                if line not in unique_line_set:
-                    unique_line_set.append(line)
-
-            for line in unique_line_set:
-                targets = _rail_default_board_targets(station, line)
-
-                for target in targets:
-                    target_name = _rail_station_name_from_slug(target)
-                    if _rail_normalize(target_name) == _rail_normalize(station_name):
-                        continue
-
-                    result = await _rail_fetch_timetable(
-                        line=line,
-                        from_station=station,
-                        to_station=target_name,
-                        after_minutes=board_start,
-                        before_minutes=board_end,
-                    )
-
-                    source_url = result.get("source_url")
-                    if source_url:
-                        source_urls.append(source_url)
-
-                    if result.get("error"):
-                        source_errors.append(str(result["error"]))
-
-                    for train in result.get("trains", []):
-                        item = dict(train)
-                        item["line"] = line
-                        item["line_name"] = _rail_line_name(line)
-                        item["direction"] = target_name
-                        all_trains.append(item)
-
-            # Apply service-independent chronological ordering.
-            all_trains.sort(
-                key=lambda item: (
-                    int(item.get("timestamp_minutes", 0)),
-                    str(item.get("train_no", "")),
-                )
-            )
-
-            # De-duplicate identical rows coming from overlapping direction searches.
+            # De-duplicate provider rows.
             seen = set()
-            deduped = []
-            for train in all_trains:
+            deduped: List[Dict[str, Any]] = []
+            for train in trains:
                 key = (
                     str(train.get("train_no")),
                     int(train.get("timestamp_minutes", -1)),
                     str(train.get("destination")),
-                    str(train.get("line")),
                 )
                 if key in seen:
                     continue
                 seen.add(key)
                 deduped.append(train)
 
-            # Keep the complete day schedule practical for mobile JSON responses,
-            # while preserving enough rows for the "next trains" experience.
-            deduped = deduped[:450]
+            deduped.sort(
+                key=lambda item: (
+                    int(item.get("timestamp_minutes", 0)),
+                    str(item.get("train_no", "")),
+                )
+            )
 
             upcoming = [
-                t for t in deduped
-                if int(t.get("timestamp_minutes", 0)) >= current_min
+                train
+                for train in deduped
+                if int(train.get("timestamp_minutes", 0)) >= current_min
             ][:12]
+
+            unique_line_set: List[str] = []
+            for line in station_lines:
+                if line not in unique_line_set:
+                    unique_line_set.append(line)
 
             return {
                 "status": "success",
                 "type": "station_board",
                 "station_code": station,
-                "station_name": station_name,
+                "station_name": result.get("station_name") or _rail_station_display_name(station),
                 "line": unique_line_set[0] if len(unique_line_set) == 1 else "ALL",
                 "line_name": (
                     _rail_line_name(unique_line_set[0])
@@ -4914,21 +5391,16 @@ async def railway_inquiry(request: Request):
                 "lines": unique_line_set,
                 "line_names": [_rail_line_name(line) for line in unique_line_set],
                 "current_time": _rail_minutes_to_12h(current_min),
-                "board_window": "03:30 AM – 11:59 PM",
-                "trains": deduped,
+                "board_window": "Full scheduled day",
+                "trains": deduped[:450],
                 "next_trains": upcoming,
                 "train_count": len(deduped),
-                "source_urls": sorted(set(source_urls)),
-                "source_errors": sorted(set(source_errors))[:5],
-                "source_label": RAILWAY_REFERENCE_LABEL,
-                "timetable_versions": {
-                    line: RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown")
-                    for line in unique_line_set
-                },
+                "source_urls": [result.get("source_url")] if result.get("source_url") else [],
+                "source_errors": [str(result.get("error"))] if result.get("error") else [],
+                "source_label": "RailRadar API",
                 "source_notice": (
-                    "Scheduled timetable data is shown from a public Mumbai suburban "
-                    "timetable reference. Platform, delay, door-side and crowd values "
-                    "are not invented when no live feed exists."
+                    "Mumbai suburban scheduled timetable data is supplied by RailRadar. "
+                    "Platform and delay values are left empty unless a live provider field supplies them."
                 ),
                 "station_directory": [
                     {
@@ -4937,51 +5409,47 @@ async def railway_inquiry(request: Request):
                         "line": data["line"],
                     }
                     for code, data in RAILWAY_STATIONS.items()
-                    if _rail_normalize(data["name"]) == _rail_normalize(station_name)
+                    if _rail_normalize(data["name"])
+                    == _rail_normalize(result.get("station_name") or _rail_station_display_name(station))
                 ],
             }
 
         # ----------------------------- LIVE TRAIN -----------------------------
         if normalized_type == "live_train":
-            train_query = str(query_value or "").strip()
-
-            if not train_query:
+            train_query = re.sub(r"\D", "", str(query_value or ""))
+            if len(train_query) < 4 or len(train_query) > 6:
                 return {
                     "status": "error",
                     "type": "live_train",
-                    "message": "Enter a train number or timetable train code.",
+                    "message": "Enter the train number shown in the Omni Rail timetable.",
                 }
 
-            # We deliberately return a truthful response here.  The timetable
-            # source does not provide real-time movement/delay data.
-            return {
-                "status": "success",
-                "type": "live_train",
-                "train_no": train_query,
-                "train_name": "Mumbai Suburban Local",
-                "current_station": None,
-                "next_station": None,
-                "platform": None,
-                "door_side": None,
-                "delay_minutes": None,
-                "crowd": None,
-                "status_msg": (
-                    "Live movement data is not available from the current no-key "
-                    "railway source. Use the Mumbai Local timetable for scheduled stops."
-                ),
-                "live": False,
-                "live_feed_available": False,
-                "message": (
-                    "Omni Rail will display live location/delay/platform information "
-                    "only when an authorized or genuinely live feed is connected."
-                ),
-                "data_source_label": RAILWAY_REFERENCE_LABEL,
-            }
+            status_code, payload, error = await _railradar_get(
+                f"trains/{urllib.parse.quote(train_query)}/live",
+                params={
+                    "authoritative": "true",
+                    "haltsOnly": "true",
+                },
+            )
+
+            if error:
+                return {
+                    "status": "error",
+                    "type": "live_train",
+                    "train_no": train_query,
+                    "message": str(error),
+                    "status_msg": str(error),
+                    "live": False,
+                    "live_feed_available": False,
+                    "data_source_label": "RailRadar API",
+                    "http_status": status_code or None,
+                }
+
+            return _rr_live_normalize(payload, train_query)
 
         # ----------------------------- PNR -----------------------------
         if normalized_type == "pnr":
             pnr = re.sub(r"\D", "", str(query_value or ""))
-
             if len(pnr) != 10:
                 return {
                     "status": "error",
@@ -4989,23 +5457,23 @@ async def railway_inquiry(request: Request):
                     "message": "PNR must contain exactly 10 digits.",
                 }
 
-            return {
-                "status": "success",
-                "type": "pnr",
-                "pnr": pnr,
-                "train_no": None,
-                "train_name": None,
-                "from_station": None,
-                "to_station": None,
-                "journey_date": None,
-                "booking_status": "Live PNR lookup unavailable",
-                "status_msg": (
-                    "This backend does not have an authorized live PNR feed. "
-                    "Please verify the PNR through an official railway service."
-                ),
-                "live": False,
-                "data_source_label": "Official railway PNR service required",
-            }
+            status_code, payload, error = await _railradar_get(
+                f"pnr/{urllib.parse.quote(pnr)}"
+            )
+
+            if error:
+                return {
+                    "status": "error",
+                    "type": "pnr",
+                    "pnr": pnr,
+                    "message": str(error),
+                    "status_msg": str(error),
+                    "live": False,
+                    "data_source_label": "RailRadar API",
+                    "http_status": status_code or None,
+                }
+
+            return _rr_pnr_normalize(payload, pnr)
 
         return {
             "status": "error",
@@ -5015,11 +5483,14 @@ async def railway_inquiry(request: Request):
         }
 
     except Exception as exc:
+        print(f"[Omni Rail] railway_inquiry error: {type(exc).__name__}: {exc}")
         return {
             "status": "error",
             "message": f"Railway inquiry error: {exc}",
             "trains": [],
         }
+
+# -------------------------------------------------------------
 
 # -------------------------------------------------------------
 
