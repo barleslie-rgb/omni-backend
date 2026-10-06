@@ -203,27 +203,51 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
     raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
 
 async def ask_fast_vision(image_bytes: bytes, filename: str, target_language: str) -> str:
+    """High-quality multimodal document extraction for images.
+
+    Llama 4 Scout was deprecated by Groq in July 2026, so Paper Pilot now
+    uses the current Qwen 3.8 multimodal model. The vision pass is deliberately
+    extraction-heavy: the following text auditor receives the visible evidence
+    instead of a vague image caption.
+    """
     client = get_groq_client()
     if not client:
         return ""
     try:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         prompt = (
-            f"Analyze this image as Paper Pilot. Read all visible text, tables, names, dates, amounts, addresses and clauses. "
-            f"Identify important risks or inconsistencies. Do not invent anything. Respond in {target_language}."
+            "You are Paper Pilot's visual document intelligence engine. "
+            "Analyze the uploaded image as if a user handed the document to an expert human analyst.\n\n"
+            "FIRST, inspect the entire image carefully. Do not say that OCR failed if the image is readable. "
+            "Read visible text in every language/script you can identify, including headings, names, dates, "
+            "phone numbers, addresses, prices, amounts, times, contact details, labels, tables and small print. "
+            "Also describe important visual facts such as logos, photographs, seals, signatures, stamps, "
+            "checkboxes, highlighted items, layout, document type, and obvious inconsistencies.\n\n"
+            "RETURN A FACTUAL EVIDENCE REPORT with these headings:\n"
+            "DOCUMENT TYPE / PURPOSE\n"
+            "VISIBLE TEXT (transcribe faithfully; preserve important original wording)\n"
+            "PEOPLE / ORGANIZATIONS / PLACES\n"
+            "DATES / TIMES / NUMBERS\n"
+            "FINANCIAL OR OTHER NUMERICAL DETAILS\n"
+            "IMPORTANT VISUAL ELEMENTS\n"
+            "POTENTIAL ISSUES OR ITEMS TO VERIFY\n"
+            "CONFIDENCE / UNREADABLE AREAS\n\n"
+            "Rules: Never invent missing text. If something is uncertain, mark it as uncertain. "
+            "Do not replace readable content with a generic failure message. "
+            f"Write the evidence report in {target_language}."
         )
         completion = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model="qwen/qwen3.8-27b",
             messages=[
-                {"role":"system","content":"You are Paper Pilot's visual document intelligence engine."},
+                {"role":"system","content":"You are an expert multimodal document/OCR analyst. Accuracy is more important than brevity."},
                 {"role":"user","content":[
                     {"type":"text","text":prompt},
                     {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{encoded}"}}
                 ]}
             ],
             temperature=0.1,
-            max_tokens=3000,
-            timeout=60,
+            max_completion_tokens=5000,
+            timeout=90,
         )
         return sanitize_ai_output(completion.choices[0].message.content or "")
     except Exception as exc:
@@ -3011,10 +3035,10 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 1600:
-            pil_img.thumbnail((1600, 1600), Image.Resampling.BILINEAR)
+        if max(pil_img.size) > 2200:
+            pil_img.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
         out_buf = io.BytesIO()
-        pil_img.save(out_buf, format="JPEG", quality=92)
+        pil_img.save(out_buf, format="JPEG", quality=95, optimize=True)
         return out_buf.getvalue()
     except Exception:
         return None
@@ -3270,18 +3294,29 @@ async def analyze_document(
         }.get(kind, "Treat this as a general uploaded file and explain what can be reliably inferred.")
 
         audit_prompt = (
-            f"You are Paper Pilot, an elite Universal Document Analyst and Intelligence Auditor.\n"
+            f"You are Paper Pilot, an expert document analyst and intelligent auditor.\n"
             f"{lang_instruction}\n{type_guidance}\n\n"
+            "The goal is to make the user understand exactly what this file is about, in simple language, "
+            "while still being precise enough for serious document review.\n\n"
             "GUIDELINES:\n"
-            "1. Provide a comprehensive, rigorous audit of the supplied content.\n"
-            "2. Structure into Executive Summary, Key Information, Financial/Numerical Data, Risks/Observations, and Actionable Recommendations.\n"
-            "3. Never invent names, numbers, clauses, dates or facts absent from the supplied content.\n"
-            "4. If extraction is incomplete, explicitly say what could not be verified.\n"
-            "5. At the very end, output: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
+            "1. Start with a plain-English 'What this file is about' explanation in 2-4 sentences.\n"
+            "2. Then provide: Executive Summary; Key Information; Important Details / Clauses; "
+            "People, Organizations & Places; Dates & Deadlines; Financial / Numerical Data; "
+            "Risks / Things to Verify; What the User Should Do Next.\n"
+            "3. For images, treat the visual evidence report as primary source material and synthesize it carefully.\n"
+            "4. Preserve exact names, numbers, dates, phone numbers, addresses and wording when they are readable.\n"
+            "5. Explain technical/legal/financial terms in simple words immediately after using them.\n"
+            "6. Never invent facts. If a value is unreadable or uncertain, explicitly say so.\n"
+            "7. Distinguish clearly between facts visible in the file and reasonable observations/inferences.\n"
+            "8. Do not say 'OCR failed', 'content unavailable', or similar when usable evidence is present.\n"
+            "9. For posters, notices, invitations, receipts, IDs, forms and photographs, explain the purpose and "
+            "the practical meaning rather than forcing them into a financial/legal template.\n"
+            "10. End with 3-4 useful follow-up questions under EXPLORE_SUGGESTIONS.\n"
+            "At the very end, output exactly: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
         )
 
         analysis_raw = await ask_fast_text(
-            f"DOCUMENT FILE: {filename}\nTYPE: {kind}\nMIME: {mime}\nPAGES/SLIDES/CHAPTERS: {total_pages_detected}\n\nCONTENT:\n{extracted_text[:95000]}",
+            f"DOCUMENT FILE: {filename}\nTYPE: {kind}\nMIME: {mime}\nPAGES/SLIDES/CHAPTERS: {total_pages_detected}\n\nSOURCE EVIDENCE / EXTRACTED CONTENT:\n{extracted_text[:120000]}",
             audit_prompt
         )
 
