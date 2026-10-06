@@ -8,6 +8,9 @@ import time
 import uuid
 import base64
 import zipfile
+import mimetypes
+import subprocess
+import tempfile
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -36,6 +39,16 @@ try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
+
+try:
+    import fitz
+except ImportError:
+    fitz = None
+
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
 
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
@@ -188,6 +201,34 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             continue
 
     raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
+
+async def ask_fast_vision(image_bytes: bytes, filename: str, target_language: str) -> str:
+    client = get_groq_client()
+    if not client:
+        return ""
+    try:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        prompt = (
+            f"Analyze this image as Paper Pilot. Read all visible text, tables, names, dates, amounts, addresses and clauses. "
+            f"Identify important risks or inconsistencies. Do not invent anything. Respond in {target_language}."
+        )
+        completion = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {"role":"system","content":"You are Paper Pilot's visual document intelligence engine."},
+                {"role":"user","content":[
+                    {"type":"text","text":prompt},
+                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{encoded}"}}
+                ]}
+            ],
+            temperature=0.1,
+            max_tokens=3000,
+            timeout=60,
+        )
+        return sanitize_ai_output(completion.choices[0].message.content or "")
+    except Exception as exc:
+        print(f"[PaperPilot vision notice]: {exc}")
+        return ""
 
 # -------------------------------------------------------------
 # 4. FAST JSON ENGINE VIA GROQ
@@ -2981,34 +3022,229 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
 # -------------------------------------------------------------
 # 15. PAPER PILOT UNIVERSAL DOCUMENT AUDITOR
 # -------------------------------------------------------------
+
+async def _extract_scanned_pdf_with_vision(file_bytes: bytes, target_language: str, max_pages: int = 10) -> str:
+    if fitz is None:
+        return ""
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        chunks = []
+        count = min(len(doc), max_pages)
+        for idx in range(count):
+            page = doc.load_page(idx)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+            jpg = pix.tobytes("jpeg", jpg_quality=82)
+            text = await ask_fast_vision(jpg, f"page-{idx+1}.jpg", target_language)
+            if text:
+                chunks.append(f"--- [SCANNED PAGE {idx+1} OF {len(doc)}] ---\n{text}")
+        doc.close()
+        return "\n\n".join(chunks).strip()
+    except Exception as exc:
+        print(f"[PaperPilot scanned PDF notice]: {exc}")
+        return ""
+
+
+def _file_kind(filename: str, content_type: str = "") -> str:
+    ext = os.path.splitext(filename.lower())[1]
+    groups = {
+        "pdf": {".pdf"},
+        "image": {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"},
+        "word": {".doc", ".docx", ".odt", ".rtf"},
+        "spreadsheet": {".xls", ".xlsx", ".xlsm", ".csv", ".tsv"},
+        "presentation": {".ppt", ".pptx", ".odp"},
+        "ebook": {".epub"},
+        "text": {".txt", ".md", ".json", ".xml", ".html", ".htm", ".yaml", ".yml"},
+        "audio": {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"},
+        "video": {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"},
+    }
+    for kind, exts in groups.items():
+        if ext in exts:
+            return kind
+    if "pdf" in content_type.lower():
+        return "pdf"
+    if content_type.lower().startswith("image/"):
+        return "image"
+    if content_type.lower().startswith("audio/"):
+        return "audio"
+    if content_type.lower().startswith("video/"):
+        return "video"
+    return "binary"
+
+
+def extract_text_from_pptx(file_bytes: bytes) -> Tuple[str, int]:
+    """Read PPTX text/tables using the OOXML zip structure; no extra package required."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            slide_names = sorted(
+                [n for n in zf.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)],
+                key=lambda n: int(re.search(r"slide(\d+)\.xml", n).group(1)),
+            )
+            ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+            chunks = []
+            for idx, name in enumerate(slide_names, 1):
+                root = ET.fromstring(zf.read(name))
+                texts = [node.text.strip() for node in root.iter(ns + "t") if node.text and node.text.strip()]
+                if texts:
+                    chunks.append(f"--- [SLIDE {idx} OF {len(slide_names)}] ---\n" + "\n".join(texts))
+            return "\n\n".join(chunks).strip(), len(slide_names)
+    except Exception:
+        return inspect_binary_stream(file_bytes), 0
+
+
+def extract_text_from_epub(file_bytes: bytes) -> Tuple[str, int]:
+    """Extract EPUB XHTML/HTML chapters using only zip + HTML stripping."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
+            chunks = []
+            for idx, name in enumerate(names, 1):
+                raw = zf.read(name).decode("utf-8", errors="ignore")
+                raw = re.sub(r"<script.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+                raw = re.sub(r"<style.*?</style>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r"<[^>]+>", " ", raw)
+                text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
+                text = re.sub(r"&amp;", "&", text, flags=re.IGNORECASE)
+                text = re.sub(r"\\s+", " ", text).strip()
+                if text:
+                    chunks.append(f"--- [CHAPTER/DOCUMENT {idx}] ---\n{text}")
+            return "\n\n".join(chunks).strip(), len(chunks)
+    except Exception:
+        return inspect_binary_stream(file_bytes), 0
+
+
+def _media_probe(file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    result = {"duration_seconds": None, "width": None, "height": None, "codec": None, "bitrate": None}
+    suffix = os.path.splitext(filename)[1] or ".bin"
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            proc = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", tmp_path],
+                capture_output=True, text=True, timeout=12,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                data = json.loads(proc.stdout)
+                fmt = data.get("format", {})
+                result["duration_seconds"] = float(fmt.get("duration")) if fmt.get("duration") else None
+                result["bitrate"] = int(float(fmt.get("bit_rate"))) if fmt.get("bit_rate") else None
+                for stream in data.get("streams", []):
+                    if stream.get("codec_type") == "video":
+                        result["width"] = stream.get("width")
+                        result["height"] = stream.get("height")
+                        result["codec"] = stream.get("codec_name")
+                        break
+                    if stream.get("codec_type") == "audio" and result["codec"] is None:
+                        result["codec"] = stream.get("codec_name")
+        finally:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+    except Exception:
+        pass
+    return result
+
+
+async def _transcribe_media(file_bytes: bytes, filename: str) -> str:
+    client = get_groq_client()
+    if client is None:
+        return ""
+    try:
+        suffix = os.path.splitext(filename)[1] or ".mp3"
+        # Groq's transcription endpoint accepts audio files. For video, extract
+        # the audio track first when ffmpeg is available.
+        audio_bytes = file_bytes
+        audio_name = filename
+        if _file_kind(filename) == "video":
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as src:
+                src.write(file_bytes)
+                src_path = src.name
+            out_path = src_path + ".mp3"
+            try:
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe() if imageio_ffmpeg is not None else "ffmpeg"
+                subprocess.run([ffmpeg_exe, "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-b:a", "96k", out_path], capture_output=True, timeout=90, check=True)
+                audio_bytes = open(out_path, "rb").read()
+                audio_name = os.path.basename(out_path)
+            finally:
+                for path in (src_path, out_path):
+                    try: os.unlink(path)
+                    except Exception: pass
+        bio = io.BytesIO(audio_bytes)
+        bio.name = audio_name
+        transcript = client.audio.transcriptions.create(
+            file=bio,
+            model="whisper-large-v3-turbo",
+            response_format="text",
+        )
+        return str(getattr(transcript, "text", transcript) or "").strip()
+    except Exception as exc:
+        print(f"[PaperPilot transcription notice]: {exc}")
+        return ""
+
+
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
     file: UploadFile = File(...),
     target_language: str = Form("English")
 ):
+    """Universal Paper Pilot ingestion pipeline.
+
+    The endpoint always returns a structured document envelope so the Flutter
+    client can render a file preview even when a specialized parser is not
+    installed. Media files receive metadata and, when configured, a speech
+    transcript. Images are passed through the existing normalized image path.
+    """
     try:
         file_bytes = await file.read()
-        filename = (file.filename or "uploaded_document.pdf").lower()
-
+        filename = file.filename or "uploaded_file"
+        kind = _file_kind(filename, file.content_type or "")
+        ext = os.path.splitext(filename.lower())[1]
+        mime = file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         extracted_text = ""
-        total_pages_detected = 1
+        total_pages_detected = 0
+        scanned = False
+        media = {}
+        preview_type = kind
 
-        if filename.endswith(".docx"):
-            extracted_text = extract_text_from_docx(file_bytes)
-        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-            extracted_text = extract_text_from_xlsx(file_bytes)
-        elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md", ".xml", ".rtf"]):
-            try:
-                extracted_text = file_bytes.decode("utf-8", errors="ignore")
-            except Exception:
-                pass
-        elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
+        if kind == "pdf":
             extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=500)
-        else:
-            try:
-                extracted_text = file_bytes.decode("utf-8", errors="ignore")
-            except Exception:
+            scanned = not bool(extracted_text.strip()) or extracted_text.startswith("EXTRACTED STREAM DATA:")
+            if scanned:
+                visual_text = await _extract_scanned_pdf_with_vision(file_bytes, target_language, max_pages=10)
+                if visual_text:
+                    extracted_text = visual_text
+        elif kind == "image":
+            normalized = prepare_image_bytes(file_bytes)
+            visual_text = await ask_fast_vision(normalized or file_bytes, filename, target_language)
+            extracted_text = visual_text or "Image document received. Visual/OCR inspection could not be completed by the configured vision model."
+            if normalized and not visual_text:
+                extracted_text += f"\nNormalized image size: {len(normalized)} bytes."
+        elif kind == "word":
+            if ext == ".docx":
+                extracted_text = extract_text_from_docx(file_bytes)
+            else:
                 extracted_text = inspect_binary_stream(file_bytes)
+        elif kind == "spreadsheet":
+            if ext in {".xlsx", ".xlsm", ".xls"}:
+                extracted_text = extract_text_from_xlsx(file_bytes)
+            else:
+                extracted_text = file_bytes.decode("utf-8", errors="ignore")
+        elif kind == "presentation":
+            if ext == ".pptx":
+                extracted_text, total_pages_detected = extract_text_from_pptx(file_bytes)
+            else:
+                extracted_text = inspect_binary_stream(file_bytes)
+        elif kind == "ebook":
+            extracted_text, total_pages_detected = extract_text_from_epub(file_bytes)
+        elif kind == "text":
+            extracted_text = file_bytes.decode("utf-8", errors="ignore")
+        elif kind in {"audio", "video"}:
+            media = _media_probe(file_bytes, filename)
+            extracted_text = await _transcribe_media(file_bytes, filename)
+            if not extracted_text:
+                extracted_text = f"{kind.title()} file received. No speech transcript was produced by the configured transcription service."
+        else:
+            extracted_text = inspect_binary_stream(file_bytes)
 
         if not extracted_text or len(extracted_text.strip()) < 5:
             extracted_text = inspect_binary_stream(file_bytes)
@@ -3021,36 +3257,46 @@ async def analyze_document(
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
+        type_guidance = {
+            "pdf":"Treat this as a document/legal/financial record.",
+            "image":"Treat this as a photographed or scanned document/image. Identify visible text, entities, tables and risks.",
+            "word":"Preserve headings, clauses, parties, dates and numerical details.",
+            "spreadsheet":"Focus on tables, totals, anomalies, formulas represented in the extracted data and important numerical patterns.",
+            "presentation":"Treat each slide as a separate information unit and identify key conclusions.",
+            "ebook":"Treat chapters as a continuous book and identify themes, entities and important passages.",
+            "audio":"Treat the transcript as a conversation/recording. Extract speakers if possible, decisions, commitments, dates and risks.",
+            "video":"Treat the transcript as a recording. Extract decisions, actions, dates and important observations; mention that visual scene analysis may require a dedicated vision pass.",
+            "text":"Treat this as a text record and preserve its structure.",
+        }.get(kind, "Treat this as a general uploaded file and explain what can be reliably inferred.")
+
         audit_prompt = (
-            f"You are Paper Pilot, an elite Document Analyst and Intelligence Auditor.\n"
-            f"{lang_instruction}\n\n"
-            f"GUIDELINES:\n"
-            f"1. Provide a comprehensive, rigorous forensic audit of the document contents below.\n"
-            f"2. Structure into clear sections: • Executive Summary • Key Breakdown / Clauses • Financial / Numerical Data • Actionable Recommendations.\n"
-            f"3. At the very end, output: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
+            f"You are Paper Pilot, an elite Universal Document Analyst and Intelligence Auditor.\n"
+            f"{lang_instruction}\n{type_guidance}\n\n"
+            "GUIDELINES:\n"
+            "1. Provide a comprehensive, rigorous audit of the supplied content.\n"
+            "2. Structure into Executive Summary, Key Information, Financial/Numerical Data, Risks/Observations, and Actionable Recommendations.\n"
+            "3. Never invent names, numbers, clauses, dates or facts absent from the supplied content.\n"
+            "4. If extraction is incomplete, explicitly say what could not be verified.\n"
+            "5. At the very end, output: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
         )
 
         analysis_raw = await ask_fast_text(
-            f"DOCUMENT FILE: {filename} (Pages: {total_pages_detected})\n\nCONTENT:\n{extracted_text[:95000]}",
+            f"DOCUMENT FILE: {filename}\nTYPE: {kind}\nMIME: {mime}\nPAGES/SLIDES/CHAPTERS: {total_pages_detected}\n\nCONTENT:\n{extracted_text[:95000]}",
             audit_prompt
         )
 
-        del file_bytes
-        gc.collect()
-
         suggestions = [
             "What are the primary financial details here?",
-            "Are there hidden liabilities or terms?",
-            "How do I verify this record?"
+            "Are there hidden liabilities or important risks?",
+            "What should I verify before relying on this file?"
         ]
-
         clean_text = analysis_raw
         if "EXPLORE_SUGGESTIONS:" in analysis_raw:
-            parts = analysis_raw.split("EXPLORE_SUGGESTIONS:")
+            parts = analysis_raw.split("EXPLORE_SUGGESTIONS:", 1)
             clean_text = parts[0].strip()
             try:
                 parsed_sugg = json.loads(parts[1].strip())
-                if isinstance(parsed_sugg, list) and len(parsed_sugg) > 0:
+                if isinstance(parsed_sugg, list) and parsed_sugg:
                     suggestions = [str(s) for s in parsed_sugg[:4]]
             except Exception:
                 pass
@@ -3058,15 +3304,33 @@ async def analyze_document(
         return {
             "status": "success",
             "data": {
-                "document_title": f"Document Audit ({filename})",
+                "document_title": filename,
+                "file_name": filename,
+                "file_type": kind,
+                "mime_type": mime,
+                "extension": ext,
+                "size_bytes": len(file_bytes),
+                "pages": total_pages_detected,
+                "scanned": scanned,
+                "preview": {
+                    "type": preview_type,
+                    "available": True,
+                    "text": extracted_text[:12000],
+                    "page_count": total_pages_detected,
+                },
+                "media": media,
                 "actionable_advisory": clean_text,
                 "detected_destination": None,
-                "suggestions": suggestions
+                "suggestions": suggestions,
+                "extracted_text": extracted_text[:120000],
             },
             "raw_text": clean_text
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Audit error: {str(e)}")
+        print(f"[PaperPilot universal audit error]: {e}")
+        raise HTTPException(status_code=500, detail=f"Audit error at universal ingestion stage: {str(e)}")
 
 # -------------------------------------------------------------
 # 16. REPORT TRANSLATOR
