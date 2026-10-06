@@ -3941,6 +3941,189 @@ async def get_community_feed(community_id: str = Query("vasai-virar")):
     except Exception as e:
         return {"status": "error", "message": str(e), "gems": [], "pulse": []}
 
+COMMUNITY_GOOGLE_CATEGORY_QUERIES = {
+    "Pharmacy / Chemist": "pharmacy chemist",
+    "Barber & Salon": "barber salon",
+    "Kirana & Essentials": "grocery store",
+    "General Store / Supermarket": "general store supermarket",
+    "Fruits & Vegetables": "fruit vegetable market",
+    "Meat / Fish": "meat fish market",
+    "Ice Cream & Dairy": "ice cream dairy",
+    "Cold Storage & Meat": "meat cold storage",
+    "Bakery & Sweets": "bakery sweets",
+    "Indo-Chinese & Snacks": "indo chinese snacks",
+    "Chai & Quick Bites": "cafe tea snacks",
+    "Bar & Restaurant": "restaurant",
+    "Diner & Seafood": "seafood restaurant diner",
+    "Market, Bazaar & Mall": "market bazaar mall",
+    "Movie Cinema & Theater": "cinema theater",
+    "Picnic Spot & Landscape": "park picnic spot",
+    "Resort & Farmhouse": "resort farmhouse",
+    "Heritage & Sight": "tourist attraction heritage",
+    "Clothing & Fashion": "clothing fashion store",
+    "Electronics & Mobile": "electronics mobile phone store",
+    "Stationery & Gifts": "stationery gift shop",
+    "Hardware & Home": "hardware home improvement",
+    "Beauty & Spa": "beauty spa",
+    "Tailor & Laundry": "tailor laundry",
+    "Car / Bike Service": "car bike service repair",
+    "Clinic / Doctor": "clinic doctor",
+    "Dental / Optical": "dentist optical",
+    "Hotel & Stay": "hotel",
+    "Guest House / Homestay": "guest house homestay",
+    "Travel / Car Rental": "car rental travel agency",
+    "Beach / Park / Sports": "beach park sports",
+    "Temple / Place of Worship": "temple place of worship",
+    "Event / Wedding Venue": "wedding event venue",
+}
+
+def _community_google_category(place: Dict[str, Any], requested: str = "All") -> str:
+    if requested and requested != "All":
+        return requested
+    raw = " ".join([
+        str(place.get("primaryType") or ""),
+        str(place.get("primaryTypeDisplayName") or ""),
+        " ".join([str(x) for x in (place.get("types") or [])]),
+    ]).lower()
+    if any(x in raw for x in ["pharmacy", "drugstore"]): return "Pharmacy / Chemist"
+    if any(x in raw for x in ["hair_care", "barber"]): return "Barber & Salon"
+    if any(x in raw for x in ["grocery", "supermarket", "convenience_store"]): return "General Store / Supermarket"
+    if any(x in raw for x in ["bakery"]): return "Bakery & Sweets"
+    if any(x in raw for x in ["ice_cream"]): return "Ice Cream & Dairy"
+    if any(x in raw for x in ["restaurant", "meal_takeaway", "food"]): return "Bar & Restaurant"
+    if any(x in raw for x in ["cafe", "coffee_shop"]): return "Chai & Quick Bites"
+    if any(x in raw for x in ["shopping_mall", "market"]): return "Market, Bazaar & Mall"
+    if any(x in raw for x in ["movie_theater", "cinema"]): return "Movie Cinema & Theater"
+    if any(x in raw for x in ["park", "tourist_attraction", "historical_landmark"]): return "Picnic Spot & Landscape"
+    if any(x in raw for x in ["hotel", "resort"]): return "Hotel & Stay"
+    return "General"
+
+def _community_google_place_to_row(place: Dict[str, Any], city: str, category: str = "All") -> Dict[str, Any]:
+    display = place.get("displayName") or {}
+    loc = place.get("location") or {}
+    photos = [str(x.get("name")) for x in (place.get("photos") or []) if isinstance(x, dict) and x.get("name")]
+    image_urls = _google_photo_proxy_urls(photos, 1200)
+    row = {
+        "id": str(place.get("id") or "google-unknown"),
+        "source": "GOOGLE",
+        "google_place_id": str(place.get("id") or ""),
+        "name": str(display.get("text") or "Local Place"),
+        "category": _community_google_category(place, category),
+        "subcategory": str(place.get("primaryTypeDisplayName") or ""),
+        "address": str(place.get("formattedAddress") or ""),
+        "city": city,
+        "latitude": loc.get("latitude"),
+        "longitude": loc.get("longitude"),
+        "rating": place.get("rating"),
+        "review_count": place.get("userRatingCount"),
+        "open_now": (place.get("regularOpeningHours") or {}).get("openNow"),
+        "hours": (place.get("regularOpeningHours") or {}).get("weekdayDescriptions") or [],
+        "maps_url": str(place.get("googleMapsUri") or ""),
+        "website_url": str(place.get("websiteUri") or ""),
+        "contact_phone": "",
+        "image_url": image_urls[0] if image_urls else "",
+        "photos": image_urls,
+        "google_photo_names": photos,
+        "upvotes": 0,
+        "community_endorsements": 0,
+        "community_tags": [],
+        "must_try_tip": "",
+        "contributor_name": "Google Places",
+        "community_notice": None,
+        "providers": {},
+        "booking": {},
+    }
+    return row
+
+def _merge_community_place_with_google(community: Dict[str, Any], google: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    row = dict(community)
+    row["source"] = "GOOGLE+COMMUNITY" if google else "COMMUNITY"
+    if google:
+        for key in ["google_place_id", "rating", "review_count", "open_now", "hours", "website_url", "photos"]:
+            if not row.get(key): row[key] = google.get(key)
+        if not row.get("maps_url"): row["maps_url"] = google.get("maps_url", "")
+        if not row.get("image_url"): row["image_url"] = google.get("image_url", "")
+        if not row.get("latitude"): row["latitude"] = google.get("latitude")
+        if not row.get("longitude"): row["longitude"] = google.get("longitude")
+        row["google_place_id"] = row.get("google_place_id") or google.get("google_place_id")
+    row["community_endorsements"] = int(row.get("upvotes") or row.get("community_endorsements") or 0)
+    row["community_notice"] = row.get("community_notice") or row.get("daily_notice") or None
+    row["providers"] = row.get("providers") or {
+        "zomato": {"url": row.get("zomato_url") or ""},
+        "swiggy": {"url": row.get("swiggy_url") or ""},
+    }
+    row["booking"] = row.get("booking") or {"url": row.get("booking_url") or "", "provider": row.get("booking_provider") or ""}
+    return row
+
+@app.get("/api/v1/community/places/search")
+async def search_community_places(
+    city: str = Query(...),
+    q: str = Query(""),
+    category: str = Query("All"),
+    lat: Optional[float] = Query(None),
+    lng: Optional[float] = Query(None),
+    limit: int = Query(30, ge=1, le=50),
+):
+    """Unified Community Gems feed: real Google Places + Supabase community listings.
+    Google keys remain server-side. No fabricated fallback places are returned.
+    """
+    clean_city = city.strip()
+    requested_category = category.strip() or "All"
+    search_term = q.strip()
+    google_query = " ".join(x for x in [search_term, COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "places"), clean_city] if x).strip()
+    if not search_term and requested_category == "All":
+        google_query = f"popular local places businesses restaurants shops attractions in {clean_city}"
+
+    google_places = await _google_text_search(google_query, max_result_count=min(limit, 20))
+    google_rows = [_community_google_place_to_row(p, clean_city, requested_category) for p in google_places]
+
+    community_rows: List[Dict[str, Any]] = []
+    if supabase:
+        try:
+            query = supabase.table("community_places").select("*").eq("city", clean_city)
+            if requested_category != "All": query = query.eq("category", requested_category)
+            if search_term:
+                query = query.or_(f"name.ilike.%{search_term}%,address.ilike.%{search_term}%,category.ilike.%{search_term}%,description.ilike.%{search_term}%")
+            res = query.order("upvotes", desc=True).limit(limit).execute()
+            community_rows = res.data or []
+        except Exception as exc:
+            print(f"[Community Gems Supabase search notice]: {exc}")
+
+    # Match community records to Google primarily by place_id, then normalized name/address.
+    google_by_id = {str(r.get("google_place_id")): r for r in google_rows if r.get("google_place_id")}
+    google_by_key = {}
+    for r in google_rows:
+        key = (str(r.get("name") or "").lower().strip(), str(r.get("address") or "").lower().strip())
+        google_by_key[key] = r
+
+    merged: List[Dict[str, Any]] = []
+    used_google = set()
+    for c in community_rows:
+        gid = str(c.get("google_place_id") or "")
+        key = (str(c.get("name") or "").lower().strip(), str(c.get("address") or "").lower().strip())
+        g = google_by_id.get(gid) or google_by_key.get(key)
+        if g: used_google.add(g.get("id"))
+        merged.append(_merge_community_place_with_google(c, g))
+    for g in google_rows:
+        if g.get("id") not in used_google:
+            merged.append(g)
+
+    # Optional nearest-first ordering when the client has a usable position.
+    if lat is not None and lng is not None:
+        def distance_key(row):
+            try:
+                dlat = float(row.get("latitude")) - lat
+                dlng = float(row.get("longitude")) - lng
+                return dlat * dlat + dlng * dlng
+            except Exception:
+                return 10**9
+        merged.sort(key=distance_key)
+    else:
+        merged.sort(key=lambda r: (-(int(r.get("upvotes") or 0)), -(float(r.get("rating") or 0))))
+
+    return {"status": "success", "city": clean_city, "places": merged[:limit], "google_live": bool(google_places)}
+
+
 @app.post("/api/v1/gems/create")
 async def create_gem(request: Request):
     if not supabase:
