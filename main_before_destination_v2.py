@@ -8,22 +8,17 @@ import time
 import uuid
 import base64
 import zipfile
-import mimetypes
-import subprocess
-import tempfile
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
-from html.parser import HTMLParser
 
 import httpx
 import requests
 from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import Response
 from places import router as places_router
-from services.destination_engine import router as destination_router
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -40,16 +35,6 @@ try:
 except ImportError:
     PdfReader = None
 
-try:
-    import fitz
-except ImportError:
-    fitz = None
-
-try:
-    import imageio_ffmpeg
-except ImportError:
-    imageio_ffmpeg = None
-
 app = FastAPI(
     title="Omni TouristOS & Unified Intelligence Cloud",
     description="Universal Travel AI, Street Lens Vision, Dual Voice, Bargain Pal, Universal Document Auditor, Transit Cloud & Community Intelligence",
@@ -58,9 +43,6 @@ app = FastAPI(
 
 # Register the places router on the active app instance
 app.include_router(places_router)
-# Destination Engine v2 is mounted before legacy destination routes so the
-# new local-catalog-first architecture owns the stable public API contract.
-app.include_router(destination_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,15 +62,6 @@ app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().strip('"').strip("'")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip().strip('"').strip("'")
 supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
-
-# -------------------------------------------------------------
-# RAILRADAR API CONFIGURATION
-# -------------------------------------------------------------
-RAILRADAR_API_KEY = os.environ.get("RAILRADAR_API_KEY", "").strip().strip('"').strip("'")
-RAILRADAR_BASE_URL = os.environ.get(
-    "RAILRADAR_BASE_URL",
-    "https://api.railradar.in/v1"
-).strip().rstrip("/")
 
 # -------------------------------------------------------------
 # 1. LIVE BULLION BENCHMARK ENGINE
@@ -201,58 +174,6 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
             continue
 
     raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
-
-async def ask_fast_vision(image_bytes: bytes, filename: str, target_language: str) -> str:
-    """High-quality multimodal document extraction for images.
-
-    Llama 4 Scout was deprecated by Groq in July 2026, so Paper Pilot now
-    uses the current Qwen 3.8 multimodal model. The vision pass is deliberately
-    extraction-heavy: the following text auditor receives the visible evidence
-    instead of a vague image caption.
-    """
-    client = get_groq_client()
-    if not client:
-        return ""
-    try:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        prompt = (
-            "You are Paper Pilot's visual document intelligence engine. "
-            "Analyze the uploaded image as if a user handed the document to an expert human analyst.\n\n"
-            "FIRST, inspect the entire image carefully. Do not say that OCR failed if the image is readable. "
-            "Read visible text in every language/script you can identify, including headings, names, dates, "
-            "phone numbers, addresses, prices, amounts, times, contact details, labels, tables and small print. "
-            "Also describe important visual facts such as logos, photographs, seals, signatures, stamps, "
-            "checkboxes, highlighted items, layout, document type, and obvious inconsistencies.\n\n"
-            "RETURN A FACTUAL EVIDENCE REPORT with these headings:\n"
-            "DOCUMENT TYPE / PURPOSE\n"
-            "VISIBLE TEXT (transcribe faithfully; preserve important original wording)\n"
-            "PEOPLE / ORGANIZATIONS / PLACES\n"
-            "DATES / TIMES / NUMBERS\n"
-            "FINANCIAL OR OTHER NUMERICAL DETAILS\n"
-            "IMPORTANT VISUAL ELEMENTS\n"
-            "POTENTIAL ISSUES OR ITEMS TO VERIFY\n"
-            "CONFIDENCE / UNREADABLE AREAS\n\n"
-            "Rules: Never invent missing text. If something is uncertain, mark it as uncertain. "
-            "Do not replace readable content with a generic failure message. "
-            f"Write the evidence report in {target_language}."
-        )
-        completion = client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[
-                {"role":"system","content":"You are an expert multimodal document/OCR analyst. Accuracy is more important than brevity."},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{encoded}"}}
-                ]}
-            ],
-            temperature=0.1,
-            max_completion_tokens=5000,
-            timeout=90,
-        )
-        return sanitize_ai_output(completion.choices[0].message.content or "")
-    except Exception as exc:
-        print(f"[PaperPilot vision notice]: {exc}")
-        return ""
 
 # -------------------------------------------------------------
 # 4. FAST JSON ENGINE VIA GROQ
@@ -2659,8 +2580,6 @@ async def place_details(request: Request):
                         "hotels": google_hotels,
                     }
 
-        places_provider = str(body.get("places_provider") or body.get("source") or "").strip()
-
         return {
             "status": "success",
             "place": {
@@ -2700,9 +2619,9 @@ async def place_details(request: Request):
             "hotel_state": nearby_stays.get("status"),
             "hotel_provider": nearby_stays.get("provider"),
             "hotel_reason": nearby_stays.get("reason"),
-            "attribution_required": (["Google Maps", "Booking.com"]
+            "attribution_required": (["Google Maps", "Booking.com", "Wikimedia Commons"]
                                      if places_provider == "Google Places"
-                                     else ["OpenStreetMap", "Wikimedia Commons", "Booking.com"]),
+                                     else ["OpenStreetMap", "Wikipedia", "Wikimedia Commons", "Booking.com"]),
         }
     except Exception as e:
         print(f"[Place Details Error]: {e}")
@@ -2839,7 +2758,7 @@ async def explore_city(request: Request):
 async def ask_concierge_text(prompt: str, system_prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
     if history:
-        for turn in history[-24:]:
+        for turn in history[-6:]:
             role = turn.get("role", "user")
             content = turn.get("content", "").strip()
             if content:
@@ -3035,10 +2954,10 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
         pil_img = ImageOps.exif_transpose(pil_img)
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        if max(pil_img.size) > 2200:
-            pil_img.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
+        if max(pil_img.size) > 1600:
+            pil_img.thumbnail((1600, 1600), Image.Resampling.BILINEAR)
         out_buf = io.BytesIO()
-        pil_img.save(out_buf, format="JPEG", quality=95, optimize=True)
+        pil_img.save(out_buf, format="JPEG", quality=92)
         return out_buf.getvalue()
     except Exception:
         return None
@@ -3046,229 +2965,34 @@ def prepare_image_bytes(file_bytes: bytes) -> Optional[bytes]:
 # -------------------------------------------------------------
 # 15. PAPER PILOT UNIVERSAL DOCUMENT AUDITOR
 # -------------------------------------------------------------
-
-async def _extract_scanned_pdf_with_vision(file_bytes: bytes, target_language: str, max_pages: int = 10) -> str:
-    if fitz is None:
-        return ""
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        chunks = []
-        count = min(len(doc), max_pages)
-        for idx in range(count):
-            page = doc.load_page(idx)
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
-            jpg = pix.tobytes("jpeg", jpg_quality=82)
-            text = await ask_fast_vision(jpg, f"page-{idx+1}.jpg", target_language)
-            if text:
-                chunks.append(f"--- [SCANNED PAGE {idx+1} OF {len(doc)}] ---\n{text}")
-        doc.close()
-        return "\n\n".join(chunks).strip()
-    except Exception as exc:
-        print(f"[PaperPilot scanned PDF notice]: {exc}")
-        return ""
-
-
-def _file_kind(filename: str, content_type: str = "") -> str:
-    ext = os.path.splitext(filename.lower())[1]
-    groups = {
-        "pdf": {".pdf"},
-        "image": {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"},
-        "word": {".doc", ".docx", ".odt", ".rtf"},
-        "spreadsheet": {".xls", ".xlsx", ".xlsm", ".csv", ".tsv"},
-        "presentation": {".ppt", ".pptx", ".odp"},
-        "ebook": {".epub"},
-        "text": {".txt", ".md", ".json", ".xml", ".html", ".htm", ".yaml", ".yml"},
-        "audio": {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"},
-        "video": {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"},
-    }
-    for kind, exts in groups.items():
-        if ext in exts:
-            return kind
-    if "pdf" in content_type.lower():
-        return "pdf"
-    if content_type.lower().startswith("image/"):
-        return "image"
-    if content_type.lower().startswith("audio/"):
-        return "audio"
-    if content_type.lower().startswith("video/"):
-        return "video"
-    return "binary"
-
-
-def extract_text_from_pptx(file_bytes: bytes) -> Tuple[str, int]:
-    """Read PPTX text/tables using the OOXML zip structure; no extra package required."""
-    try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-            slide_names = sorted(
-                [n for n in zf.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)],
-                key=lambda n: int(re.search(r"slide(\d+)\.xml", n).group(1)),
-            )
-            ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
-            chunks = []
-            for idx, name in enumerate(slide_names, 1):
-                root = ET.fromstring(zf.read(name))
-                texts = [node.text.strip() for node in root.iter(ns + "t") if node.text and node.text.strip()]
-                if texts:
-                    chunks.append(f"--- [SLIDE {idx} OF {len(slide_names)}] ---\n" + "\n".join(texts))
-            return "\n\n".join(chunks).strip(), len(slide_names)
-    except Exception:
-        return inspect_binary_stream(file_bytes), 0
-
-
-def extract_text_from_epub(file_bytes: bytes) -> Tuple[str, int]:
-    """Extract EPUB XHTML/HTML chapters using only zip + HTML stripping."""
-    try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-            names = [n for n in zf.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
-            chunks = []
-            for idx, name in enumerate(names, 1):
-                raw = zf.read(name).decode("utf-8", errors="ignore")
-                raw = re.sub(r"<script.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
-                raw = re.sub(r"<style.*?</style>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r"<[^>]+>", " ", raw)
-                text = re.sub(r"&nbsp;", " ", text, flags=re.IGNORECASE)
-                text = re.sub(r"&amp;", "&", text, flags=re.IGNORECASE)
-                text = re.sub(r"\\s+", " ", text).strip()
-                if text:
-                    chunks.append(f"--- [CHAPTER/DOCUMENT {idx}] ---\n{text}")
-            return "\n\n".join(chunks).strip(), len(chunks)
-    except Exception:
-        return inspect_binary_stream(file_bytes), 0
-
-
-def _media_probe(file_bytes: bytes, filename: str) -> Dict[str, Any]:
-    result = {"duration_seconds": None, "width": None, "height": None, "codec": None, "bitrate": None}
-    suffix = os.path.splitext(filename)[1] or ".bin"
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-        try:
-            proc = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", tmp_path],
-                capture_output=True, text=True, timeout=12,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                data = json.loads(proc.stdout)
-                fmt = data.get("format", {})
-                result["duration_seconds"] = float(fmt.get("duration")) if fmt.get("duration") else None
-                result["bitrate"] = int(float(fmt.get("bit_rate"))) if fmt.get("bit_rate") else None
-                for stream in data.get("streams", []):
-                    if stream.get("codec_type") == "video":
-                        result["width"] = stream.get("width")
-                        result["height"] = stream.get("height")
-                        result["codec"] = stream.get("codec_name")
-                        break
-                    if stream.get("codec_type") == "audio" and result["codec"] is None:
-                        result["codec"] = stream.get("codec_name")
-        finally:
-            try: os.unlink(tmp_path)
-            except Exception: pass
-    except Exception:
-        pass
-    return result
-
-
-async def _transcribe_media(file_bytes: bytes, filename: str) -> str:
-    client = get_groq_client()
-    if client is None:
-        return ""
-    try:
-        suffix = os.path.splitext(filename)[1] or ".mp3"
-        # Groq's transcription endpoint accepts audio files. For video, extract
-        # the audio track first when ffmpeg is available.
-        audio_bytes = file_bytes
-        audio_name = filename
-        if _file_kind(filename) == "video":
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as src:
-                src.write(file_bytes)
-                src_path = src.name
-            out_path = src_path + ".mp3"
-            try:
-                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe() if imageio_ffmpeg is not None else "ffmpeg"
-                subprocess.run([ffmpeg_exe, "-y", "-i", src_path, "-vn", "-acodec", "libmp3lame", "-b:a", "96k", out_path], capture_output=True, timeout=90, check=True)
-                audio_bytes = open(out_path, "rb").read()
-                audio_name = os.path.basename(out_path)
-            finally:
-                for path in (src_path, out_path):
-                    try: os.unlink(path)
-                    except Exception: pass
-        bio = io.BytesIO(audio_bytes)
-        bio.name = audio_name
-        transcript = client.audio.transcriptions.create(
-            file=bio,
-            model="whisper-large-v3-turbo",
-            response_format="text",
-        )
-        return str(getattr(transcript, "text", transcript) or "").strip()
-    except Exception as exc:
-        print(f"[PaperPilot transcription notice]: {exc}")
-        return ""
-
-
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
     file: UploadFile = File(...),
     target_language: str = Form("English")
 ):
-    """Universal Paper Pilot ingestion pipeline.
-
-    The endpoint always returns a structured document envelope so the Flutter
-    client can render a file preview even when a specialized parser is not
-    installed. Media files receive metadata and, when configured, a speech
-    transcript. Images are passed through the existing normalized image path.
-    """
     try:
         file_bytes = await file.read()
-        filename = file.filename or "uploaded_file"
-        kind = _file_kind(filename, file.content_type or "")
-        ext = os.path.splitext(filename.lower())[1]
-        mime = file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        extracted_text = ""
-        total_pages_detected = 0
-        scanned = False
-        media = {}
-        preview_type = kind
+        filename = (file.filename or "uploaded_document.pdf").lower()
 
-        if kind == "pdf":
-            extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=500)
-            scanned = not bool(extracted_text.strip()) or extracted_text.startswith("EXTRACTED STREAM DATA:")
-            if scanned:
-                visual_text = await _extract_scanned_pdf_with_vision(file_bytes, target_language, max_pages=10)
-                if visual_text:
-                    extracted_text = visual_text
-        elif kind == "image":
-            normalized = prepare_image_bytes(file_bytes)
-            visual_text = await ask_fast_vision(normalized or file_bytes, filename, target_language)
-            extracted_text = visual_text or "Image document received. Visual/OCR inspection could not be completed by the configured vision model."
-            if normalized and not visual_text:
-                extracted_text += f"\nNormalized image size: {len(normalized)} bytes."
-        elif kind == "word":
-            if ext == ".docx":
-                extracted_text = extract_text_from_docx(file_bytes)
-            else:
-                extracted_text = inspect_binary_stream(file_bytes)
-        elif kind == "spreadsheet":
-            if ext in {".xlsx", ".xlsm", ".xls"}:
-                extracted_text = extract_text_from_xlsx(file_bytes)
-            else:
+        extracted_text = ""
+        total_pages_detected = 1
+
+        if filename.endswith(".docx"):
+            extracted_text = extract_text_from_docx(file_bytes)
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            extracted_text = extract_text_from_xlsx(file_bytes)
+        elif any(filename.endswith(ext) for ext in [".csv", ".txt", ".json", ".md", ".xml", ".rtf"]):
+            try:
                 extracted_text = file_bytes.decode("utf-8", errors="ignore")
-        elif kind == "presentation":
-            if ext == ".pptx":
-                extracted_text, total_pages_detected = extract_text_from_pptx(file_bytes)
-            else:
-                extracted_text = inspect_binary_stream(file_bytes)
-        elif kind == "ebook":
-            extracted_text, total_pages_detected = extract_text_from_epub(file_bytes)
-        elif kind == "text":
-            extracted_text = file_bytes.decode("utf-8", errors="ignore")
-        elif kind in {"audio", "video"}:
-            media = _media_probe(file_bytes, filename)
-            extracted_text = await _transcribe_media(file_bytes, filename)
-            if not extracted_text:
-                extracted_text = f"{kind.title()} file received. No speech transcript was produced by the configured transcription service."
+            except Exception:
+                pass
+        elif filename.endswith(".pdf") or (file.content_type and "pdf" in file.content_type.lower()):
+            extracted_text, total_pages_detected = extract_massive_pdf_text(file_bytes, max_pages=500)
         else:
-            extracted_text = inspect_binary_stream(file_bytes)
+            try:
+                extracted_text = file_bytes.decode("utf-8", errors="ignore")
+            except Exception:
+                extracted_text = inspect_binary_stream(file_bytes)
 
         if not extracted_text or len(extracted_text.strip()) < 5:
             extracted_text = inspect_binary_stream(file_bytes)
@@ -3281,57 +3005,36 @@ async def analyze_document(
         else:
             lang_instruction = f"Output the entire analysis clearly in {target_language}."
 
-        type_guidance = {
-            "pdf":"Treat this as a document/legal/financial record.",
-            "image":"Treat this as a photographed or scanned document/image. Identify visible text, entities, tables and risks.",
-            "word":"Preserve headings, clauses, parties, dates and numerical details.",
-            "spreadsheet":"Focus on tables, totals, anomalies, formulas represented in the extracted data and important numerical patterns.",
-            "presentation":"Treat each slide as a separate information unit and identify key conclusions.",
-            "ebook":"Treat chapters as a continuous book and identify themes, entities and important passages.",
-            "audio":"Treat the transcript as a conversation/recording. Extract speakers if possible, decisions, commitments, dates and risks.",
-            "video":"Treat the transcript as a recording. Extract decisions, actions, dates and important observations; mention that visual scene analysis may require a dedicated vision pass.",
-            "text":"Treat this as a text record and preserve its structure.",
-        }.get(kind, "Treat this as a general uploaded file and explain what can be reliably inferred.")
-
         audit_prompt = (
-            f"You are Paper Pilot, an expert document analyst and intelligent auditor.\n"
-            f"{lang_instruction}\n{type_guidance}\n\n"
-            "The goal is to make the user understand exactly what this file is about, in simple language, "
-            "while still being precise enough for serious document review.\n\n"
-            "GUIDELINES:\n"
-            "1. Start with a plain-English 'What this file is about' explanation in 2-4 sentences.\n"
-            "2. Then provide: Executive Summary; Key Information; Important Details / Clauses; "
-            "People, Organizations & Places; Dates & Deadlines; Financial / Numerical Data; "
-            "Risks / Things to Verify; What the User Should Do Next.\n"
-            "3. For images, treat the visual evidence report as primary source material and synthesize it carefully.\n"
-            "4. Preserve exact names, numbers, dates, phone numbers, addresses and wording when they are readable.\n"
-            "5. Explain technical/legal/financial terms in simple words immediately after using them.\n"
-            "6. Never invent facts. If a value is unreadable or uncertain, explicitly say so.\n"
-            "7. Distinguish clearly between facts visible in the file and reasonable observations/inferences.\n"
-            "8. Do not say 'OCR failed', 'content unavailable', or similar when usable evidence is present.\n"
-            "9. For posters, notices, invitations, receipts, IDs, forms and photographs, explain the purpose and "
-            "the practical meaning rather than forcing them into a financial/legal template.\n"
-            "10. End with 3-4 useful follow-up questions under EXPLORE_SUGGESTIONS.\n"
-            "At the very end, output exactly: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
+            f"You are Paper Pilot, an elite Document Analyst and Intelligence Auditor.\n"
+            f"{lang_instruction}\n\n"
+            f"GUIDELINES:\n"
+            f"1. Provide a comprehensive, rigorous forensic audit of the document contents below.\n"
+            f"2. Structure into clear sections: • Executive Summary • Key Breakdown / Clauses • Financial / Numerical Data • Actionable Recommendations.\n"
+            f"3. At the very end, output: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
         )
 
         analysis_raw = await ask_fast_text(
-            f"DOCUMENT FILE: {filename}\nTYPE: {kind}\nMIME: {mime}\nPAGES/SLIDES/CHAPTERS: {total_pages_detected}\n\nSOURCE EVIDENCE / EXTRACTED CONTENT:\n{extracted_text[:120000]}",
+            f"DOCUMENT FILE: {filename} (Pages: {total_pages_detected})\n\nCONTENT:\n{extracted_text[:95000]}",
             audit_prompt
         )
 
+        del file_bytes
+        gc.collect()
+
         suggestions = [
             "What are the primary financial details here?",
-            "Are there hidden liabilities or important risks?",
-            "What should I verify before relying on this file?"
+            "Are there hidden liabilities or terms?",
+            "How do I verify this record?"
         ]
+
         clean_text = analysis_raw
         if "EXPLORE_SUGGESTIONS:" in analysis_raw:
-            parts = analysis_raw.split("EXPLORE_SUGGESTIONS:", 1)
+            parts = analysis_raw.split("EXPLORE_SUGGESTIONS:")
             clean_text = parts[0].strip()
             try:
                 parsed_sugg = json.loads(parts[1].strip())
-                if isinstance(parsed_sugg, list) and parsed_sugg:
+                if isinstance(parsed_sugg, list) and len(parsed_sugg) > 0:
                     suggestions = [str(s) for s in parsed_sugg[:4]]
             except Exception:
                 pass
@@ -3339,33 +3042,15 @@ async def analyze_document(
         return {
             "status": "success",
             "data": {
-                "document_title": filename,
-                "file_name": filename,
-                "file_type": kind,
-                "mime_type": mime,
-                "extension": ext,
-                "size_bytes": len(file_bytes),
-                "pages": total_pages_detected,
-                "scanned": scanned,
-                "preview": {
-                    "type": preview_type,
-                    "available": True,
-                    "text": extracted_text[:12000],
-                    "page_count": total_pages_detected,
-                },
-                "media": media,
+                "document_title": f"Document Audit ({filename})",
                 "actionable_advisory": clean_text,
                 "detected_destination": None,
-                "suggestions": suggestions,
-                "extracted_text": extracted_text[:120000],
+                "suggestions": suggestions
             },
             "raw_text": clean_text
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        print(f"[PaperPilot universal audit error]: {e}")
-        raise HTTPException(status_code=500, detail=f"Audit error at universal ingestion stage: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Audit error: {str(e)}")
 
 # -------------------------------------------------------------
 # 16. REPORT TRANSLATOR
@@ -3383,356 +3068,16 @@ async def translate_report(report_text: str = Form(...), target_language: str = 
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
-# -------------------------------------------------------------
-# 16A. SARATHI IDENTITY & PERSISTENT CONVERSATIONS
-# -------------------------------------------------------------
-# Storage policy for the 25K-user design. Raw messages are deliberately kept
-# short-lived; older turns are compressed into one conversation memory row.
-SARATHI_RAW_MESSAGE_LIMIT = 12
-SARATHI_COMPACTION_TRIGGER = 20
-SARATHI_COMPACTION_BATCH = 8
-SARATHI_MAX_PERSISTED_CHARS = 6000
-SARATHI_MAX_MEMORY_CHARS = 7000
-
-
-async def _sarathi_compact_conversation(conversation_id: str, user_id: str) -> None:
-    """Compress older Sarathi turns so database size does not grow linearly forever."""
-    if not supabase:
-        return
-    try:
-        rows = (
-            supabase.table("sarathi_messages")
-            .select("id, role, content, created_at")
-            .eq("conversation_id", conversation_id)
-            .eq("user_id", user_id)
-            .order("created_at", desc=False)
-            .limit(200)
-            .execute()
-        ).data or []
-        if len(rows) <= SARATHI_RAW_MESSAGE_LIMIT + SARATHI_COMPACTION_BATCH:
-            return
-
-        older = rows[:-SARATHI_RAW_MESSAGE_LIMIT]
-        batch = older[-SARATHI_COMPACTION_BATCH:]
-        if not batch:
-            return
-
-        previous = (
-            supabase.table("sarathi_conversation_memory")
-            .select("summary, summarized_message_count")
-            .eq("conversation_id", conversation_id)
-            .eq("user_id", user_id)
-            .maybe_single()
-            .execute()
-        ).data or {}
-        previous_summary = str(previous.get("summary") or "").strip()
-
-        transcript = "\n".join(
-            f"{str(item.get('role') or 'assistant').upper()}: {str(item.get('content') or '')[:3500]}"
-            for item in batch
-        )
-        summary_prompt = f"""Update the compact memory for a travel conversation.
-Preserve only durable facts, decisions, preferences, trip details, unresolved questions,
-and important context needed to continue naturally. Do not invent anything.
-Keep the result under 6500 characters.
-
-Existing memory:
-{previous_summary or '(none)'}
-
-New older turns:
-{transcript}
-
-Return only the updated memory summary."""
-        summary = (await ask_fast_text(
-            summary_prompt,
-            "You compress conversation history accurately. Preserve facts and uncertainty; never invent details."
-        )).strip()
-        if not summary:
-            return
-        summary = summary[:SARATHI_MAX_MEMORY_CHARS]
-
-        total_summarized = int(previous.get("summarized_message_count") or 0) + len(batch)
-        supabase.table("sarathi_conversation_memory").upsert({
-            "conversation_id": conversation_id,
-            "user_id": user_id,
-            "summary": summary,
-            "summarized_message_count": total_summarized,
-            "updated_at": datetime.utcnow().isoformat(),
-        }).execute()
-
-        ids = [item.get("id") for item in batch if item.get("id")]
-        if ids:
-            supabase.table("sarathi_messages").delete().in_("id", ids).eq("user_id", user_id).execute()
-    except Exception:
-        # Compaction must never break a successful AI response.
-        return
-
-
-
-# Sarathi never trusts a user_id supplied by the client. The authenticated
-# Supabase access token is the source of identity; the server resolves the
-# account before reading or writing conversation data.
-
-def _extract_bearer_token(request: Request) -> Optional[str]:
-    value = request.headers.get("authorization", "").strip()
-    if not value.lower().startswith("bearer "):
-        return None
-    token = value[7:].strip()
-    return token or None
-
-
-def _require_sarathi_user(request: Request) -> Dict[str, Any]:
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    token = _extract_bearer_token(request)
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required for Sarathi.")
-    try:
-        auth_response = supabase.auth.get_user(token)
-        auth_user = getattr(auth_response, "user", None)
-        if auth_user is None:
-            raise HTTPException(status_code=401, detail="Invalid or expired authentication session.")
-
-        user_id = str(auth_user.id)
-        metadata = getattr(auth_user, "user_metadata", {}) or {}
-        profile = {}
-        try:
-            profile_res = (
-                supabase.table("users")
-                .select("id, display_name, avatar_url, role, preferred_language")
-                .eq("id", user_id)
-                .maybe_single()
-                .execute()
-            )
-            profile = profile_res.data or {}
-        except Exception:
-            profile = {}
-
-        display_name = (
-            profile.get("display_name")
-            or metadata.get("display_name")
-            or metadata.get("full_name")
-            or metadata.get("name")
-            or (getattr(auth_user, "email", "") or "").split("@")[0]
-            or "Traveler"
-        )
-        display_name = str(display_name).strip() or "Traveler"
-        first_name = display_name.split()[0]
-
-        return {
-            "id": user_id,
-            "email": getattr(auth_user, "email", None),
-            "display_name": display_name,
-            "first_name": first_name,
-            "avatar_url": profile.get("avatar_url") or metadata.get("avatar_url"),
-            "role": profile.get("role"),
-            "preferred_language": profile.get("preferred_language") or metadata.get("preferred_language"),
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail=f"Authentication verification failed: {exc}")
-
-
-def _sarathi_conversation_title(text: str, fallback: str = "New conversation") -> str:
-    value = re.sub(r"\s+", " ", str(text or "").strip())
-    if not value:
-        return fallback
-    value = value.replace("\n", " ")
-    return value[:72].rstrip() + ("…" if len(value) > 72 else "")
-
-
-@app.get("/api/v1/sarathi/me")
-async def sarathi_me(request: Request):
-    user = _require_sarathi_user(request)
-    return {"status": "success", "user": user}
-
-
-@app.get("/api/v1/sarathi/conversations")
-async def sarathi_list_conversations(request: Request, include_archived: bool = Query(False)):
-    user = _require_sarathi_user(request)
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        query = (
-            supabase.table("sarathi_conversations")
-            .select("id, title, city, language, archived, created_at, updated_at")
-            .eq("user_id", user["id"])
-            .order("updated_at", desc=True)
-            .limit(100)
-        )
-        if not include_archived:
-            query = query.eq("archived", False)
-        result = query.execute()
-        return {"status": "success", "conversations": result.data or [], "user": user}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to load Sarathi conversations: {exc}")
-
-
-@app.post("/api/v1/sarathi/conversations")
-async def sarathi_create_conversation(request: Request):
-    user = _require_sarathi_user(request)
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    city = str(body.get("city") or "Vasai-Virar").strip()
-    language = str(body.get("language") or user.get("preferred_language") or "English").strip()
-    title = _sarathi_conversation_title(body.get("title"), "New conversation")
-    try:
-        result = supabase.table("sarathi_conversations").insert({
-            "user_id": user["id"],
-            "title": title,
-            "city": city,
-            "language": language,
-            "archived": False,
-        }).execute()
-        conversation = (result.data or [None])[0]
-        if not conversation:
-            raise HTTPException(status_code=500, detail="Conversation was not created.")
-        return {"status": "success", "conversation": conversation, "user": user}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to create Sarathi conversation: {exc}")
-
-
-@app.get("/api/v1/sarathi/conversations/{conversation_id}")
-async def sarathi_get_conversation(conversation_id: str, request: Request):
-    user = _require_sarathi_user(request)
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        conv = (
-            supabase.table("sarathi_conversations")
-            .select("id, title, city, language, archived, created_at, updated_at")
-            .eq("id", conversation_id)
-            .eq("user_id", user["id"])
-            .maybe_single()
-            .execute()
-        )
-        if not conv.data:
-            raise HTTPException(status_code=404, detail="Sarathi conversation not found.")
-        messages = (
-            supabase.table("sarathi_messages")
-            .select("id, role, content, created_at")
-            .eq("conversation_id", conversation_id)
-            .eq("user_id", user["id"])
-            .order("created_at", desc=False)
-            .limit(SARATHI_RAW_MESSAGE_LIMIT)
-            .execute()
-        )
-        # Conversation memory is optional. A missing table/column, RLS issue,
-        # or temporary Supabase problem must not make an otherwise valid
-        # conversation return HTTP 500. The raw messages remain usable.
-        memory = {}
-        try:
-            memory = (
-                supabase.table("sarathi_conversation_memory")
-                .select("summary, summarized_message_count, updated_at")
-                .eq("conversation_id", conversation_id)
-                .eq("user_id", user["id"])
-                .maybe_single()
-                .execute()
-            ).data or {}
-        except Exception as memory_exc:
-            print(f"[Sarathi memory warning]: {memory_exc}")
-
-        return {
-            "status": "success",
-            "conversation": conv.data,
-            "messages": messages.data or [],
-            "memory_summary": memory.get("summary", ""),
-            "summarized_message_count": memory.get("summarized_message_count", 0),
-            "storage_policy": {
-                "raw_messages_kept": SARATHI_RAW_MESSAGE_LIMIT,
-                "older_messages_compacted": True,
-            },
-            "user": user,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to load Sarathi conversation: {exc}")
-
-
-@app.patch("/api/v1/sarathi/conversations/{conversation_id}")
-async def sarathi_update_conversation(conversation_id: str, request: Request):
-    user = _require_sarathi_user(request)
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    updates: Dict[str, Any] = {}
-    if "title" in body:
-        updates["title"] = _sarathi_conversation_title(body.get("title"))
-    if "archived" in body:
-        updates["archived"] = bool(body.get("archived"))
-    if not updates:
-        return {"status": "success", "message": "No changes requested."}
-    try:
-        result = (
-            supabase.table("sarathi_conversations")
-            .update(updates)
-            .eq("id", conversation_id)
-            .eq("user_id", user["id"])
-            .execute()
-        )
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Sarathi conversation not found.")
-        return {"status": "success", "conversation": result.data[0]}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to update Sarathi conversation: {exc}")
-
-
-@app.delete("/api/v1/sarathi/conversations/{conversation_id}")
-async def sarathi_delete_conversation(conversation_id: str, request: Request):
-    user = _require_sarathi_user(request)
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        result = (
-            supabase.table("sarathi_conversations")
-            .delete()
-            .eq("id", conversation_id)
-            .eq("user_id", user["id"])
-            .execute()
-        )
-        return {"status": "success", "deleted": bool(result.data)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to delete Sarathi conversation: {exc}")
-
 # -------------------------------------------------------------
 # 17. CONCIERGE CHAT & LIVE RADAR PIPELINE
 # -------------------------------------------------------------
 @app.post("/api/v1/explore-chat")
 async def explore_chat(request: Request):
-    # Sarathi is authenticated for persistent conversations. If the endpoint is
-    # called by an older/guest client without a token, keep the legacy response
-    # path working instead of breaking unrelated app builds.
-    authenticated_user: Optional[Dict[str, Any]] = None
-    try:
-        authenticated_user = _require_sarathi_user(request)
-    except HTTPException as auth_error:
-        if auth_error.status_code != 401:
-            raise
-
     city = "Vasai-Virar"
     country = "India"
     question = ""
     target_language = "English"
     chat_history: List[Dict[str, str]] = []
-    conversation_id: Optional[str] = None
-    saved_home_base = ""
-    current_gps = ""
-    persist_user_message = True
 
     content_type = request.headers.get("content-type", "").lower()
     try:
@@ -3743,169 +3088,26 @@ async def explore_chat(request: Request):
             question = body.get("question", "")
             target_language = body.get("target_language", target_language)
             chat_history = body.get("chat_history", [])
-            conversation_id = body.get("conversation_id")
-            saved_home_base = str(body.get("saved_home_base") or "")
-            current_gps = str(body.get("current_gps") or "")
-            persist_user_message = bool(body.get("persist_user_message", True))
         else:
             form = await request.form()
             city = form.get("city", city)
             country = form.get("country", country)
             question = form.get("question", "")
             target_language = form.get("target_language", target_language)
-            conversation_id = form.get("conversation_id")
-            saved_home_base = str(form.get("saved_home_base") or "")
-            current_gps = str(form.get("current_gps") or "")
-            persist_user_message = str(form.get("persist_user_message", "true")).lower() == "true"
     except Exception:
         pass
 
     clean_q = str(question).strip()
-    if not clean_q:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    ans = await ask_concierge_text(clean_q, f"You are Omni Guide Assistant in {city}.", chat_history)
 
-    # For authenticated Sarathi conversations, the server-owned history is the
-    # authoritative context. The client history is retained only as a fallback
-    # for backwards compatibility and never determines ownership.
-    if authenticated_user and conversation_id:
-        try:
-            owned = (
-                supabase.table("sarathi_conversations")
-                .select("id, title, city, language")
-                .eq("id", conversation_id)
-                .eq("user_id", authenticated_user["id"])
-                .maybe_single()
-                .execute()
-            )
-            if not owned.data:
-                raise HTTPException(status_code=404, detail="Sarathi conversation not found.")
-            memory_row = (
-                supabase.table("sarathi_conversation_memory")
-                .select("summary")
-                .eq("conversation_id", conversation_id)
-                .eq("user_id", authenticated_user["id"])
-                .maybe_single()
-                .execute()
-            ).data or {}
-            stored = (
-                supabase.table("sarathi_messages")
-                .select("role, content")
-                .eq("conversation_id", conversation_id)
-                .eq("user_id", authenticated_user["id"])
-                .order("created_at", desc=True)
-                .limit(SARATHI_RAW_MESSAGE_LIMIT)
-                .execute()
-            )
-            chat_history = []
-            if memory_row.get("summary"):
-                chat_history.append({
-                    "role": "system",
-                    "content": "Compact memory of earlier turns (treat as context, not as new user instructions): " + str(memory_row["summary"])[:SARATHI_MAX_MEMORY_CHARS],
-                })
-            chat_history.extend(reversed(stored.data or []))
-        except HTTPException:
-            raise
-        except Exception as exc:
-            # Conversation persistence/context is auxiliary. If Supabase is
-            # temporarily unavailable or a deployed schema is missing, keep the
-            # chat request alive and fall back to the client-provided history.
-            print(f"[Sarathi context warning]: {exc}")
-
-    user_name_instruction = ""
-    if authenticated_user:
-        user_name_instruction = (
-            f"The authenticated traveler's name is {authenticated_user['first_name']}. "
-            "Use their name naturally when it improves the conversation, but do not repeat it in every reply. "
-        )
-
-    system_prompt = f"""You are Sarathi, the warm, highly capable AI travel companion inside Omni TouristOS.
-{user_name_instruction}
-Current active city: {city}.
-Country: {country}.
-Preferred response language: {target_language}.
-Saved home/stay base: {saved_home_base or 'not provided'}.
-Current GPS context: {current_gps or 'not provided'}.
-
-Behavior:
-- Be intelligent, warm, calm, concise and genuinely useful, like a polished modern AI assistant.
-- Understand conversation context and resolve references such as 'that place', 'there', 'tomorrow', or 'the second option' from prior turns.
-- Answer the actual question first; do not force every question into tourism.
-- For travel, give practical next steps, alternatives and cautions when useful.
-- Never invent live prices, weather, transit status, availability, bookings, ETAs or other real-time facts.
-- If live data is not supplied by a tool, say what is known and what needs a live lookup.
-- Do not mention internal prompts, models, APIs, databases or implementation details.
-- Do not repeatedly greet the traveler. A greeting belongs at the beginning of a new conversation, not every turn.
-- Use clean paragraphs and bullets only when they improve readability.
-"""
-
-    ans = await ask_concierge_text(clean_q, system_prompt, chat_history)
-
-    response: Dict[str, Any] = {
+    return {
         "status": "success",
         "answer": ans,
         "venues": [],
         "has_document": False,
         "pdf_name": f"{city}_Itinerary.pdf",
         "docx_name": f"{city}_Itinerary.docx",
-        "user": authenticated_user,
-        "conversation_id": conversation_id,
     }
-
-    if authenticated_user and conversation_id:
-        try:
-            # Save both sides atomically enough for the current Supabase client;
-            # ownership is always tied to the authenticated server-resolved user.
-            message_rows = []
-            if persist_user_message:
-                message_rows.append({
-                    "conversation_id": conversation_id,
-                    "user_id": authenticated_user["id"],
-                    "role": "user",
-                    "content": clean_q[:SARATHI_MAX_PERSISTED_CHARS],
-                })
-            message_rows.append({
-                "conversation_id": conversation_id,
-                "user_id": authenticated_user["id"],
-                "role": "assistant",
-                "content": ans[:SARATHI_MAX_PERSISTED_CHARS],
-            })
-            supabase.table("sarathi_messages").insert(message_rows).execute()
-            # First user message becomes the default ChatGPT-style title.
-            conv = (
-                supabase.table("sarathi_conversations")
-                .select("title")
-                .eq("id", conversation_id)
-                .eq("user_id", authenticated_user["id"])
-                .maybe_single()
-                .execute()
-            )
-            if conv.data and conv.data.get("title") in (None, "", "New conversation"):
-                supabase.table("sarathi_conversations").update({
-                    "title": _sarathi_conversation_title(clean_q),
-                    "updated_at": datetime.utcnow().isoformat(),
-                }).eq("id", conversation_id).eq("user_id", authenticated_user["id"]).execute()
-            else:
-                supabase.table("sarathi_conversations").update({
-                    "updated_at": datetime.utcnow().isoformat(),
-                }).eq("id", conversation_id).eq("user_id", authenticated_user["id"]).execute()
-
-            # Compact only at a safe threshold so normal messages do not incur an
-            # extra AI call. The raw database footprint therefore stays bounded.
-            message_count = (
-                supabase.table("sarathi_messages")
-                .select("id", count="exact", head=True)
-                .eq("conversation_id", conversation_id)
-                .eq("user_id", authenticated_user["id"])
-                .execute()
-            ).count or 0
-            if message_count >= SARATHI_COMPACTION_TRIGGER:
-                await _sarathi_compact_conversation(conversation_id, authenticated_user["id"])
-        except Exception as exc:
-            # The AI answer is still valid, but tell the client persistence failed
-            # so the UI can avoid pretending the message was safely stored.
-            response["persistence_warning"] = str(exc)
-
-    return response
 
 # -------------------------------------------------------------
 # 18. COMMUNITY INTELLIGENCE, MODERATION & 1-ON-1 SUITE
@@ -3940,189 +3142,6 @@ async def get_community_feed(community_id: str = Query("vasai-virar")):
         return {"status": "success", "gems": gems_res.data, "pulse": pulse_res.data}
     except Exception as e:
         return {"status": "error", "message": str(e), "gems": [], "pulse": []}
-
-COMMUNITY_GOOGLE_CATEGORY_QUERIES = {
-    "Pharmacy / Chemist": "pharmacy chemist",
-    "Barber & Salon": "barber salon",
-    "Kirana & Essentials": "grocery store",
-    "General Store / Supermarket": "general store supermarket",
-    "Fruits & Vegetables": "fruit vegetable market",
-    "Meat / Fish": "meat fish market",
-    "Ice Cream & Dairy": "ice cream dairy",
-    "Cold Storage & Meat": "meat cold storage",
-    "Bakery & Sweets": "bakery sweets",
-    "Indo-Chinese & Snacks": "indo chinese snacks",
-    "Chai & Quick Bites": "cafe tea snacks",
-    "Bar & Restaurant": "restaurant",
-    "Diner & Seafood": "seafood restaurant diner",
-    "Market, Bazaar & Mall": "market bazaar mall",
-    "Movie Cinema & Theater": "cinema theater",
-    "Picnic Spot & Landscape": "park picnic spot",
-    "Resort & Farmhouse": "resort farmhouse",
-    "Heritage & Sight": "tourist attraction heritage",
-    "Clothing & Fashion": "clothing fashion store",
-    "Electronics & Mobile": "electronics mobile phone store",
-    "Stationery & Gifts": "stationery gift shop",
-    "Hardware & Home": "hardware home improvement",
-    "Beauty & Spa": "beauty spa",
-    "Tailor & Laundry": "tailor laundry",
-    "Car / Bike Service": "car bike service repair",
-    "Clinic / Doctor": "clinic doctor",
-    "Dental / Optical": "dentist optical",
-    "Hotel & Stay": "hotel",
-    "Guest House / Homestay": "guest house homestay",
-    "Travel / Car Rental": "car rental travel agency",
-    "Beach / Park / Sports": "beach park sports",
-    "Temple / Place of Worship": "temple place of worship",
-    "Event / Wedding Venue": "wedding event venue",
-}
-
-def _community_google_category(place: Dict[str, Any], requested: str = "All") -> str:
-    if requested and requested != "All":
-        return requested
-    raw = " ".join([
-        str(place.get("primaryType") or ""),
-        str(place.get("primaryTypeDisplayName") or ""),
-        " ".join([str(x) for x in (place.get("types") or [])]),
-    ]).lower()
-    if any(x in raw for x in ["pharmacy", "drugstore"]): return "Pharmacy / Chemist"
-    if any(x in raw for x in ["hair_care", "barber"]): return "Barber & Salon"
-    if any(x in raw for x in ["grocery", "supermarket", "convenience_store"]): return "General Store / Supermarket"
-    if any(x in raw for x in ["bakery"]): return "Bakery & Sweets"
-    if any(x in raw for x in ["ice_cream"]): return "Ice Cream & Dairy"
-    if any(x in raw for x in ["restaurant", "meal_takeaway", "food"]): return "Bar & Restaurant"
-    if any(x in raw for x in ["cafe", "coffee_shop"]): return "Chai & Quick Bites"
-    if any(x in raw for x in ["shopping_mall", "market"]): return "Market, Bazaar & Mall"
-    if any(x in raw for x in ["movie_theater", "cinema"]): return "Movie Cinema & Theater"
-    if any(x in raw for x in ["park", "tourist_attraction", "historical_landmark"]): return "Picnic Spot & Landscape"
-    if any(x in raw for x in ["hotel", "resort"]): return "Hotel & Stay"
-    return "General"
-
-def _community_google_place_to_row(place: Dict[str, Any], city: str, category: str = "All") -> Dict[str, Any]:
-    display = place.get("displayName") or {}
-    loc = place.get("location") or {}
-    photos = [str(x.get("name")) for x in (place.get("photos") or []) if isinstance(x, dict) and x.get("name")]
-    image_urls = _google_photo_proxy_urls(photos, 1200)
-    row = {
-        "id": str(place.get("id") or "google-unknown"),
-        "source": "GOOGLE",
-        "google_place_id": str(place.get("id") or ""),
-        "name": str(display.get("text") or "Local Place"),
-        "category": _community_google_category(place, category),
-        "subcategory": str(place.get("primaryTypeDisplayName") or ""),
-        "address": str(place.get("formattedAddress") or ""),
-        "city": city,
-        "latitude": loc.get("latitude"),
-        "longitude": loc.get("longitude"),
-        "rating": place.get("rating"),
-        "review_count": place.get("userRatingCount"),
-        "open_now": (place.get("regularOpeningHours") or {}).get("openNow"),
-        "hours": (place.get("regularOpeningHours") or {}).get("weekdayDescriptions") or [],
-        "maps_url": str(place.get("googleMapsUri") or ""),
-        "website_url": str(place.get("websiteUri") or ""),
-        "contact_phone": "",
-        "image_url": image_urls[0] if image_urls else "",
-        "photos": image_urls,
-        "google_photo_names": photos,
-        "upvotes": 0,
-        "community_endorsements": 0,
-        "community_tags": [],
-        "must_try_tip": "",
-        "contributor_name": "Google Places",
-        "community_notice": None,
-        "providers": {},
-        "booking": {},
-    }
-    return row
-
-def _merge_community_place_with_google(community: Dict[str, Any], google: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    row = dict(community)
-    row["source"] = "GOOGLE+COMMUNITY" if google else "COMMUNITY"
-    if google:
-        for key in ["google_place_id", "rating", "review_count", "open_now", "hours", "website_url", "photos"]:
-            if not row.get(key): row[key] = google.get(key)
-        if not row.get("maps_url"): row["maps_url"] = google.get("maps_url", "")
-        if not row.get("image_url"): row["image_url"] = google.get("image_url", "")
-        if not row.get("latitude"): row["latitude"] = google.get("latitude")
-        if not row.get("longitude"): row["longitude"] = google.get("longitude")
-        row["google_place_id"] = row.get("google_place_id") or google.get("google_place_id")
-    row["community_endorsements"] = int(row.get("upvotes") or row.get("community_endorsements") or 0)
-    row["community_notice"] = row.get("community_notice") or row.get("daily_notice") or None
-    row["providers"] = row.get("providers") or {
-        "zomato": {"url": row.get("zomato_url") or ""},
-        "swiggy": {"url": row.get("swiggy_url") or ""},
-    }
-    row["booking"] = row.get("booking") or {"url": row.get("booking_url") or "", "provider": row.get("booking_provider") or ""}
-    return row
-
-@app.get("/api/v1/community/places/search")
-async def search_community_places(
-    city: str = Query(...),
-    q: str = Query(""),
-    category: str = Query("All"),
-    lat: Optional[float] = Query(None),
-    lng: Optional[float] = Query(None),
-    limit: int = Query(30, ge=1, le=50),
-):
-    """Unified Community Gems feed: real Google Places + Supabase community listings.
-    Google keys remain server-side. No fabricated fallback places are returned.
-    """
-    clean_city = city.strip()
-    requested_category = category.strip() or "All"
-    search_term = q.strip()
-    google_query = " ".join(x for x in [search_term, COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "places"), clean_city] if x).strip()
-    if not search_term and requested_category == "All":
-        google_query = f"popular local places businesses restaurants shops attractions in {clean_city}"
-
-    google_places = await _google_text_search(google_query, max_result_count=min(limit, 20))
-    google_rows = [_community_google_place_to_row(p, clean_city, requested_category) for p in google_places]
-
-    community_rows: List[Dict[str, Any]] = []
-    if supabase:
-        try:
-            query = supabase.table("community_places").select("*").eq("city", clean_city)
-            if requested_category != "All": query = query.eq("category", requested_category)
-            if search_term:
-                query = query.or_(f"name.ilike.%{search_term}%,address.ilike.%{search_term}%,category.ilike.%{search_term}%,description.ilike.%{search_term}%")
-            res = query.order("upvotes", desc=True).limit(limit).execute()
-            community_rows = res.data or []
-        except Exception as exc:
-            print(f"[Community Gems Supabase search notice]: {exc}")
-
-    # Match community records to Google primarily by place_id, then normalized name/address.
-    google_by_id = {str(r.get("google_place_id")): r for r in google_rows if r.get("google_place_id")}
-    google_by_key = {}
-    for r in google_rows:
-        key = (str(r.get("name") or "").lower().strip(), str(r.get("address") or "").lower().strip())
-        google_by_key[key] = r
-
-    merged: List[Dict[str, Any]] = []
-    used_google = set()
-    for c in community_rows:
-        gid = str(c.get("google_place_id") or "")
-        key = (str(c.get("name") or "").lower().strip(), str(c.get("address") or "").lower().strip())
-        g = google_by_id.get(gid) or google_by_key.get(key)
-        if g: used_google.add(g.get("id"))
-        merged.append(_merge_community_place_with_google(c, g))
-    for g in google_rows:
-        if g.get("id") not in used_google:
-            merged.append(g)
-
-    # Optional nearest-first ordering when the client has a usable position.
-    if lat is not None and lng is not None:
-        def distance_key(row):
-            try:
-                dlat = float(row.get("latitude")) - lat
-                dlng = float(row.get("longitude")) - lng
-                return dlat * dlat + dlng * dlng
-            except Exception:
-                return 10**9
-        merged.sort(key=distance_key)
-    else:
-        merged.sort(key=lambda r: (-(int(r.get("upvotes") or 0)), -(float(r.get("rating") or 0))))
-
-    return {"status": "success", "city": clean_city, "places": merged[:limit], "google_live": bool(google_places)}
-
 
 @app.post("/api/v1/gems/create")
 async def create_gem(request: Request):
@@ -4325,132 +3344,6 @@ async def delete_direct_conversation(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/api/v1/community/private-message")
-async def send_moderated_private_message(request: Request):
-    """Server-authoritative 1-to-1 message path supervised by Supervisor Bot."""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        body = await request.json()
-        sender_id = str(body.get("sender_id") or "").strip()
-        receiver_id = str(body.get("receiver_id") or "").strip()
-        sender_name = str(body.get("sender_name") or "Local Scout").strip()[:120]
-        sender_avatar_url = body.get("sender_avatar_url")
-        message = str(body.get("message") or "").strip()
-
-        if not sender_id or not receiver_id or not message:
-            raise HTTPException(status_code=400, detail="sender_id, receiver_id and message are required.")
-        if len(message) > 500:
-            raise HTTPException(status_code=400, detail="Message is too long. Please keep it concise.")
-
-        # Account enforcement before moderation.
-        try:
-            user_row = supabase.table("users").select("is_banned, muted_until").eq("id", sender_id).single().execute()
-            if user_row.data:
-                if user_row.data.get("is_banned"):
-                    raise HTTPException(status_code=403, detail="Account banned for community violations.")
-                muted_until = user_row.data.get("muted_until")
-                if muted_until:
-                    try:
-                        muted_dt = datetime.fromisoformat(str(muted_until).replace("Z", "+00:00"))
-                        if muted_dt > datetime.now(muted_dt.tzinfo):
-                            raise HTTPException(status_code=403, detail="Account temporarily muted.")
-                    except ValueError:
-                        pass
-        except HTTPException:
-            raise
-        except Exception:
-            # Preserve compatibility with installations where the users row is incomplete.
-            pass
-
-        violation = evaluate_supervisor_bot_flag(message)
-        if violation:
-            try:
-                supabase.table("community_reports").insert({
-                    "reporter_id": None,
-                    "offender_id": sender_id,
-                    "community_id": "private",
-                    "reason": "Supervisor Bot Auto-Flag",
-                    "details": f"Private message flagged: '{message}' | Issue: {violation}",
-                    "status": "pending",
-                }).execute()
-            except Exception:
-                pass
-            raise HTTPException(status_code=403, detail=f"Message blocked by Supervisor Bot: {violation}.")
-
-        inserted = supabase.table("direct_messages").insert({
-            "sender_id": sender_id,
-            "sender_name": sender_name,
-            "sender_avatar_url": sender_avatar_url,
-            "receiver_id": receiver_id,
-            "message": message,
-            "created_at": datetime.utcnow().isoformat(),
-        }).execute()
-
-        return {"status": "success", "message": inserted.data[0] if inserted.data else {}}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/v1/community/group-message")
-async def send_moderated_group_message(request: Request):
-    """Server-authoritative Travel Crew message path supervised by Supervisor Bot."""
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured.")
-    try:
-        body = await request.json()
-        group_id = str(body.get("group_id") or "").strip()
-        sender_id = str(body.get("sender_id") or "").strip()
-        sender_name = str(body.get("sender_name") or "Local Scout").strip()[:120]
-        sender_avatar_url = body.get("sender_avatar_url")
-        message = str(body.get("message") or "").strip()
-
-        if not group_id or not sender_id or not message:
-            raise HTTPException(status_code=400, detail="group_id, sender_id and message are required.")
-        if len(message) > 500:
-            raise HTTPException(status_code=400, detail="Message is too long. Please keep it concise.")
-
-        try:
-            user_row = supabase.table("users").select("is_banned, muted_until").eq("id", sender_id).single().execute()
-            if user_row.data and user_row.data.get("is_banned"):
-                raise HTTPException(status_code=403, detail="Account banned for community violations.")
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
-        violation = evaluate_supervisor_bot_flag(message)
-        if violation:
-            try:
-                supabase.table("community_reports").insert({
-                    "reporter_id": None,
-                    "offender_id": sender_id,
-                    "community_id": group_id,
-                    "reason": "Supervisor Bot Auto-Flag",
-                    "details": f"Group message flagged: '{message}' | Issue: {violation}",
-                    "status": "pending",
-                }).execute()
-            except Exception:
-                pass
-            raise HTTPException(status_code=403, detail=f"Message blocked by Supervisor Bot: {violation}.")
-
-        inserted = supabase.table("chat_group_messages").insert({
-            "group_id": group_id,
-            "sender_id": sender_id,
-            "sender_name": sender_name,
-            "sender_avatar_url": sender_avatar_url,
-            "message": message,
-            "created_at": datetime.utcnow().isoformat(),
-        }).execute()
-
-        return {"status": "success", "message": inserted.data[0] if inserted.data else {}}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 # -------------------------------------------------------------
 # 19. INDIAN RAILWAYS TRANSIT & PNR ENGINE
 # -------------------------------------------------------------
@@ -4467,13 +3360,11 @@ async def send_moderated_group_message(request: Request):
 # -------------------------------------------------------------
 
 RAILWAY_REFERENCE_BASE = "https://www.mumbailifeline.com"
-# Legacy constants retained because the older helper functions remain in this
-# file for compatibility, but Omni Rail now uses RailRadar for its live API.
-RAILWAY_REFERENCE_LABEL = "RailRadar API"
+RAILWAY_REFERENCE_LABEL = "Mumbai Lifeline public timetable reference"
 RAILWAY_TIMETABLE_VERSIONS = {
-    "W": "RailRadar",
-    "C": "RailRadar",
-    "H": "RailRadar",
+    "W": "May 2026",
+    "C": "2024",
+    "H": "May 2026",
 }
 
 # Short, stable station master used by the app.  The timetable source uses
@@ -4885,199 +3776,6 @@ def _rail_find_header(headers: List[str], candidates: List[str]) -> Optional[int
     return None
 
 
-class _RailHTMLTableParser(HTMLParser):
-    """Small stdlib HTML table extractor used when BeautifulSoup is unavailable."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.tables: List[List[List[str]]] = []
-        self._table: Optional[List[List[str]]] = None
-        self._row: Optional[List[str]] = None
-        self._cell: Optional[List[str]] = None
-        self._cell_tag: Optional[str] = None
-
-    def handle_starttag(self, tag: str, attrs: Any) -> None:
-        tag = tag.lower()
-        if tag == "table":
-            if self._table is None:
-                self._table = []
-        elif tag == "tr" and self._table is not None:
-            self._row = []
-        elif tag in {"td", "th"} and self._row is not None:
-            self._cell = []
-            self._cell_tag = tag
-
-    def handle_data(self, data: str) -> None:
-        if self._cell is not None:
-            self._cell.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
-            value = re.sub(r"\s+", " ", "".join(self._cell)).strip()
-            self._row.append(value)
-            self._cell = None
-            self._cell_tag = None
-        elif tag == "tr" and self._row is not None and self._table is not None:
-            if self._row:
-                self._table.append(self._row)
-            self._row = None
-        elif tag == "table" and self._table is not None:
-            if self._table:
-                self.tables.append(self._table)
-            self._table = None
-
-
-def _rail_html_tables(html: str) -> List[List[List[str]]]:
-    """Return HTML tables as simple row/cell lists with a stdlib fallback."""
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            output: List[List[List[str]]] = []
-            for table in soup.find_all("table"):
-                rows: List[List[str]] = []
-                for row in table.find_all("tr"):
-                    cells = [
-                        re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip()
-                        for cell in row.find_all(["th", "td"])
-                    ]
-                    if cells:
-                        rows.append(cells)
-                if rows:
-                    output.append(rows)
-            return output
-        except Exception:
-            pass
-
-    parser = _RailHTMLTableParser()
-    try:
-        parser.feed(html)
-        parser.close()
-    except Exception:
-        return []
-    return parser.tables
-
-
-def _rail_header_score(cell: str) -> int:
-    norm = _rail_normalize(cell)
-    if norm in {"trainno", "trainnumber", "train"}:
-        return 5
-    if "trainno" in norm or "trainnumber" in norm:
-        return 4
-    if norm in {"speed", "coaches", "duration", "originatingfrom", "endingat"}:
-        return 2
-    return 0
-
-
-def _rail_station_header_index(headers: List[str], station: str) -> Optional[int]:
-    aliases = [
-        _rail_station_display_name(station),
-        str(station or ""),
-        _rail_legacy_station_param(station),
-        _rail_slug_from_station(station),
-    ]
-    normalized_aliases = [_rail_normalize(x) for x in aliases if x]
-    for idx, header in enumerate(headers):
-        norm = _rail_normalize(header)
-        if not norm:
-            continue
-        if any(alias and (alias == norm or alias in norm or norm in alias) for alias in normalized_aliases):
-            return idx
-    return None
-
-
-def _rail_merge_header_rows(rows: List[List[str]], start: int, end: int) -> List[str]:
-    """Merge a multi-row table header while preserving column positions."""
-    width = max((len(rows[i]) for i in range(start, end + 1)), default=0)
-    merged = [""] * width
-    for i in range(start, end + 1):
-        row = rows[i]
-        for col in range(width):
-            value = row[col].strip() if col < len(row) else ""
-            if value and value not in {"-", "—", "–"}:
-                if not merged[col]:
-                    merged[col] = value
-                elif _rail_normalize(value) != _rail_normalize(merged[col]):
-                    merged[col] = f"{merged[col]} {value}".strip()
-    return merged
-
-
-def _rail_train_from_row(
-    values: List[str],
-    line: str,
-    requested_from_name: str,
-    requested_to_name: str,
-    train_idx: Optional[int],
-    speed_idx: Optional[int],
-    coach_idx: Optional[int],
-    origin_idx: Optional[int],
-    ending_idx: Optional[int],
-    duration_idx: Optional[int],
-    from_time_idx: int,
-    to_time_idx: Optional[int],
-    source_url: str,
-) -> Optional[Dict[str, Any]]:
-    def value_at(index: Optional[int]) -> str:
-        return values[index].strip() if index is not None and index < len(values) else ""
-
-    train_cell = value_at(train_idx)
-    dep_raw = value_at(from_time_idx)
-    arr_raw = value_at(to_time_idx)
-    if not dep_raw or dep_raw in {"—", "-", "–"}:
-        return None
-
-    dep_min = _rail_time_to_minutes(dep_raw)
-    if dep_min is None:
-        return None
-    arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
-    if arr_min is not None and arr_min < dep_min:
-        arr_min += 1440
-
-    speed = value_at(speed_idx)
-    coaches = value_at(coach_idx) or None
-    origin = value_at(origin_idx) or None
-    ending = value_at(ending_idx) or None
-    duration = value_at(duration_idx) or None
-
-    service_type, service_label = _rail_detect_service(train_cell, speed)
-    cleaned_train_no = _rail_clean_train_no(train_cell)
-    if cleaned_train_no == "—" and train_cell:
-        cleaned_train_no = train_cell
-
-    return {
-        "time": dep_raw,
-        "departure_time": dep_raw,
-        "arrival_time": arr_raw if arr_raw not in {"", "—", "-", "–"} else None,
-        "timestamp_minutes": dep_min,
-        "arrival_minutes": arr_min,
-        "train_no": cleaned_train_no,
-        "name": f"{origin or requested_from_name} → {ending or requested_to_name}",
-        "service_type": service_type,
-        "service": service_label,
-        "category": service_label,
-        "platform": None,
-        "platform_note": "Platform not published in this timetable response.",
-        "status": "Scheduled",
-        "status_msg": "Scheduled timetable entry",
-        "delay_minutes": None,
-        "crowd": None,
-        "door_side": None,
-        "coaches": coaches,
-        "coach_count": coaches,
-        "composition": coaches,
-        "source": requested_from_name,
-        "destination": requested_to_name,
-        "origin": origin,
-        "ending_at": ending,
-        "duration": duration,
-        "days": _rail_days_from_label(train_cell),
-        "live": False,
-        "data_source": source_url,
-        "data_source_type": RAILWAY_REFERENCE_LABEL,
-        "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
-    }
-
-
 def _rail_parse_timetable_html(
     html: str,
     line: str,
@@ -5085,59 +3783,46 @@ def _rail_parse_timetable_html(
     to_station: str,
     source_url: str,
 ) -> List[Dict[str, Any]]:
-    """Parse Mumbai Lifeline tables, including multi-row headers and layout changes."""
-    tables = _rail_html_tables(html)
-    if not tables:
+    """Parse Mumbai Lifeline's timetable table without assuming a fixed layout."""
+    if BeautifulSoup is None:
         return []
 
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+
+    trains: List[Dict[str, Any]] = []
     requested_from_name = _rail_station_display_name(from_station)
     requested_to_name = _rail_station_display_name(to_station)
-    trains: List[Dict[str, Any]] = []
 
-    for rows in tables:
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
         if not rows:
             continue
 
-        # Locate the real timetable header. It may be split over two rows.
         header_row_index: Optional[int] = None
-        station_row_index: Optional[int] = None
-        header_end = -1
+        header_cells: List[str] = []
 
-        for row_index, row in enumerate(rows[:80]):
-            score = sum(_rail_header_score(cell) for cell in row)
-            if score < 4:
-                continue
-            header_row_index = row_index
-            if _rail_station_header_index(row, from_station) is not None:
-                station_row_index = row_index
-                header_end = row_index
+        # The page contains navigation/summary rows before the real timetable.
+        # Search the first 60 rows for a row containing Train No and station data.
+        for row_index, row in enumerate(rows[:60]):
+            cells = row.find_all(["th", "td"])
+            candidate = [cell.get_text(" ", strip=True) for cell in cells]
+            normalized = [_rail_normalize(x) for x in candidate]
+            has_train = any(x in {"trainno", "trainnumber", "train"} for x in normalized)
+            has_station = any(
+                _rail_normalize(requested_from_name) in x
+                or _rail_normalize(from_station) in x
+                for x in normalized
+            )
+            if has_train and has_station:
+                header_row_index = row_index
+                header_cells = candidate
                 break
-            for look_ahead in range(row_index + 1, min(row_index + 4, len(rows))):
-                if _rail_station_header_index(rows[look_ahead], from_station) is not None:
-                    station_row_index = look_ahead
-                    header_end = look_ahead
-                    break
-            break
-
-        if header_row_index is None:
-            # Some legacy tables omit the literal Train No heading. Find a row
-            # that contains the requested station and several time-like cells.
-            for row_index, row in enumerate(rows[:80]):
-                if _rail_station_header_index(row, from_station) is None:
-                    continue
-                time_count = sum(1 for cell in row if _rail_time_to_minutes(cell) is not None)
-                if time_count >= 1:
-                    header_row_index = max(0, row_index - 1)
-                    station_row_index = row_index
-                    header_end = row_index
-                    break
 
         if header_row_index is None:
             continue
-
-        if station_row_index is None:
-            station_row_index = header_row_index
-        header_cells = _rail_merge_header_rows(rows, header_row_index, header_end)
 
         train_idx = _rail_find_header(header_cells, ["Train No", "Train Number", "Train"])
         speed_idx = _rail_find_header(header_cells, ["Speed"])
@@ -5145,47 +3830,88 @@ def _rail_parse_timetable_html(
         origin_idx = _rail_find_header(header_cells, ["Originating From", "Origin"])
         ending_idx = _rail_find_header(header_cells, ["Ending At", "Destination"])
         duration_idx = _rail_find_header(header_cells, ["Duration"])
-        from_time_idx = _rail_station_header_index(header_cells, from_station)
-        to_time_idx = _rail_station_header_index(header_cells, to_station)
+        from_time_idx = _rail_find_header(
+            header_cells,
+            [requested_from_name, from_station, _rail_legacy_station_param(from_station)],
+        )
+        to_time_idx = _rail_find_header(
+            header_cells,
+            [requested_to_name, to_station, _rail_legacy_station_param(to_station)],
+        )
 
-        # If the merged header failed, use the station-specific header row.
-        if from_time_idx is None:
-            from_time_idx = _rail_station_header_index(rows[station_row_index], from_station)
-        if to_time_idx is None:
-            to_time_idx = _rail_station_header_index(rows[station_row_index], to_station)
-
-        if from_time_idx is None:
+        if train_idx is None or from_time_idx is None:
             continue
 
-        data_start = max(header_row_index, station_row_index) + 1
-        table_trains: List[Dict[str, Any]] = []
-        for row in rows[data_start:]:
-            values = [re.sub(r"\s+", " ", str(v or "")).strip() for v in row]
-            if not values:
+        for row in rows[header_row_index + 1:]:
+            cells = row.find_all(["th", "td"])
+            values = [c.get_text(" ", strip=True) for c in cells]
+            if not values or train_idx >= len(values) or from_time_idx >= len(values):
                 continue
-            parsed = _rail_train_from_row(
-                values=values,
-                line=line,
-                requested_from_name=requested_from_name,
-                requested_to_name=requested_to_name,
-                train_idx=train_idx,
-                speed_idx=speed_idx,
-                coach_idx=coach_idx,
-                origin_idx=origin_idx,
-                ending_idx=ending_idx,
-                duration_idx=duration_idx,
-                from_time_idx=from_time_idx,
-                to_time_idx=to_time_idx,
-                source_url=source_url,
-            )
-            if parsed:
-                table_trains.append(parsed)
 
-        if table_trains:
-            trains.extend(table_trains)
-            # Prefer the first real timetable table; navigation tables should
-            # never prevent later data from being considered, but once a table
-            # has produced valid rows it is already authoritative for this URL.
+            train_cell = values[train_idx].strip()
+            dep_raw = values[from_time_idx].strip()
+            arr_raw = (
+                values[to_time_idx].strip()
+                if to_time_idx is not None and to_time_idx < len(values)
+                else ""
+            )
+
+            if not train_cell or not dep_raw or dep_raw in {"—", "-", "–"}:
+                continue
+
+            dep_min = _rail_time_to_minutes(dep_raw)
+            arr_min = _rail_time_to_minutes(arr_raw) if arr_raw else None
+            if dep_min is None:
+                continue
+
+            speed = values[speed_idx] if speed_idx is not None and speed_idx < len(values) else ""
+            coaches = values[coach_idx] if coach_idx is not None and coach_idx < len(values) else None
+            origin = values[origin_idx] if origin_idx is not None and origin_idx < len(values) else None
+            ending = values[ending_idx] if ending_idx is not None and ending_idx < len(values) else None
+            duration = values[duration_idx] if duration_idx is not None and duration_idx < len(values) else None
+
+            service_type, service_label = _rail_detect_service(train_cell, speed)
+            cleaned_train_no = _rail_clean_train_no(train_cell)
+            if cleaned_train_no == "—":
+                cleaned_train_no = train_cell
+
+            if arr_min is not None and arr_min < dep_min:
+                arr_min += 1440
+
+            trains.append({
+                "time": dep_raw,
+                "departure_time": dep_raw,
+                "arrival_time": arr_raw if arr_raw not in {"", "—", "-", "–"} else None,
+                "timestamp_minutes": dep_min,
+                "arrival_minutes": arr_min,
+                "train_no": cleaned_train_no,
+                "name": f"{origin or requested_from_name} → {ending or requested_to_name}",
+                "service_type": service_type,
+                "service": service_label,
+                "category": service_label,
+                "platform": None,
+                "platform_note": "Platform not published in this timetable response.",
+                "status": "Scheduled",
+                "status_msg": "Scheduled timetable entry",
+                "delay_minutes": None,
+                "crowd": None,
+                "door_side": None,
+                "coaches": coaches,
+                "coach_count": coaches,
+                "composition": coaches,
+                "source": requested_from_name,
+                "destination": requested_to_name,
+                "origin": origin,
+                "ending_at": ending,
+                "duration": duration,
+                "days": _rail_days_from_label(train_cell),
+                "live": False,
+                "data_source": source_url,
+                "data_source_type": RAILWAY_REFERENCE_LABEL,
+                "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+            })
+
+        if trains:
             break
 
     unique: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
@@ -5196,23 +3922,8 @@ def _rail_parse_timetable_html(
             str(train.get("destination", "")),
         )
         unique[key] = train
+
     return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
-
-
-def _rail_strip_html_to_lines(html: str) -> List[str]:
-    if BeautifulSoup is not None:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-            text = soup.get_text("\n", strip=True)
-            return [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
-        except Exception:
-            pass
-    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-    text = re.sub(r"</(p|div|li|tr|h[1-6])\s*>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&nbsp;", " ", text, flags=re.I)
-    text = re.sub(r"&amp;", "&", text, flags=re.I)
-    return [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
 
 
 def _rail_parse_mobile_timetable_html(
@@ -5222,37 +3933,31 @@ def _rail_parse_mobile_timetable_html(
     to_station: str,
     source_url: str,
 ) -> List[Dict[str, Any]]:
-    """Parse Mumbai Lifeline's lightweight timetable even without BeautifulSoup."""
-    lines = _rail_strip_html_to_lines(html)
-    if not lines:
+    """Parse the lightweight Mumbai Lifeline timetable as a final fallback."""
+    if BeautifulSoup is None:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text("\n", strip=True)
+    except Exception:
         return []
 
-    requested_from = _rail_station_display_name(from_station)
-    requested_from_norm = _rail_normalize(requested_from)
-    trains: List[Dict[str, Any]] = []
-
-    # Mobile pages normally contain lines such as:
-    # "Virar to Churchgate 7:09 am 7:27 am". Some variants insert extra
-    # whitespace or omit the selected station, so accept any station-to-dest
-    # pair with two recognizable times and then validate the origin.
-    time_re = r"(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))"
+    station = re.escape(_rail_station_display_name(from_station))
     pattern = re.compile(
-        rf"^(.+?)\s+to\s+(.+?)\s+{time_re}\s+{time_re}$",
+        rf"^{station}\s+to\s+(.+?)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)\s+(\d{{1,2}}:\d{{2}}\s*[ap]m)$",
         re.I,
     )
 
-    for raw_line in lines:
-        match = pattern.match(raw_line)
+    trains: List[Dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line_text = re.sub(r"\s+", " ", raw_line).strip()
+        match = pattern.match(line_text)
         if not match:
             continue
-        origin = match.group(1).strip()
-        destination = match.group(2).strip()
-        dep_raw = match.group(3).strip()
-        arr_raw = match.group(4).strip()
 
-        if _rail_normalize(origin) != requested_from_norm:
-            continue
-
+        destination = match.group(1).strip()
+        dep_raw = match.group(2).strip()
+        arr_raw = match.group(3).strip()
         dep_min = _rail_time_to_minutes(dep_raw)
         arr_min = _rail_time_to_minutes(arr_raw)
         if dep_min is None:
@@ -5267,7 +3972,7 @@ def _rail_parse_mobile_timetable_html(
             "timestamp_minutes": dep_min,
             "arrival_minutes": arr_min,
             "train_no": "—",
-            "name": f"{requested_from} → {destination}",
+            "name": f"{_rail_station_display_name(from_station)} → {destination}",
             "service_type": "S",
             "service": "Scheduled local",
             "category": "Scheduled local",
@@ -5278,9 +3983,9 @@ def _rail_parse_mobile_timetable_html(
             "coaches": None,
             "coach_count": None,
             "composition": None,
-            "source": requested_from,
+            "source": _rail_station_display_name(from_station),
             "destination": destination,
-            "origin": requested_from,
+            "origin": _rail_station_display_name(from_station),
             "ending_at": destination,
             "duration": None,
             "days": "As published",
@@ -5297,9 +4002,101 @@ def _rail_parse_mobile_timetable_html(
     return sorted(unique.values(), key=lambda item: int(item.get("timestamp_minutes", 0)))
 
 
-# RailRadar replaces the former HTML timetable fetcher. The compatibility
-# wrapper is defined later, after the RailRadar normalization helpers.
+async def _rail_fetch_timetable(
+    line: str,
+    from_station: str,
+    to_station: str,
+    after_minutes: int,
+    before_minutes: int,
+) -> Dict[str, Any]:
+    line = str(line).upper()
+    from_name = _rail_station_display_name(from_station)
+    to_name = _rail_station_display_name(to_station)
 
+    source_urls = _rail_candidate_urls(
+        line=line,
+        from_station=from_station,
+        to_station=to_station,
+        after_minutes=after_minutes,
+        before_minutes=before_minutes,
+    )
+    primary_url = source_urls[0]
+
+    cache_key = f"{line}|{from_name}|{to_name}|{after_minutes}|{before_minutes}"
+    cached = _rail_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = {
+        "trains": [],
+        "source_url": primary_url,
+        "source_urls": source_urls,
+        "source_label": RAILWAY_REFERENCE_LABEL,
+        "line": line,
+        "line_name": _rail_line_name(line),
+        "from": from_name,
+        "to": to_name,
+        "timetable_version": RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown"),
+        "retrieved_at": datetime.now().astimezone().isoformat(),
+        "error": None,
+    }
+
+    errors: List[str] = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36 OmniTouristOS/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=RAILWAY_HTTP_TIMEOUT_SECONDS,
+            headers=headers,
+        ) as client:
+            for index, url in enumerate(source_urls):
+                try:
+                    response = await client.get(url)
+                    if response.status_code != 200:
+                        errors.append(f"HTTP {response.status_code}: {url}")
+                        continue
+
+                    parsed = _rail_parse_timetable_html(
+                        html=response.text,
+                        line=line,
+                        from_station=from_station,
+                        to_station=to_station,
+                        source_url=str(response.url),
+                    )
+
+                    if not parsed and index == len(source_urls) - 1:
+                        parsed = _rail_parse_mobile_timetable_html(
+                            html=response.text,
+                            line=line,
+                            from_station=from_station,
+                            to_station=to_station,
+                            source_url=str(response.url),
+                        )
+
+                    if parsed:
+                        result["trains"] = parsed
+                        result["source_url"] = str(response.url)
+                        result["source_used"] = "mobile" if "/m/" in str(response.url) else "timetable"
+                        result["error"] = None
+                        _rail_cache_set(cache_key, result)
+                        return result
+
+                    errors.append(f"No timetable rows parsed: {url}")
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}: {exc}")
+
+    result["error"] = "Timetable source was reached, but no schedule rows could be parsed. " + " | ".join(errors[-3:])
+    result["source_errors"] = errors
+    _rail_cache_set(cache_key, result)
+    return result
 
 def _rail_filter_trains(
     trains: List[Dict[str, Any]],
@@ -5557,893 +4354,20 @@ async def _rail_cross_line_route(
     }
 
 
-
-
-def _ist_now() -> datetime:
-    """Return current India Standard Time regardless of Render's host timezone."""
-    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
-
-
-def _railradar_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {RAILRADAR_API_KEY}",
-        "Accept": "application/json",
-        "User-Agent": "OmniTouristOS/1.0",
-    }
-
-
-async def _railradar_get(
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout_seconds: float = 20.0,
-) -> Tuple[int, Dict[str, Any], Optional[str]]:
-    """
-    Server-side RailRadar GET wrapper.
-
-    The API key never leaves Render. The Flutter app only sees our normalized
-    /api/v1/railway-inquiry contract.
-    """
-    if not RAILRADAR_API_KEY:
-        return 0, {}, "RAILRADAR_API_KEY is not configured on the backend."
-
-    endpoint = f"{RAILRADAR_BASE_URL}/{str(path).lstrip('/')}"
-    try:
-        timeout = httpx.Timeout(timeout_seconds, connect=min(8.0, timeout_seconds))
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(
-                endpoint,
-                params=params or {},
-                headers=_railradar_headers(),
-            )
-
-        try:
-            payload = response.json()
-        except Exception:
-            payload = {"raw_response": response.text[:5000]}
-
-        if not isinstance(payload, dict):
-            payload = {"raw_response": payload}
-
-        if not response.is_success:
-            error_obj = payload.get("error")
-            if isinstance(error_obj, dict):
-                message = str(error_obj.get("message") or error_obj.get("code") or "RailRadar request failed.")
-            else:
-                message = f"RailRadar returned HTTP {response.status_code}."
-            return response.status_code, payload, message
-
-        return response.status_code, payload, None
-
-    except Exception as exc:
-        return 0, {}, f"RailRadar request failed: {type(exc).__name__}: {exc}"
-
-
-def _rr_data(payload: Dict[str, Any]) -> Dict[str, Any]:
-    data = payload.get("data")
-    return data if isinstance(data, dict) else {}
-
-
-def _rr_time_minutes(value: Any) -> Optional[int]:
-    """Convert RailRadar HH:MM / ISO timestamps into minutes after midnight."""
-    if value is None:
-        return None
-
-    raw = str(value).strip()
-    if not raw:
-        return None
-
-    # ISO timestamps such as 2026-10-05T06:30:00+05:30.
-    if "T" in raw:
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(timezone(timedelta(hours=5, minutes=30)))
-            return parsed.hour * 60 + parsed.minute
-        except Exception:
-            pass
-
-    match = re.search(r"\b(\d{1,2}):(\d{2})\b", raw)
-    if not match:
-        return None
-
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-    if hour > 23 or minute > 59:
-        return None
-    return hour * 60 + minute
-
-
-def _rr_time_display(value: Any) -> Optional[str]:
-    minutes = _rr_time_minutes(value)
-    if minutes is None:
-        return None
-    return _rail_minutes_to_12h(minutes)
-
-
-def _rr_service_type(train: Dict[str, Any]) -> Tuple[str, str]:
-    name = str(train.get("name") or "").strip()
-    train_type = str(train.get("type") or "").strip()
-    category = str(train.get("category") or "").strip()
-    text = f"{name} {train_type} {category}".upper()
-
-    if "LADIES" in text or "WOMEN" in text:
-        return "LADIES", "Ladies Local"
-    if re.search(r"\bAC\b", text) or "AC LOCAL" in text:
-        return "AC", "AC Local"
-    if "FAST" in text:
-        return "F", "Fast Local"
-    if "SLOW" in text:
-        return "S", "Slow Local"
-    if "LOCAL" in text or "SUBURBAN" in text or "MEMU" in text:
-        return "LOCAL", "Local"
-    return "LOCAL", train_type or "Local"
-
-
-def _rr_is_mumbai_local(train: Dict[str, Any]) -> bool:
-    """Identify suburban/local services without inventing a classification."""
-    name = str(train.get("name") or "").upper()
-    train_type = str(train.get("type") or "").upper()
-    category = str(train.get("category") or "").upper()
-    text = f"{name} {train_type} {category}"
-    return any(token in text for token in ("LOCAL", "SUBURBAN", "MEMU", "FAST", "SLOW", "LADIES"))
-
-
-def _rr_run_days(value: Any) -> str:
-    if isinstance(value, list):
-        days = [str(x).strip().title() for x in value if str(x).strip()]
-        return ", ".join(days) if days else "As published"
-    return str(value).strip() if value else "As published"
-
-
-def _rr_normalize_between_train(
-    item: Dict[str, Any],
-    from_station: str,
-    to_station: str,
-    source_url: str,
-) -> Optional[Dict[str, Any]]:
-    train = item.get("train")
-    from_stop = item.get("from")
-    to_stop = item.get("to")
-
-    if not isinstance(train, dict):
-        return None
-    if not isinstance(from_stop, dict):
-        from_stop = {}
-    if not isinstance(to_stop, dict):
-        to_stop = {}
-
-    dep_raw = from_stop.get("departure")
-    arr_raw = to_stop.get("arrival")
-    dep_min = _rr_time_minutes(dep_raw)
-    if dep_min is None:
-        return None
-
-    arr_min = _rr_time_minutes(arr_raw)
-    if arr_min is not None and arr_min < dep_min:
-        arr_min += 1440
-
-    service_type, service_label = _rr_service_type(train)
-    train_no = str(train.get("number") or "—")
-    train_name = str(train.get("name") or f"{_rail_station_display_name(from_station)} → {_rail_station_display_name(to_station)}")
-
-    live = item.get("live")
-    if not isinstance(live, dict):
-        live = {}
-
-    delay = live.get("delayMinutes")
-    platform = live.get("platform")
-    live_type = str(live.get("type") or "").strip()
-
-    status = "Scheduled"
-    status_msg = "Scheduled timetable entry"
-    is_live = bool(live)
-    if live_type:
-        status = live_type.replace("-", " ").title()
-        status_msg = f"RailRadar live status: {status}"
-    if delay is not None:
-        try:
-            delay_int = int(delay)
-            status_msg = f"{status} • {delay_int} min delay"
-        except Exception:
-            pass
-
-    return {
-        "time": _rr_time_display(dep_raw),
-        "departure_time": _rr_time_display(dep_raw),
-        "arrival_time": _rr_time_display(arr_raw),
-        "timestamp_minutes": dep_min,
-        "arrival_minutes": arr_min,
-        "train_no": train_no,
-        "number": train_no,
-        "name": train_name,
-        "train_name": train_name,
-        "service_type": service_type,
-        "service": service_label,
-        "category": str(train.get("category") or train.get("type") or service_label),
-        "platform": str(platform) if platform is not None else None,
-        "status": status,
-        "status_msg": status_msg,
-        "delay_minutes": delay,
-        "crowd": None,
-        "door_side": None,
-        "coaches": None,
-        "coach_count": None,
-        "composition": None,
-        "source": _rail_station_display_name(from_station),
-        "destination": _rail_station_display_name(to_station),
-        "origin": _rail_station_display_name(from_station),
-        "ending_at": _rail_station_display_name(to_station),
-        "duration": (
-            f"{int(item.get('duration')) // 60}h {int(item.get('duration')) % 60}m"
-            if isinstance(item.get("duration"), (int, float)) and int(item.get("duration")) >= 60
-            else (
-                f"{int(item.get('duration'))} min"
-                if isinstance(item.get("duration"), (int, float))
-                else None
-            )
-        ),
-        "days": _rr_run_days(train.get("runDays")),
-        "live": is_live,
-        "live_feed_available": is_live,
-        "data_source": source_url,
-        "data_source_type": "RailRadar API",
-    }
-
-
-def _rr_normalize_station_train(
-    item: Dict[str, Any],
-    station_code: str,
-    source_url: str,
-) -> Optional[Dict[str, Any]]:
-    train = item.get("train")
-    stop = item.get("stop")
-
-    if not isinstance(train, dict):
-        return None
-    if not isinstance(stop, dict):
-        stop = {}
-
-    dep_raw = stop.get("departure")
-    arr_raw = stop.get("arrival")
-    chosen_raw = dep_raw or arr_raw
-    minute = _rr_time_minutes(chosen_raw)
-    if minute is None:
-        return None
-
-    service_type, service_label = _rr_service_type(train)
-    train_no = str(train.get("number") or "—")
-    train_name = str(train.get("name") or "Mumbai Local")
-    destination = train.get("destination")
-    if isinstance(destination, dict):
-        destination = destination.get("name") or destination.get("code")
-    source = train.get("source")
-    if isinstance(source, dict):
-        source = source.get("name") or source.get("code")
-
-    return {
-        "time": _rr_time_display(chosen_raw),
-        "departure_time": _rr_time_display(dep_raw),
-        "arrival_time": _rr_time_display(arr_raw),
-        "timestamp_minutes": minute,
-        "arrival_minutes": _rr_time_minutes(arr_raw),
-        "train_no": train_no,
-        "number": train_no,
-        "name": train_name,
-        "train_name": train_name,
-        "service_type": service_type,
-        "service": service_label,
-        "category": str(train.get("category") or train.get("type") or service_label),
-        "platform": None,
-        "status": "Scheduled",
-        "status_msg": "Scheduled timetable entry",
-        "delay_minutes": None,
-        "crowd": None,
-        "door_side": None,
-        "coaches": None,
-        "coach_count": None,
-        "composition": None,
-        "source": str(source or _rail_station_display_name(station_code)),
-        "destination": str(destination or "—"),
-        "origin": str(source or _rail_station_display_name(station_code)),
-        "ending_at": str(destination or "—"),
-        "duration": None,
-        "days": _rr_run_days(train.get("runDays")),
-        "live": False,
-        "live_feed_available": False,
-        "stop_sequence": stop.get("sequence"),
-        "stop_type": stop.get("stopType"),
-        "data_source": source_url,
-        "data_source_type": "RailRadar API",
-    }
-
-
-def _rr_live_normalize(payload: Dict[str, Any], train_query: str) -> Dict[str, Any]:
-    """Normalize RailRadar live telemetry into a UI-friendly, station-aware payload.
-
-    RailRadar's currentLocation often contains only a stationCode. The route array
-    contains the corresponding stationName and scheduled/actual times, so enrich
-    the live response from that route instead of showing only ``RailRadar: Running``.
-    """
-    data = _rr_data(payload)
-    train = data.get("train") if isinstance(data.get("train"), dict) else {}
-    current = data.get("currentLocation") if isinstance(data.get("currentLocation"), dict) else {}
-    previous = data.get("previousHalt") if isinstance(data.get("previousHalt"), dict) else {}
-    next_halt = data.get("nextHalt") if isinstance(data.get("nextHalt"), dict) else {}
-    route = data.get("route") if isinstance(data.get("route"), list) else []
-    route = [x for x in route if isinstance(x, dict)]
-
-    def code_of(obj: Dict[str, Any]) -> Optional[str]:
-        value = obj.get("stationCode") or obj.get("code")
-        return str(value).strip().upper() if value not in (None, "") else None
-
-    def name_of(obj: Dict[str, Any]) -> Optional[str]:
-        value = obj.get("stationName") or obj.get("name")
-        return str(value).strip() if value not in (None, "") else None
-
-    def route_match(code: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not code:
-            return None
-        for stop in route:
-            if str(stop.get("stationCode") or stop.get("code") or "").strip().upper() == code:
-                return stop
-        return None
-
-    current_code = code_of(current) or code_of(previous)
-    current_route = route_match(current_code)
-    current_seq = current.get("sequence") or (current_route or {}).get("sequence")
-
-    # Route-derived station names are more reliable than exposing a bare station code.
-    current_label = name_of(current) or name_of(current_route) or name_of(previous)
-    if not current_label and current_code:
-        current_label = current_code
-
-    # Work out the previous and next actual route stops from sequence whenever
-    # possible. This avoids RailRadar payload variations around previousHalt/nextHalt.
-    previous_route = None
-    next_route = None
-    if isinstance(current_seq, (int, float)):
-        earlier = [x for x in route if isinstance(x.get("sequence"), (int, float)) and x.get("sequence") < current_seq]
-        later = [x for x in route if isinstance(x.get("sequence"), (int, float)) and x.get("sequence") > current_seq]
-        if earlier:
-            previous_route = max(earlier, key=lambda x: x.get("sequence", -1))
-        if later:
-            next_route = min(later, key=lambda x: x.get("sequence", 10**9))
-
-    previous_obj = previous_route or previous
-    next_obj = next_route or next_halt
-    previous_label = name_of(previous_obj) or code_of(previous_obj) or current_label
-    next_label = name_of(next_obj) or code_of(next_obj)
-
-    # If RailRadar's nextHalt points at the current station, prefer the next route stop.
-    if next_label and current_code and code_of(next_obj) == current_code and next_route:
-        next_obj = next_route
-        next_label = name_of(next_obj) or code_of(next_obj)
-
-    delay = data.get("delayMinutes")
-    if delay is None:
-        delay = data.get("overallDelayMinutes")
-    if delay is None and isinstance(current_route, dict):
-        delay = current_route.get("delayDeparture") or current_route.get("delayArrival")
-
-    platform = current.get("platform") or next_halt.get("platform")
-    if platform is None and isinstance(current_route, dict):
-        platform = current_route.get("platform")
-    if platform is None and isinstance(next_route, dict):
-        platform = next_route.get("platform")
-
-    # Parse a provider ISO timestamp without assuming UTC. RailRadar timestamps
-    # include +05:30 for India, so datetime.fromisoformat preserves the offset.
-    def parse_dt(value: Any) -> Optional[datetime]:
-        if value in (None, ""):
-            return None
-        try:
-            text = str(value).strip().replace("Z", "+00:00")
-            return datetime.fromisoformat(text)
-        except Exception:
-            return None
-
-    last_departure_at = None
-    if isinstance(current_route, dict):
-        last_departure_at = current_route.get("actualDeparture") or current_route.get("scheduledDeparture")
-    if not last_departure_at and isinstance(previous_route, dict):
-        last_departure_at = previous_route.get("actualDeparture") or previous_route.get("scheduledDeparture")
-    if not last_departure_at:
-        last_departure_at = data.get("lastDepartureAt")
-
-    next_eta_minutes = None
-    if isinstance(next_obj, dict):
-        eta_value = (
-            next_obj.get("expectedArrival")
-            or next_obj.get("expectedArrivalTime")
-            or next_obj.get("scheduledArrival")
-        )
-        eta_dt = parse_dt(eta_value)
-        if eta_dt is not None:
-            try:
-                if delay is not None:
-                    eta_dt = eta_dt + timedelta(minutes=float(delay))
-                now = datetime.now(eta_dt.tzinfo) if eta_dt.tzinfo else datetime.now()
-                next_eta_minutes = max(0, int(round((eta_dt - now).total_seconds() / 60.0)))
-            except Exception:
-                next_eta_minutes = None
-
-    progress = current.get("segmentProgress")
-    if progress is None:
-        progress = current.get("segment_progress")
-    try:
-        if progress is not None:
-            progress = max(0.0, min(1.0, float(progress)))
-    except Exception:
-        progress = None
-
-    status = str(data.get("status") or current.get("status") or "unknown").replace("_", " ").title()
-    is_live = bool(data.get("isLive", True))
-
-    # A live response with telemetry but no explicit isLive should still be usable.
-    if current or data.get("lastUpdatedAt"):
-        is_live = bool(data.get("isLive", True))
-
-    return {
-        "status": "success",
-        "type": "live_train",
-        "train_no": str(data.get("trainNumber") or train.get("number") or train_query),
-        "train_name": str(data.get("trainName") or train.get("name") or "Mumbai Local"),
-        "current_station": current_label,
-        "next_station": next_label,
-        "last_departure_station": previous_label,
-        "platform": str(platform) if platform is not None else None,
-        "door_side": None,
-        "delay_minutes": delay,
-        "crowd": None,
-        "status_msg": f"RailRadar: {status}" if is_live else "RailRadar has no live movement fix for this run.",
-        "live": is_live,
-        "live_feed_available": is_live,
-        "current_location": current_label,
-        "next_stop": next_label,
-        "data_source_label": "RailRadar Live Train API",
-        "last_updated_at": data.get("lastUpdatedAt"),
-        "last_departure_at": last_departure_at,
-        "next_eta_minutes": next_eta_minutes,
-        "segment_progress": progress,
-        "speed_kmh": current.get("speedKmh") or current.get("speed_kmh"),
-        "bearing_degrees": current.get("bearingDegrees") or current.get("bearing_degrees"),
-        "current_station_code": current_code,
-        "next_station_code": code_of(next_obj),
-    }
-
-
-def _rr_pnr_normalize(payload: Dict[str, Any], pnr: str) -> Dict[str, Any]:
-    data = _rr_data(payload)
-
-    def first(*keys: str) -> Any:
-        for key in keys:
-            value = data.get(key)
-            if value not in (None, ""):
-                return value
-        return None
-
-    train = data.get("train")
-    if not isinstance(train, dict):
-        train = {}
-
-    from_station = first("fromStation", "from", "source")
-    to_station = first("toStation", "to", "destination")
-
-    def station_value(value: Any) -> Any:
-        if isinstance(value, dict):
-            return value.get("name") or value.get("code")
-        return value
-
-    passengers = data.get("passengers")
-    if not isinstance(passengers, list):
-        passengers = data.get("passengerDetails")
-    if not isinstance(passengers, list):
-        passengers = []
-
-    return {
-        "status": "success",
-        "type": "pnr",
-        "pnr": str(first("pnrNumber", "pnr") or pnr),
-        "train_no": str(first("trainNumber", "trainNo") or train.get("number") or "—"),
-        "train_name": str(first("trainName") or train.get("name") or "—"),
-        "from_station": station_value(from_station) or "—",
-        "to_station": station_value(to_station) or "—",
-        "journey_date": str(first("journeyDate", "date") or "—"),
-        "booking_status": str(first("bookingStatus", "status", "chartStatus") or "Status unavailable"),
-        "status": str(first("bookingStatus", "status", "chartStatus") or "Status unavailable"),
-        "status_msg": str(first("statusMessage", "message") or "PNR status returned by RailRadar."),
-        "passengers": passengers,
-        "live": True,
-        "data_source_label": "RailRadar API",
-    }
-
-
-def _rr_route_matches_service(train: Dict[str, Any], wanted: str) -> bool:
-    wanted = str(wanted or "ALL").upper()
-    if wanted in {"", "ALL"}:
-        return True
-    service_type = str(train.get("service_type") or "").upper()
-    service = str(train.get("service") or "").upper()
-    category = str(train.get("category") or "").upper()
-    text = f"{service_type} {service} {category}"
-    if wanted == "FAST":
-        return "FAST" in text or service_type == "F"
-    if wanted == "SLOW":
-        return "SLOW" in text or service_type == "S"
-    if wanted == "AC":
-        return "AC" in text or service_type == "AC"
-    if wanted == "LADIES":
-        return "LADIES" in text or "WOMEN" in text or service_type == "LADIES"
-    return True
-
-
-async def _railradar_fetch_between(
-    from_station: str,
-    to_station: str,
-    *,
-    date_value: Optional[str] = None,
-    live: bool = False,
-) -> Dict[str, Any]:
-    from_code = str(from_station).strip().upper()
-    to_code = str(to_station).strip().upper()
-    date_value = date_value or _ist_now().strftime("%Y-%m-%d")
-
-    source_url = f"{RAILRADAR_BASE_URL}/trains/between/{urllib.parse.quote(from_code)}/{urllib.parse.quote(to_code)}"
-    cache_key = f"railradar-between|{from_code}|{to_code}|{date_value}|{live}"
-
-    if not live:
-        cached = _rail_cache_get(cache_key)
-        if cached is not None:
-            return cached
-
-    params: Dict[str, Any] = {
-        "type": "local",
-        "category": "Suburban",
-        "date": date_value,
-        "live": str(bool(live)).lower(),
-    }
-
-    status_code, payload, error = await _railradar_get(
-        f"trains/between/{urllib.parse.quote(from_code)}/{urllib.parse.quote(to_code)}",
-        params=params,
-    )
-
-    # If a provider build rejects the optional category filter, retry with the
-    # documented type=local filter alone.
-    if error and status_code == 400:
-        params.pop("category", None)
-        status_code, payload, error = await _railradar_get(
-            f"trains/between/{urllib.parse.quote(from_code)}/{urllib.parse.quote(to_code)}",
-            params=params,
-        )
-
-    data = _rr_data(payload)
-    provider_trains = data.get("trains") if isinstance(data.get("trains"), list) else []
-
-    normalized: List[Dict[str, Any]] = []
-    for item in provider_trains:
-        if not isinstance(item, dict):
-            continue
-        train = _rr_normalize_between_train(
-            item,
-            from_station=from_code,
-            to_station=to_code,
-            source_url=source_url,
-        )
-        if train:
-            normalized.append(train)
-
-    normalized.sort(key=lambda item: int(item.get("timestamp_minutes", 0)))
-
-    result = {
-        "trains": normalized,
-        "source_url": source_url,
-        "source_label": "RailRadar API",
-        "line": _rail_lines_for_station(from_code)[0] if _rail_lines_for_station(from_code) else "ALL",
-        "line_name": _rail_line_name(_rail_lines_for_station(from_code)[0]) if _rail_lines_for_station(from_code) else "Mumbai Suburban Network",
-        "from": _rail_station_display_name(from_code),
-        "to": _rail_station_display_name(to_code),
-        "date": date_value,
-        "live": live,
-        "error": error,
-        "http_status": status_code or None,
-        "provider_count": len(provider_trains),
-    }
-
-    if not live:
-        _rail_cache_set(cache_key, result)
-
-    return result
-
-
-
-async def _railradar_fetch_station_live_board(
-    station_code: str,
-    *,
-    hours: int = 2,
-) -> Dict[str, Any]:
-    """Fetch RailRadar's live station board.
-
-    This is intentionally separate from the static station timetable endpoint.
-    For a commuter board we need trains that merely HALT at the selected station
-    (for example Virar -> Churchgate trains halting at Naigaon), plus the live
-    departure/platform/delay fields supplied by RailRadar.
-    """
-    station = str(station_code).strip().upper()
-    hours = hours if hours in {2, 4, 6, 8} else 2
-    source_url = f"{RAILRADAR_BASE_URL}/stations/{urllib.parse.quote(station)}/live"
-
-    status_code, payload, error = await _railradar_get(
-        f"stations/{urllib.parse.quote(station)}/live",
-        params={
-            "hours": str(hours),
-            "includeIntermediate": "false",
-        },
-    )
-
-    data = _rr_data(payload)
-    provider_trains = data.get("trains") if isinstance(data.get("trains"), list) else []
-    normalized: List[Dict[str, Any]] = []
-
-    for item in provider_trains:
-        if not isinstance(item, dict):
-            continue
-        train_obj = item.get("train")
-        stop = item.get("stop") if isinstance(item.get("stop"), dict) else {}
-        live = item.get("live") if isinstance(item.get("live"), dict) else {}
-        if not isinstance(train_obj, dict):
-            continue
-        if not _rr_is_mumbai_local(train_obj):
-            continue
-
-        expected_raw = live.get("expectedDepartureTime") or stop.get("departure") or stop.get("arrival")
-        minute = _rr_time_minutes(expected_raw)
-        if minute is None:
-            continue
-
-        service_type, service_label = _rr_service_type(train_obj)
-        train_no = str(train_obj.get("number") or "—")
-        train_name = str(train_obj.get("name") or "Mumbai Local")
-
-        destination = train_obj.get("destination")
-        if isinstance(destination, dict):
-            destination = destination.get("name") or destination.get("code")
-        source = train_obj.get("source")
-        if isinstance(source, dict):
-            source = source.get("name") or source.get("code")
-
-        live_type = str(live.get("type") or "scheduled").strip()
-        delay = live.get("delayMinutes")
-        platform = live.get("platform")
-        status = live_type.replace("-", " ").title() if live_type else "Scheduled"
-        status_msg = f"Live: {status}"
-        if delay is not None:
-            try:
-                status_msg = f"{status} • {int(delay)} min delay"
-            except Exception:
-                pass
-
-        normalized.append({
-            "time": _rr_time_display(expected_raw),
-            "departure_time": _rr_time_display(expected_raw),
-            "scheduled_departure_time": _rr_time_display(stop.get("departure")),
-            "arrival_time": _rr_time_display(stop.get("arrival")),
-            "timestamp_minutes": minute,
-            "arrival_minutes": _rr_time_minutes(stop.get("arrival")),
-            "train_no": train_no,
-            "number": train_no,
-            "name": train_name,
-            "train_name": train_name,
-            "service_type": service_type,
-            "service": service_label,
-            "category": str(train_obj.get("category") or train_obj.get("type") or service_label),
-            "platform": str(platform) if platform is not None else None,
-            "status": status,
-            "status_msg": status_msg,
-            "delay_minutes": delay,
-            "crowd": None,
-            "door_side": None,
-            "coaches": None,
-            "coach_count": None,
-            "composition": None,
-            "source": str(source or _rail_station_display_name(station)),
-            "destination": str(destination or "—"),
-            "origin": str(source or _rail_station_display_name(station)),
-            "ending_at": str(destination or "—"),
-            "duration": None,
-            "days": _rr_run_days(train_obj.get("runDays")),
-            "live": True,
-            "live_feed_available": True,
-            "live_type": live_type,
-            "expected_departure_at": live.get("expectedDepartureTime"),
-            "stop_sequence": stop.get("sequence"),
-            "data_source": source_url,
-            "data_source_type": "RailRadar Live Station API",
-        })
-
-    normalized.sort(key=lambda item: (int(item.get("timestamp_minutes", 0)), str(item.get("train_no", ""))))
-    return {
-        "trains": normalized,
-        "source_url": source_url,
-        "source_label": "RailRadar Live Station API",
-        "station_code": station,
-        "station_name": (
-            str(data.get("station", {}).get("name"))
-            if isinstance(data.get("station"), dict) and data.get("station", {}).get("name")
-            else _rail_station_display_name(station)
-        ),
-        "error": error,
-        "http_status": status_code or None,
-        "provider_count": len(provider_trains),
-    }
-
-
-async def _railradar_fetch_station_board(
-    station_code: str,
-    *,
-    include_intermediate: bool = False,
-) -> Dict[str, Any]:
-    station = str(station_code).strip().upper()
-    source_url = f"{RAILRADAR_BASE_URL}/stations/{urllib.parse.quote(station)}/trains"
-    cache_key = f"railradar-station|{station}|{include_intermediate}"
-
-    cached = _rail_cache_get(cache_key)
-    if cached is not None:
-        return cached
-
-    status_code, payload, error = await _railradar_get(
-        f"stations/{urllib.parse.quote(station)}/trains",
-        params={"includeIntermediate": str(bool(include_intermediate)).lower()},
-    )
-
-    data = _rr_data(payload)
-    provider_trains = data.get("trains") if isinstance(data.get("trains"), list) else []
-
-    normalized: List[Dict[str, Any]] = []
-    for item in provider_trains:
-        if not isinstance(item, dict):
-            continue
-        train_obj = item.get("train")
-        if not isinstance(train_obj, dict):
-            continue
-
-        # This screen is specifically Mumbai suburban. RailRadar's station
-        # board can also contain non-suburban trains at interchange stations.
-        if not _rr_is_mumbai_local(train_obj):
-            continue
-
-        train = _rr_normalize_station_train(item, station, source_url)
-        if train:
-            normalized.append(train)
-
-    # Some provider responses may not expose an explicit "Local" type even for
-    # suburban records. Only then fall back to the returned rows rather than
-    # fabricating a classification.
-    if not normalized and provider_trains:
-        for item in provider_trains:
-            if not isinstance(item, dict):
-                continue
-            train = _rr_normalize_station_train(item, station, source_url)
-            if train:
-                normalized.append(train)
-
-    normalized.sort(
-        key=lambda item: (
-            int(item.get("timestamp_minutes", 0)),
-            str(item.get("train_no", "")),
-        )
-    )
-
-    result = {
-        "trains": normalized,
-        "source_url": source_url,
-        "source_label": "RailRadar API",
-        "station_code": station,
-        "station_name": (
-            str(data.get("station", {}).get("name"))
-            if isinstance(data.get("station"), dict) and data.get("station", {}).get("name")
-            else _rail_station_display_name(station)
-        ),
-        "error": error,
-        "http_status": status_code or None,
-        "provider_count": len(provider_trains),
-    }
-    _rail_cache_set(cache_key, result)
-    return result
-
-
-
-async def _rail_fetch_timetable(
-    line: str,
-    from_station: str,
-    to_station: str,
-    after_minutes: int,
-    before_minutes: int,
-) -> Dict[str, Any]:
-    """
-    Compatibility wrapper for the existing interchange engine.
-
-    The old implementation scraped a public timetable website. It is now
-    backed by RailRadar while preserving the same normalized return shape.
-    """
-    result = await _railradar_fetch_between(
-        from_station=from_station,
-        to_station=to_station,
-        date_value=_ist_now().strftime("%Y-%m-%d"),
-        live=False,
-    )
-
-    trains = []
-    for train in result.get("trains", []):
-        minute = train.get("timestamp_minutes")
-        if minute is None:
-            continue
-        minute = int(minute) % 1440
-        start = int(after_minutes) % 1440
-        end = int(before_minutes) % 1440
-        if start <= end:
-            in_window = start <= minute <= end
-        else:
-            in_window = minute >= start or minute <= end
-        if in_window:
-            item = dict(train)
-            item["line"] = line
-            item["line_name"] = _rail_line_name(line)
-            trains.append(item)
-
-    return {
-        **result,
-        "trains": trains,
-        "line": line,
-        "line_name": _rail_line_name(line),
-    }
-
-
-@app.get("/api/v1/railradar-test")
-async def railradar_test(
-    date: Optional[str] = Query(None),
-    live: bool = Query(False),
-):
-    """Server-side RailRadar connectivity diagnostic for NIG -> CCG."""
-    if not RAILRADAR_API_KEY:
-        return {
-            "status": "error",
-            "railradar_configured": False,
-            "message": "RAILRADAR_API_KEY is not configured on the backend.",
-        }
-
-    test_date = (date or _ist_now().strftime("%Y-%m-%d")).strip()
-    result = await _railradar_fetch_between(
-        "NIG",
-        "CCG",
-        date_value=test_date,
-        live=live,
-    )
-
-    return {
-        "status": "success" if not result.get("error") else "error",
-        "railradar_configured": True,
-        "railradar_reachable": result.get("http_status") is not None,
-        "http_status": result.get("http_status"),
-        "endpoint_tested": result.get("source_url"),
-        "route": "NIG -> CCG",
-        "date": test_date,
-        "live": live,
-        "train_count": len(result.get("trains", [])),
-        "provider_count": result.get("provider_count", 0),
-        "error": result.get("error"),
-        "provider_normalized_trains": result.get("trains", [])[:20],
-    }
-
-
 @app.post("/api/v1/railway-inquiry")
 async def railway_inquiry(request: Request):
     """
-    Backward-compatible Omni Rail gateway.
+    Backward-compatible railway gateway.
 
-    Flutter continues to call /api/v1/railway-inquiry. RailRadar stays behind
-    this server endpoint; the API key is never embedded in the app.
+    Supported query_type values:
+      - station_board
+      - route_search
+      - live_train
+      - pnr
+
+    The Flutter client can continue using the same endpoint and payload shape.
     """
+
     try:
         content_type = request.headers.get("content-type", "").lower()
 
@@ -6464,22 +4388,10 @@ async def railway_inquiry(request: Request):
 
         normalized_type = query_type.strip().lower()
 
-        if not RAILRADAR_API_KEY:
-            return {
-                "status": "error",
-                "type": normalized_type,
-                "message": "Railway service is not configured on the backend. Add RAILRADAR_API_KEY in Render.",
-                "trains": [],
-            }
-
         # ----------------------------- ROUTE SEARCH -----------------------------
         if normalized_type == "route_search":
             try:
-                route_payload = (
-                    query_value
-                    if isinstance(query_value, dict)
-                    else json.loads(str(query_value)) if query_value else {}
-                )
+                route_payload = json.loads(str(query_value)) if query_value else {}
             except Exception:
                 route_payload = {}
 
@@ -6487,15 +4399,15 @@ async def railway_inquiry(request: Request):
                 route_payload.get("from")
                 or route_payload.get("source")
                 or route_payload.get("from_station")
-                or "NIG"
-            ).strip().upper()
+                or "BSR"
+            ).strip()
 
             to_station = str(
                 route_payload.get("to")
                 or route_payload.get("destination")
                 or route_payload.get("to_station")
-                or "CCG"
-            ).strip().upper()
+                or "DDR"
+            ).strip()
 
             requested_line = str(route_payload.get("line") or "ALL").upper()
             requested_service = str(route_payload.get("service") or "ALL").upper()
@@ -6514,124 +4426,52 @@ async def railway_inquiry(request: Request):
                 requested_line,
             )
 
-            # Direct RailRadar route search. For Mumbai suburban pairs this is
-            # the authoritative provider response and avoids the old HTML source.
             if direct_line and not line_error:
-                # A commuter route must include trains that ORIGINATE elsewhere
-                # but HALT at the selected origin station (e.g. Virar -> Churchgate
-                # when the user selects Naigaon). The live station-board endpoint
-                # is the correct source for that use case.
-                station_live = await _railradar_fetch_station_live_board(
+                now = datetime.now()
+                start_min = now.hour * 60 + now.minute
+                window_end = min(start_min + 180, 1439)
+
+                result = await _rail_fetch_timetable(
+                    direct_line,
                     from_station,
-                    hours=2,
+                    to_station,
+                    start_min,
+                    window_end,
                 )
-                station_trains = station_live.get("trains", [])
 
-                destination_norm = _rail_normalize(to_station)
-                trains = []
-                for train in station_trains:
-                    destination = _rail_normalize(str(train.get("destination") or ""))
-                    ending_at = _rail_normalize(str(train.get("ending_at") or ""))
-                    if destination_norm and destination_norm not in destination and destination_norm not in ending_at:
-                        # For Churchgate/CCG, allow the exact code/name variants.
-                        if to_station == "CCG" and "CHURCHGATE" not in f"{destination} {ending_at}" and "CCG" not in f"{destination} {ending_at}":
-                            continue
-                        elif to_station != "CCG":
-                            continue
-                    if _rr_route_matches_service(train, requested_service):
-                        trains.append(train)
-
-                result = {
-                    **station_live,
-                    "trains": trains,
-                    "source_url": station_live.get("source_url"),
-                    "source_label": "RailRadar Live Station API",
-                    "from": _rail_station_display_name(from_station),
-                    "to": _rail_station_display_name(to_station),
-                    "date": _ist_now().strftime("%Y-%m-%d"),
-                    "live": True,
-                }
-
-                if result.get("error") and not result.get("trains"):
-                    return {
-                        "status": "error",
-                        "type": "route_search",
-                        "station_code": from_station,
-                        "station_name": _rail_station_display_name(from_station),
-                        "from": _rail_station_display_name(from_station),
-                        "to": _rail_station_display_name(to_station),
-                        "line": direct_line,
-                        "line_name": _rail_line_name(direct_line),
-                        "trains": [],
-                        "route_search": True,
-                        "requires_interchange": False,
-                        "service_filter": requested_service,
-                        "message": str(result.get("error")),
-                        "source_error": str(result.get("error")),
-                        "data_source_label": "RailRadar API",
-                    }
-
-                trains = [
-                    train
-                    for train in result.get("trains", [])
-                    if _rr_route_matches_service(train, requested_service)
-                ]
-
-                # The Flutter planner sends the requested clock time. Respect it
-                # instead of silently replacing it with the server's current time.
-                requested_minutes = route_payload.get("time_minutes")
-                try:
-                    requested_minutes = int(requested_minutes) if requested_minutes is not None else None
-                except Exception:
-                    requested_minutes = None
-
-                if requested_minutes is None:
-                    requested_minutes = _ist_now().hour * 60 + _ist_now().minute
-
-                window_start = max(0, requested_minutes - 60)
-                window_end = min(1439, requested_minutes + 120)
-
-                around_time = [
-                    train
-                    for train in trains
-                    if window_start <= int(train.get("timestamp_minutes", 0)) <= window_end
-                ]
-
-                # If the requested time is near a boundary or provider has only
-                # a sparse result set, retain the full provider result rather than
-                # displaying an empty board.
-                display_trains = around_time or trains
+                trains = _rail_filter_trains(
+                    list(result.get("trains", [])),
+                    requested_service,
+                )
 
                 return {
                     "status": "success",
                     "type": "route_search",
-                    "station_code": from_station,
+                    "station_code": str(from_station).upper(),
                     "station_name": _rail_station_display_name(from_station),
                     "from": _rail_station_display_name(from_station),
                     "to": _rail_station_display_name(to_station),
                     "line": direct_line,
                     "line_name": _rail_line_name(direct_line),
-                    "trains": display_trains[:100],
+                    "trains": trains,
                     "route_search": True,
                     "requires_interchange": False,
                     "service_filter": requested_service,
-                    "requested_time": _rail_minutes_to_12h(requested_minutes),
-                    "window_start": _rail_minutes_to_12h(window_start),
-                    "window_end": _rail_minutes_to_12h(window_end),
-                    "current_time": _rail_minutes_to_12h(
-                        _ist_now().hour * 60 + _ist_now().minute
+                    "current_time": _rail_minutes_to_12h(start_min),
+                    "timetable_version": result.get(
+                        "timetable_version",
+                        RAILWAY_TIMETABLE_VERSIONS.get(direct_line, "Unknown"),
                     ),
                     "data_source": result.get("source_url"),
-                    "data_source_label": "RailRadar API",
+                    "data_source_label": RAILWAY_REFERENCE_LABEL,
                     "source_notice": (
-                        "Scheduled Mumbai suburban timetable data is supplied by RailRadar. "
-                        "Live delay/platform values are shown only when a live RailRadar field is present."
+                        "Timetable values are from a public timetable reference; "
+                        "they are scheduled values, not a live delay feed."
                     ),
                     "source_error": result.get("error"),
                 }
 
-            # Cross-line journeys retain the existing Omni Rail interchange
-            # algorithm, but its underlying timetable fetch now uses RailRadar.
+            # Try an interchange journey when the selected stations span lines.
             from_lines = _rail_lines_for_station(from_station)
             to_lines = _rail_lines_for_station(to_station)
 
@@ -6650,11 +4490,12 @@ async def railway_inquiry(request: Request):
                 cross_line["type"] = "route_search"
                 cross_line["route_search"] = True
                 cross_line["current_time"] = _rail_minutes_to_12h(
-                    _ist_now().hour * 60 + _ist_now().minute
+                    datetime.now().hour * 60 + datetime.now().minute
                 )
-                cross_line["data_source_label"] = "RailRadar API"
+                cross_line["data_source_label"] = RAILWAY_REFERENCE_LABEL
                 cross_line["source_notice"] = (
-                    "Connected journeys are assembled from RailRadar scheduled timetable entries."
+                    "Connected journeys are assembled from scheduled public timetable "
+                    "entries; connection times are timetable-based, not live platform data."
                 )
                 return cross_line
 
@@ -6667,7 +4508,8 @@ async def railway_inquiry(request: Request):
 
         # ----------------------------- STATION BOARD -----------------------------
         if normalized_type == "station_board":
-            station = str(query_value or "NIG").strip().upper()
+            station = str(query_value or "BSR").strip().upper()
+            station_name = _rail_station_display_name(station)
             station_lines = _rail_lines_for_station(station)
 
             if not station_lines:
@@ -6675,56 +4517,94 @@ async def railway_inquiry(request: Request):
                     "status": "error",
                     "type": "station_board",
                     "station_code": station,
-                    "station_name": _rail_station_display_name(station),
+                    "station_name": station_name,
                     "message": "Station not found in the Omni Rail station directory.",
                     "trains": [],
                 }
 
-            # Use RailRadar's live station board for the visible commuter board.
-            # The static timetable endpoint is retained for compatibility elsewhere.
-            result = await _railradar_fetch_station_live_board(station, hours=2)
-            trains = list(result.get("trains", []))
+            now = datetime.now()
+            current_min = now.hour * 60 + now.minute
+            board_start = 3 * 60 + 30
+            board_end = 23 * 60 + 59
 
-            current = _ist_now()
-            current_min = current.hour * 60 + current.minute
+            all_trains: List[Dict[str, Any]] = []
+            source_urls: List[str] = []
+            source_errors: List[str] = []
 
-            # De-duplicate provider rows.
-            seen = set()
-            deduped: List[Dict[str, Any]] = []
-            for train in trains:
-                key = (
-                    str(train.get("train_no")),
-                    int(train.get("timestamp_minutes", -1)),
-                    str(train.get("destination")),
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(train)
+            # A station can be an interchange (e.g. Dadar / Kurla / CSMT).
+            # Return both line boards rather than silently selecting one.
+            unique_line_set: List[str] = []
+            for line in station_lines:
+                if line not in unique_line_set:
+                    unique_line_set.append(line)
 
-            deduped.sort(
+            for line in unique_line_set:
+                targets = _rail_default_board_targets(station, line)
+
+                for target in targets:
+                    target_name = _rail_station_name_from_slug(target)
+                    if _rail_normalize(target_name) == _rail_normalize(station_name):
+                        continue
+
+                    result = await _rail_fetch_timetable(
+                        line=line,
+                        from_station=station,
+                        to_station=target_name,
+                        after_minutes=board_start,
+                        before_minutes=board_end,
+                    )
+
+                    source_url = result.get("source_url")
+                    if source_url:
+                        source_urls.append(source_url)
+
+                    if result.get("error"):
+                        source_errors.append(str(result["error"]))
+
+                    for train in result.get("trains", []):
+                        item = dict(train)
+                        item["line"] = line
+                        item["line_name"] = _rail_line_name(line)
+                        item["direction"] = target_name
+                        all_trains.append(item)
+
+            # Apply service-independent chronological ordering.
+            all_trains.sort(
                 key=lambda item: (
                     int(item.get("timestamp_minutes", 0)),
                     str(item.get("train_no", "")),
                 )
             )
 
-            upcoming = [
-                train
-                for train in deduped
-                if int(train.get("timestamp_minutes", 0)) >= current_min
-            ][:12]
+            # De-duplicate identical rows coming from overlapping direction searches.
+            seen = set()
+            deduped = []
+            for train in all_trains:
+                key = (
+                    str(train.get("train_no")),
+                    int(train.get("timestamp_minutes", -1)),
+                    str(train.get("destination")),
+                    str(train.get("line")),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(train)
 
-            unique_line_set: List[str] = []
-            for line in station_lines:
-                if line not in unique_line_set:
-                    unique_line_set.append(line)
+            # Keep the complete day schedule practical for mobile JSON responses,
+            # while preserving enough rows for the "next trains" experience.
+            deduped = deduped[:450]
+
+            upcoming = [
+                t for t in deduped
+                if int(t.get("timestamp_minutes", 0)) >= current_min
+            ][:12]
 
             return {
                 "status": "success",
                 "type": "station_board",
                 "station_code": station,
-                "station_name": result.get("station_name") or _rail_station_display_name(station),
+                "station_name": station_name,
                 "line": unique_line_set[0] if len(unique_line_set) == 1 else "ALL",
                 "line_name": (
                     _rail_line_name(unique_line_set[0])
@@ -6734,16 +4614,21 @@ async def railway_inquiry(request: Request):
                 "lines": unique_line_set,
                 "line_names": [_rail_line_name(line) for line in unique_line_set],
                 "current_time": _rail_minutes_to_12h(current_min),
-                "board_window": "Full scheduled day",
-                "trains": deduped[:450],
+                "board_window": "03:30 AM – 11:59 PM",
+                "trains": deduped,
                 "next_trains": upcoming,
                 "train_count": len(deduped),
-                "source_urls": [result.get("source_url")] if result.get("source_url") else [],
-                "source_errors": [str(result.get("error"))] if result.get("error") else [],
-                "source_label": "RailRadar API",
+                "source_urls": sorted(set(source_urls)),
+                "source_errors": sorted(set(source_errors))[:5],
+                "source_label": RAILWAY_REFERENCE_LABEL,
+                "timetable_versions": {
+                    line: RAILWAY_TIMETABLE_VERSIONS.get(line, "Unknown")
+                    for line in unique_line_set
+                },
                 "source_notice": (
-                    "Mumbai suburban scheduled timetable data is supplied by RailRadar. "
-                    "Platform and delay values are left empty unless a live provider field supplies them."
+                    "Scheduled timetable data is shown from a public Mumbai suburban "
+                    "timetable reference. Platform, delay, door-side and crowd values "
+                    "are not invented when no live feed exists."
                 ),
                 "station_directory": [
                     {
@@ -6752,47 +4637,51 @@ async def railway_inquiry(request: Request):
                         "line": data["line"],
                     }
                     for code, data in RAILWAY_STATIONS.items()
-                    if _rail_normalize(data["name"])
-                    == _rail_normalize(result.get("station_name") or _rail_station_display_name(station))
+                    if _rail_normalize(data["name"]) == _rail_normalize(station_name)
                 ],
             }
 
         # ----------------------------- LIVE TRAIN -----------------------------
         if normalized_type == "live_train":
-            train_query = re.sub(r"\D", "", str(query_value or ""))
-            if len(train_query) < 4 or len(train_query) > 6:
+            train_query = str(query_value or "").strip()
+
+            if not train_query:
                 return {
                     "status": "error",
                     "type": "live_train",
-                    "message": "Enter the train number shown in the Omni Rail timetable.",
+                    "message": "Enter a train number or timetable train code.",
                 }
 
-            status_code, payload, error = await _railradar_get(
-                f"trains/{urllib.parse.quote(train_query)}/live",
-                params={
-                    "authoritative": "true",
-                    "haltsOnly": "true",
-                },
-            )
-
-            if error:
-                return {
-                    "status": "error",
-                    "type": "live_train",
-                    "train_no": train_query,
-                    "message": str(error),
-                    "status_msg": str(error),
-                    "live": False,
-                    "live_feed_available": False,
-                    "data_source_label": "RailRadar API",
-                    "http_status": status_code or None,
-                }
-
-            return _rr_live_normalize(payload, train_query)
+            # We deliberately return a truthful response here.  The timetable
+            # source does not provide real-time movement/delay data.
+            return {
+                "status": "success",
+                "type": "live_train",
+                "train_no": train_query,
+                "train_name": "Mumbai Suburban Local",
+                "current_station": None,
+                "next_station": None,
+                "platform": None,
+                "door_side": None,
+                "delay_minutes": None,
+                "crowd": None,
+                "status_msg": (
+                    "Live movement data is not available from the current no-key "
+                    "railway source. Use the Mumbai Local timetable for scheduled stops."
+                ),
+                "live": False,
+                "live_feed_available": False,
+                "message": (
+                    "Omni Rail will display live location/delay/platform information "
+                    "only when an authorized or genuinely live feed is connected."
+                ),
+                "data_source_label": RAILWAY_REFERENCE_LABEL,
+            }
 
         # ----------------------------- PNR -----------------------------
         if normalized_type == "pnr":
             pnr = re.sub(r"\D", "", str(query_value or ""))
+
             if len(pnr) != 10:
                 return {
                     "status": "error",
@@ -6800,23 +4689,23 @@ async def railway_inquiry(request: Request):
                     "message": "PNR must contain exactly 10 digits.",
                 }
 
-            status_code, payload, error = await _railradar_get(
-                f"pnr/{urllib.parse.quote(pnr)}"
-            )
-
-            if error:
-                return {
-                    "status": "error",
-                    "type": "pnr",
-                    "pnr": pnr,
-                    "message": str(error),
-                    "status_msg": str(error),
-                    "live": False,
-                    "data_source_label": "RailRadar API",
-                    "http_status": status_code or None,
-                }
-
-            return _rr_pnr_normalize(payload, pnr)
+            return {
+                "status": "success",
+                "type": "pnr",
+                "pnr": pnr,
+                "train_no": None,
+                "train_name": None,
+                "from_station": None,
+                "to_station": None,
+                "journey_date": None,
+                "booking_status": "Live PNR lookup unavailable",
+                "status_msg": (
+                    "This backend does not have an authorized live PNR feed. "
+                    "Please verify the PNR through an official railway service."
+                ),
+                "live": False,
+                "data_source_label": "Official railway PNR service required",
+            }
 
         return {
             "status": "error",
@@ -6826,14 +4715,11 @@ async def railway_inquiry(request: Request):
         }
 
     except Exception as exc:
-        print(f"[Omni Rail] railway_inquiry error: {type(exc).__name__}: {exc}")
         return {
             "status": "error",
             "message": f"Railway inquiry error: {exc}",
             "trains": [],
         }
-
-# -------------------------------------------------------------
 
 # -------------------------------------------------------------
 
