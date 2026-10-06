@@ -5250,35 +5250,130 @@ def _rr_normalize_station_train(
 
 
 def _rr_live_normalize(payload: Dict[str, Any], train_query: str) -> Dict[str, Any]:
+    """Normalize RailRadar live telemetry into a UI-friendly, station-aware payload.
+
+    RailRadar's currentLocation often contains only a stationCode. The route array
+    contains the corresponding stationName and scheduled/actual times, so enrich
+    the live response from that route instead of showing only ``RailRadar: Running``.
+    """
     data = _rr_data(payload)
     train = data.get("train") if isinstance(data.get("train"), dict) else {}
     current = data.get("currentLocation") if isinstance(data.get("currentLocation"), dict) else {}
     previous = data.get("previousHalt") if isinstance(data.get("previousHalt"), dict) else {}
     next_halt = data.get("nextHalt") if isinstance(data.get("nextHalt"), dict) else {}
+    route = data.get("route") if isinstance(data.get("route"), list) else []
+    route = [x for x in route if isinstance(x, dict)]
 
-    def station_label(obj: Dict[str, Any]) -> Optional[str]:
-        return str(obj.get("stationName") or obj.get("stationCode") or "").strip() or None
+    def code_of(obj: Dict[str, Any]) -> Optional[str]:
+        value = obj.get("stationCode") or obj.get("code")
+        return str(value).strip().upper() if value not in (None, "") else None
+
+    def name_of(obj: Dict[str, Any]) -> Optional[str]:
+        value = obj.get("stationName") or obj.get("name")
+        return str(value).strip() if value not in (None, "") else None
+
+    def route_match(code: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not code:
+            return None
+        for stop in route:
+            if str(stop.get("stationCode") or stop.get("code") or "").strip().upper() == code:
+                return stop
+        return None
+
+    current_code = code_of(current) or code_of(previous)
+    current_route = route_match(current_code)
+    current_seq = current.get("sequence") or (current_route or {}).get("sequence")
+
+    # Route-derived station names are more reliable than exposing a bare station code.
+    current_label = name_of(current) or name_of(current_route) or name_of(previous)
+    if not current_label and current_code:
+        current_label = current_code
+
+    # Work out the previous and next actual route stops from sequence whenever
+    # possible. This avoids RailRadar payload variations around previousHalt/nextHalt.
+    previous_route = None
+    next_route = None
+    if isinstance(current_seq, (int, float)):
+        earlier = [x for x in route if isinstance(x.get("sequence"), (int, float)) and x.get("sequence") < current_seq]
+        later = [x for x in route if isinstance(x.get("sequence"), (int, float)) and x.get("sequence") > current_seq]
+        if earlier:
+            previous_route = max(earlier, key=lambda x: x.get("sequence", -1))
+        if later:
+            next_route = min(later, key=lambda x: x.get("sequence", 10**9))
+
+    previous_obj = previous_route or previous
+    next_obj = next_route or next_halt
+    previous_label = name_of(previous_obj) or code_of(previous_obj) or current_label
+    next_label = name_of(next_obj) or code_of(next_obj)
+
+    # If RailRadar's nextHalt points at the current station, prefer the next route stop.
+    if next_label and current_code and code_of(next_obj) == current_code and next_route:
+        next_obj = next_route
+        next_label = name_of(next_obj) or code_of(next_obj)
 
     delay = data.get("delayMinutes")
+    if delay is None:
+        delay = data.get("overallDelayMinutes")
+    if delay is None and isinstance(current_route, dict):
+        delay = current_route.get("delayDeparture") or current_route.get("delayArrival")
+
     platform = current.get("platform") or next_halt.get("platform")
+    if platform is None and isinstance(current_route, dict):
+        platform = current_route.get("platform")
+    if platform is None and isinstance(next_route, dict):
+        platform = next_route.get("platform")
 
-    # Some responses expose platform only inside route entries.
-    if platform is None:
-        route = data.get("route")
-        if isinstance(route, list):
-            for stop in route:
-                if not isinstance(stop, dict):
-                    continue
-                if str(stop.get("stationCode") or "") == str(current.get("stationCode") or ""):
-                    platform = stop.get("platform")
-                    if platform is not None:
-                        break
+    # Parse a provider ISO timestamp without assuming UTC. RailRadar timestamps
+    # include +05:30 for India, so datetime.fromisoformat preserves the offset.
+    def parse_dt(value: Any) -> Optional[datetime]:
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(text)
+        except Exception:
+            return None
 
-    current_label = station_label(current) or station_label(previous)
-    next_label = station_label(next_halt)
+    last_departure_at = None
+    if isinstance(current_route, dict):
+        last_departure_at = current_route.get("actualDeparture") or current_route.get("scheduledDeparture")
+    if not last_departure_at and isinstance(previous_route, dict):
+        last_departure_at = previous_route.get("actualDeparture") or previous_route.get("scheduledDeparture")
+    if not last_departure_at:
+        last_departure_at = data.get("lastDepartureAt")
+
+    next_eta_minutes = None
+    if isinstance(next_obj, dict):
+        eta_value = (
+            next_obj.get("expectedArrival")
+            or next_obj.get("expectedArrivalTime")
+            or next_obj.get("scheduledArrival")
+        )
+        eta_dt = parse_dt(eta_value)
+        if eta_dt is not None:
+            try:
+                if delay is not None:
+                    eta_dt = eta_dt + timedelta(minutes=float(delay))
+                now = datetime.now(eta_dt.tzinfo) if eta_dt.tzinfo else datetime.now()
+                next_eta_minutes = max(0, int(round((eta_dt - now).total_seconds() / 60.0)))
+            except Exception:
+                next_eta_minutes = None
+
+    progress = current.get("segmentProgress")
+    if progress is None:
+        progress = current.get("segment_progress")
+    try:
+        if progress is not None:
+            progress = max(0.0, min(1.0, float(progress)))
+    except Exception:
+        progress = None
 
     status = str(data.get("status") or current.get("status") or "unknown").replace("_", " ").title()
     is_live = bool(data.get("isLive", True))
+
+    # A live response with telemetry but no explicit isLive should still be usable.
+    if current or data.get("lastUpdatedAt"):
+        is_live = bool(data.get("isLive", True))
 
     return {
         "status": "success",
@@ -5287,20 +5382,25 @@ def _rr_live_normalize(payload: Dict[str, Any], train_query: str) -> Dict[str, A
         "train_name": str(data.get("trainName") or train.get("name") or "Mumbai Local"),
         "current_station": current_label,
         "next_station": next_label,
+        "last_departure_station": previous_label,
         "platform": str(platform) if platform is not None else None,
         "door_side": None,
         "delay_minutes": delay,
         "crowd": None,
         "status_msg": f"RailRadar: {status}" if is_live else "RailRadar has no live movement fix for this run.",
-        "status": status,
         "live": is_live,
         "live_feed_available": is_live,
         "current_location": current_label,
         "next_stop": next_label,
-        "data_source_label": "RailRadar API",
+        "data_source_label": "RailRadar Live Train API",
         "last_updated_at": data.get("lastUpdatedAt"),
-        "speed_kmh": current.get("speedKmh"),
-        "bearing_degrees": current.get("bearingDegrees"),
+        "last_departure_at": last_departure_at,
+        "next_eta_minutes": next_eta_minutes,
+        "segment_progress": progress,
+        "speed_kmh": current.get("speedKmh") or current.get("speed_kmh"),
+        "bearing_degrees": current.get("bearingDegrees") or current.get("bearing_degrees"),
+        "current_station_code": current_code,
+        "next_station_code": code_of(next_obj),
     }
 
 
