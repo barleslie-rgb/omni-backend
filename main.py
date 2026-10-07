@@ -870,8 +870,9 @@ async def _attach_wikimedia_images(
 
 
 async def _google_text_search(query: str, max_result_count: int = 10) -> List[Dict[str, Any]]:
-    global _google_places_disabled
-    if _google_places_disabled or not GOOGLE_PLACES_API_KEY:
+    # Never permanently disable Google after one provider error.
+    if not GOOGLE_PLACES_API_KEY:
+        print('[Google Places Notice] GOOGLE_PLACES_API_KEY is not configured on the backend.')
         return []
 
     endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
@@ -890,6 +891,8 @@ async def _google_text_search(query: str, max_result_count: int = 10) -> List[Di
         "places.userRatingCount",
         "places.regularOpeningHours",
         "places.photos",
+        "places.nationalPhoneNumber",
+        "places.internationalPhoneNumber",
     ])
     payload = {
         "textQuery": query,
@@ -908,10 +911,8 @@ async def _google_text_search(query: str, max_result_count: int = 10) -> List[Di
                 json=payload,
             )
         if response.status_code != 200:
-            if response.status_code in {401, 403} or "PERMISSION_DENIED" in response.text:
-                _google_places_disabled = True
-                print("[Google Places Fallback] Places API is unavailable/unauthorized; switching Destination Explorer to open-data providers.")
-            print(f"[Google Places Notice] {response.status_code}: {response.text[:300]}")
+            detail = response.text[:800]
+            print(f"[Google Places Notice] HTTP {response.status_code}: {detail}")
             return []
         data = response.json()
         return data.get("places", []) or []
@@ -4020,7 +4021,7 @@ def _community_google_place_to_row(place: Dict[str, Any], city: str, category: s
         "hours": (place.get("regularOpeningHours") or {}).get("weekdayDescriptions") or [],
         "maps_url": str(place.get("googleMapsUri") or ""),
         "website_url": str(place.get("websiteUri") or ""),
-        "contact_phone": "",
+        "contact_phone": str(place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber") or ""),
         "image_url": image_urls[0] if image_urls else "",
         "photos": image_urls,
         "google_photo_names": photos,
@@ -4034,6 +4035,97 @@ def _community_google_place_to_row(place: Dict[str, Any], city: str, category: s
         "booking": {},
     }
     return row
+
+async def _search_open_community_places(
+    city: str, query_text: str, category: str = "All", limit: int = 10
+) -> List[Dict[str, Any]]:
+    clean_city, clean_query = city.strip(), query_text.strip()
+    if not clean_city or not clean_query:
+        return []
+    destination = await _resolve_destination_with_open_data(clean_city, "", "India")
+    if not destination:
+        return []
+    lat, lng = float(destination["latitude"]), float(destination["longitude"])
+    safe_regex = re.escape(clean_query)
+    query = f'''
+[out:json][timeout:20];
+(
+  nwr(around:15000,{lat},{lng})["name"~"{safe_regex}",i];
+);
+out center tags;
+'''
+    try:
+        async with _overpass_semaphore:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=8.0)) as client:
+                response = await client.post(
+                    OVERPASS_API_URL, data={"data": query},
+                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
+                )
+        if response.status_code != 200:
+            print(f"[Community Open Data Notice] Overpass HTTP {response.status_code}: {response.text[:500]}")
+            return []
+        elements = (response.json() or {}).get("elements") or []
+        rows, seen = [], set()
+        def tag(tags, key): return str(tags.get(key) or "").strip()
+        for element in elements:
+            tags = element.get("tags") or {}
+            name = tag(tags, "name")
+            if not name or name.lower() in seen:
+                continue
+            if element.get("lat") is not None and element.get("lon") is not None:
+                item_lat, item_lng = float(element["lat"]), float(element["lon"])
+            else:
+                center = element.get("center") or {}
+                if center.get("lat") is None or center.get("lon") is None:
+                    continue
+                item_lat, item_lng = float(center["lat"]), float(center["lon"])
+            amenity, shop = tag(tags, "amenity"), tag(tags, "shop")
+            tourism, leisure, healthcare = tag(tags, "tourism"), tag(tags, "leisure"), tag(tags, "healthcare")
+            category_text = " ".join(x for x in [amenity, shop, tourism, leisure, healthcare] if x)
+            mapped_category = _community_google_category(
+                {"primaryType": category_text, "primaryTypeDisplayName": {"text": category_text}, "types": [amenity, shop, tourism, leisure, healthcare]}, category
+            )
+            address = ", ".join(x for x in [tag(tags,"addr:housenumber"), tag(tags,"addr:street"), tag(tags,"addr:suburb"), tag(tags,"addr:city"), tag(tags,"addr:postcode")] if x) or clean_city
+            osm_id = f"osm:{element.get('type','')}/{element.get('id','')}"
+            maps_url = f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}"
+            image = tag(tags, "image")
+            rows.append({
+                "id": osm_id, "source": "OPENSTREETMAP", "provider": "OpenStreetMap", "google_place_id": "",
+                "name": name, "category": mapped_category, "subcategory": category_text, "address": address, "city": clean_city,
+                "latitude": item_lat, "longitude": item_lng, "rating": None, "review_count": None, "open_now": None,
+                "hours": [tag(tags,"opening_hours")] if tag(tags,"opening_hours") else [], "maps_url": maps_url,
+                "website_url": tag(tags,"website") or tag(tags,"contact:website"), "contact_phone": tag(tags,"phone") or tag(tags,"contact:phone"),
+                "image_url": image, "photos": [image] if image else [], "google_photo_names": [], "upvotes": 0, "community_endorsements": 0,
+                "community_tags": [], "must_try_tip": "", "contributor_name": "OpenStreetMap",
+                "community_notice": "OpenStreetMap result — verify current details before submitting.", "providers": {}, "booking": {},
+                "data_state": "VERIFIED_OPEN_DATA", "attribution_required": "OpenStreetMap",
+            })
+            seen.add(name.lower())
+            if len(rows) >= max(1, min(limit,20)): break
+        return rows
+    except Exception as exc:
+        print(f"[Community Open Data Notice] {exc}")
+        return []
+
+@app.get("/api/v1/community/place-discovery/search")
+async def discover_community_place(
+    city: str = Query(...), q: str = Query(...), category: str = Query("All"), limit: int = Query(10, ge=1, le=20)
+):
+    clean_city, clean_q = city.strip(), q.strip()
+    requested_category = category.strip() or "All"
+    if not clean_q:
+        return {"status":"success","provider":"NONE","google_live":False,"places":[]}
+    category_hint = COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "")
+    google_query = " ".join(x for x in [clean_q, category_hint, clean_city] if x).strip()
+    google_places = await _google_text_search(google_query, max_result_count=limit)
+    if google_places:
+        rows = [_community_google_place_to_row(p, clean_city, requested_category) for p in google_places]
+        for row in rows:
+            row["provider"] = "Google Places"; row["data_state"] = "VERIFIED"
+        return {"status":"success","provider":"GOOGLE","google_live":True,"city":clean_city,"places":rows}
+    open_rows = await _search_open_community_places(clean_city, clean_q, requested_category, limit)
+    return {"status":"success","provider":"OPENSTREETMAP" if open_rows else "NONE","google_live":False,"city":clean_city,"places":open_rows}
+
 
 def _merge_community_place_with_google(community: Dict[str, Any], google: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     row = dict(community)
@@ -4076,6 +4168,8 @@ async def search_community_places(
 
     google_places = await _google_text_search(google_query, max_result_count=min(limit, 20))
     google_rows = [_community_google_place_to_row(p, clean_city, requested_category) for p in google_places]
+    if not google_rows and search_term:
+        google_rows = await _search_open_community_places(clean_city, search_term, requested_category, min(limit, 20))
 
     community_rows: List[Dict[str, Any]] = []
     if supabase:
