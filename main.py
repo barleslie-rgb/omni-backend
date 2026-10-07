@@ -4039,22 +4039,26 @@ def _community_google_place_to_row(place: Dict[str, Any], city: str, category: s
     return row
 
 def _community_open_category(raw: str, requested: str = "All") -> str:
-    if requested and requested != "All":
-        return requested
+    """Map real OSM tags to the app's detailed display categories.
+
+    The requested UI filter is deliberately NOT returned blindly here. The old
+    implementation returned "Food" for every OSM result whenever Food was
+    selected, which is why roads/highways could appear as food places.
+    """
     text = str(raw or "").lower()
-    if any(x in text for x in ["pharmacy", "chemist", "drugstore", "healthcare"]):
+    if any(x in text for x in ["pharmacy", "chemist", "drugstore"]):
         return "Pharmacy / Chemist"
     if any(x in text for x in ["barber", "hair", "beauty", "salon"]):
         return "Barber & Salon"
     if any(x in text for x in ["grocery", "supermarket", "convenience", "general store"]):
         return "General Store / Supermarket"
-    if "bakery" in text or "pastry" in text or "sweet" in text:
+    if "bakery" in text or "pastry" in text or "sweet" in text or "confectionery" in text:
         return "Bakery & Sweets"
     if "ice_cream" in text or "ice cream" in text or "dairy" in text:
         return "Ice Cream & Dairy"
     if any(x in text for x in ["seafood", "fish", "diner"]):
         return "Diner & Seafood"
-    if any(x in text for x in ["restaurant", "food", "meal", "fast_food"]):
+    if any(x in text for x in ["restaurant", "food", "meal", "fast_food", "food_court"]):
         return "Bar & Restaurant"
     if any(x in text for x in ["cafe", "coffee", "tea", "chai", "snack"]):
         return "Chai & Quick Bites"
@@ -4064,11 +4068,34 @@ def _community_open_category(raw: str, requested: str = "All") -> str:
         return "Movie Cinema & Theater"
     if any(x in text for x in ["park", "garden", "beach", "picnic", "sports"]):
         return "Picnic Spot & Landscape"
-    if any(x in text for x in ["resort", "hotel", "guest house", "hostel"]):
-        return "Resort & Farmhouse"
+    if any(x in text for x in ["resort", "hotel", "guest house", "guest_house", "hostel"]):
+        return "Hotel & Stay"
     if any(x in text for x in ["historic", "heritage", "monument", "museum", "castle", "fort", "attraction", "temple", "mosque", "church"]):
         return "Heritage & Sight"
     return "General"
+
+
+def _community_open_category_matches(raw: str, requested: str) -> bool:
+    """Strictly filter OSM data to the selected Community Gems category."""
+    if not requested or requested == "All":
+        return True
+    text = str(raw or "").lower()
+    groups = {
+        "Food": ["restaurant", "fast_food", "food_court", "cafe", "coffee", "tea", "snack", "bakery", "pastry", "sweet", "confectionery", "ice_cream", "dairy", "seafood", "diner", "food"],
+        "Pharmacy": ["pharmacy", "chemist", "drugstore", "healthcare=pharmacy"],
+        "Shopping": ["shop", "supermarket", "grocery", "convenience", "market", "mall", "store", "clothing", "electronics", "hardware", "tailor"],
+        "Stay": ["hotel", "hostel", "guest_house", "guest house", "motel", "resort", "homestay", "tourism"],
+    }
+    aliases = {
+        "Food": "Food", "Pharmacy / Chemist": "Pharmacy", "Pharmacy": "Pharmacy",
+        "Shopping": "Shopping", "Market, Bazaar & Mall": "Shopping",
+        "Stay": "Stay", "Hotel & Stay": "Stay",
+    }
+    group = aliases.get(requested, requested)
+    needles = groups.get(group)
+    if needles is None:
+        return True
+    return any(n in text for n in needles)
 
 
 def _community_nominatim_row(item: Dict[str, Any], city: str, category: str = "All") -> Optional[Dict[str, Any]]:
@@ -4095,8 +4122,15 @@ def _community_nominatim_row(item: Dict[str, Any], city: str, category: str = "A
         return None
     display_address = str(item.get("display_name") or city).strip()
     maps_url = f"https://www.openstreetmap.org/?mlat={float(lat)}&mlon={float(lon)}#map=17/{float(lat)}/{float(lon)}"
-    website = ""
-    phone = ""
+    tags = item.get("extratags") or {}
+    website = str(tags.get("website") or tags.get("contact:website") or "").strip()
+    phone = str(tags.get("phone") or tags.get("contact:phone") or "").strip()
+    description = str(tags.get("description") or "").strip()
+    cuisine = str(tags.get("cuisine") or "").strip()
+    brand = str(tags.get("brand") or "").strip()
+    opening_hours = str(tags.get("opening_hours") or "").strip()
+    image = str(tags.get("image") or "").strip()
+    details = description or (f"{brand} · {cuisine}" if brand and cuisine else brand or cuisine)
     return {
         "id": f"osm:nominatim:{item.get('osm_type','')}/{item.get('osm_id','')}",
         "source": "OPENSTREETMAP",
@@ -4112,12 +4146,15 @@ def _community_nominatim_row(item: Dict[str, Any], city: str, category: str = "A
         "rating": None,
         "review_count": None,
         "open_now": None,
-        "hours": [],
+        "hours": [opening_hours] if opening_hours else [],
         "maps_url": maps_url,
         "website_url": website,
         "contact_phone": phone,
-        "image_url": "",
-        "photos": [],
+        "image_url": image,
+        "photos": [image] if image else [],
+        "description": details,
+        "cuisine": cuisine,
+
         "google_photo_names": [],
         "upvotes": 0,
         "community_endorsements": 0,
@@ -4162,6 +4199,7 @@ async def _search_nominatim_community_places(
                 "format": "jsonv2",
                 "addressdetails": "1",
                 "namedetails": "1",
+                "extratags": "1",
                 "limit": str(max(1, min(int(limit), 20))),
                 "accept-language": "en",
             }
@@ -4178,6 +4216,9 @@ async def _search_nominatim_community_places(
         rows = []
         seen = set()
         for item in raw:
+            raw_category = " ".join([str(item.get("type") or ""), str(item.get("class") or ""), str((item.get("address") or {}).get("amenity") or ""), str((item.get("address") or {}).get("shop") or ""), str((item.get("address") or {}).get("tourism") or ""), str((item.get("address") or {}).get("leisure") or ""), str((item.get("address") or {}).get("healthcare") or "")])
+            if not _community_open_category_matches(raw_category, category):
+                continue
             row = _community_nominatim_row(item, clean_city, category)
             if not row:
                 continue
@@ -4198,85 +4239,109 @@ async def _search_nominatim_community_places(
 async def _search_open_community_places(
     city: str, query_text: str, category: str = "All", limit: int = 10
 ) -> List[Dict[str, Any]]:
+    """High-quality no-key fallback using OSM/Overpass.
+
+    Nominatim is used only to resolve a typed locality/business when useful.
+    POI discovery itself uses category-aware Overpass selectors so roads,
+    expressways and unrelated landmarks cannot appear as Food/Pharmacy/etc.
+    """
     clean_city, clean_query = city.strip(), query_text.strip()
     if not clean_city:
         return []
 
-    # First fallback: direct Nominatim place search. This avoids depending on an
-    # Overpass server being healthy for ordinary user searches.
+    # Resolve the active city first. If the user typed a locality/city such as
+    # "Andheri" or "Mumbai", use that as the search centre rather than matching
+    # the word "Mumbai" against arbitrary POI names such as Mumbai-Vadodara Expressway.
+    center_name = clean_city
+    center = await _resolve_destination_with_open_data(clean_city, "", "")
     if clean_query:
-        direct_rows = await _search_nominatim_community_places(clean_city, clean_query, category, limit)
-        if direct_rows:
-            return direct_rows
-
-    # Second fallback: Overpass around the city. Also used for the initial feed
-    # when there is no search term, because Nominatim cannot provide a useful
-    # "show me popular local businesses" query on its own.
-    destination = await _resolve_destination_with_open_data(clean_city, "", "")
-    if not destination:
+        query_destination = await _resolve_destination_with_open_data(clean_query, "", "India")
+        if query_destination and str(query_destination.get("type") or "").lower() in {"city", "town", "municipality", "village", "suburb", "locality", "district"}:
+            center = query_destination
+            center_name = clean_query
+            clean_query = ""
+    if not center:
         return []
-    lat, lng = float(destination["latitude"]), float(destination["longitude"])
+    lat, lng = float(center["latitude"]), float(center["longitude"])
+
+    requested = category.strip() or "All"
+    # Category-aware selectors. For Food, for example, only actual food POIs are
+    # considered; highways and road relations are never selected.
+    selectors = {
+        "Food": [
+            'nwr(around:15000,{lat},{lng})["amenity"~"restaurant|fast_food|cafe|food_court|ice_cream|pub|bar",i]["name"];',
+            'nwr(around:15000,{lat},{lng})["shop"~"bakery|confectionery|pastry|tea|coffee",i]["name"];',
+        ],
+        "Pharmacy": ['nwr(around:15000,{lat},{lng})["amenity"="pharmacy"]["name"];'],
+        "Shopping": [
+            'nwr(around:15000,{lat},{lng})["shop"]["name"];',
+            'nwr(around:15000,{lat},{lng})["amenity"~"marketplace",i]["name"];',
+        ],
+        "Stay": [
+            'nwr(around:15000,{lat},{lng})["tourism"~"hotel|hostel|guest_house|motel|resort",i]["name"];',
+        ],
+        "All": [
+            'nwr(around:12000,{lat},{lng})["amenity"]["name"];',
+            'nwr(around:12000,{lat},{lng})["shop"]["name"];',
+            'nwr(around:12000,{lat},{lng})["tourism"]["name"];',
+            'nwr(around:12000,{lat},{lng})["leisure"]["name"];',
+            'nwr(around:12000,{lat},{lng})["healthcare"]["name"];',
+        ],
+    }
+    group = "Food" if requested == "Food" else "Pharmacy" if requested in {"Pharmacy", "Pharmacy / Chemist"} else "Shopping" if requested in {"Shopping", "Market, Bazaar & Mall"} else "Stay" if requested in {"Stay", "Hotel & Stay"} else "All"
+    selected = selectors[group]
+    formatted = [x.format(lat=lat, lng=lng) for x in selected]
     if clean_query:
-        safe_regex = re.escape(clean_query)
-        selector = f'nwr(around:15000,{lat},{lng})["name"~"{safe_regex}",i];'
-    else:
-        selector = "\n".join([
-            f'nwr(around:12000,{lat},{lng})["name"]["amenity"];',
-            f'nwr(around:12000,{lat},{lng})["name"]["shop"];',
-            f'nwr(around:12000,{lat},{lng})["name"]["tourism"];',
-            f'nwr(around:12000,{lat},{lng})["name"]["leisure"];',
-            f'nwr(around:12000,{lat},{lng})["name"]["healthcare"];',
-        ])
-    query = '[out:json][timeout:25];\n(\n' + selector + '\n);\nout center tags;\n'
+        safe = re.escape(clean_query)
+        formatted = [x.replace('["name"]', f'["name"~"{safe}",i]') for x in formatted]
+    query = '[out:json][timeout:30];\n(\n' + '\n'.join(formatted) + '\n);\nout center tags;\n'
     try:
         async with _overpass_semaphore:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=8.0)) as client:
-                response = await client.post(
-                    OVERPASS_API_URL,
-                    data={"data": query},
-                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
-                )
+            async with httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=8.0)) as client:
+                response = await client.post(OVERPASS_API_URL, data={"data": query}, headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"})
         if response.status_code != 200:
             print(f"[Community Open Data Notice] Overpass HTTP {response.status_code}: {response.text[:500]}")
             return []
         elements = (response.json() or {}).get("elements") or []
         rows, seen = [], set()
-        def tag(tags, key): return str(tags.get(key) or "").strip()
         for element in elements:
             tags = element.get("tags") or {}
-            name = tag(tags, "name")
+            name = str(tags.get("name") or "").strip()
             if not name or name.lower() in seen:
                 continue
             if element.get("lat") is not None and element.get("lon") is not None:
                 item_lat, item_lng = float(element["lat"]), float(element["lon"])
             else:
-                center = element.get("center") or {}
-                if center.get("lat") is None or center.get("lon") is None:
+                c = element.get("center") or {}
+                if c.get("lat") is None or c.get("lon") is None:
                     continue
-                item_lat, item_lng = float(center["lat"]), float(center["lon"])
-            amenity, shop = tag(tags, "amenity"), tag(tags, "shop")
-            tourism, leisure, healthcare = tag(tags, "tourism"), tag(tags, "leisure"), tag(tags, "healthcare")
-            category_text = " ".join(x for x in [amenity, shop, tourism, leisure, healthcare] if x)
-            mapped_category = _community_open_category(category_text, category)
-            address = ", ".join(
-                x for x in [tag(tags,"addr:housenumber"), tag(tags,"addr:street"), tag(tags,"addr:suburb"), tag(tags,"addr:city"), tag(tags,"addr:postcode")] if x
-            ) or clean_city
+                item_lat, item_lng = float(c["lat"]), float(c["lon"])
+            raw_category = " ".join(str(tags.get(k) or "") for k in ["amenity","shop","tourism","leisure","healthcare","cuisine"])
+            if not _community_open_category_matches(raw_category, requested):
+                continue
+            mapped = _community_open_category(raw_category, requested)
+            address = ", ".join(x for x in [str(tags.get("addr:housenumber") or "").strip(), str(tags.get("addr:street") or "").strip(), str(tags.get("addr:suburb") or "").strip(), str(tags.get("addr:city") or "").strip(), str(tags.get("addr:postcode") or "").strip()] if x) or center_name
+            image = str(tags.get("image") or "").strip()
+            website = str(tags.get("website") or tags.get("contact:website") or "").strip()
+            phone = str(tags.get("phone") or tags.get("contact:phone") or "").strip()
+            hours = str(tags.get("opening_hours") or "").strip()
+            cuisine = str(tags.get("cuisine") or "").strip()
+            brand = str(tags.get("brand") or "").strip()
+            description = str(tags.get("description") or "").strip() or (f"{brand} · {cuisine}" if brand and cuisine else brand or cuisine or "Verified OpenStreetMap place")
             osm_id = f"osm:{element.get('type','')}/{element.get('id','')}"
-            maps_url = f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}"
-            image = tag(tags, "image")
             rows.append({
                 "id": osm_id, "source": "OPENSTREETMAP", "provider": "OpenStreetMap", "google_place_id": "",
-                "name": name, "category": mapped_category, "subcategory": category_text, "address": address, "city": clean_city,
+                "name": name, "category": mapped, "subcategory": raw_category, "address": address, "city": clean_city,
                 "latitude": item_lat, "longitude": item_lng, "rating": None, "review_count": None, "open_now": None,
-                "hours": [tag(tags,"opening_hours")] if tag(tags,"opening_hours") else [], "maps_url": maps_url,
-                "website_url": tag(tags,"website") or tag(tags,"contact:website"), "contact_phone": tag(tags,"phone") or tag(tags,"contact:phone"),
-                "image_url": image, "photos": [image] if image else [], "google_photo_names": [], "upvotes": 0, "community_endorsements": 0,
-                "community_tags": [], "must_try_tip": "", "contributor_name": "OpenStreetMap",
+                "hours": [hours] if hours else [], "maps_url": f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}",
+                "website_url": website, "contact_phone": phone, "image_url": image, "photos": [image] if image else [],
+                "google_photo_names": [], "upvotes": 0, "community_endorsements": 0, "community_tags": [],
+                "must_try_tip": "", "description": description, "cuisine": cuisine, "contributor_name": "OpenStreetMap",
                 "community_notice": "OpenStreetMap result — verify current details before submitting.", "providers": {}, "booking": {},
                 "data_state": "VERIFIED_OPEN_DATA", "attribution_required": "OpenStreetMap",
             })
             seen.add(name.lower())
-            if len(rows) >= max(1, min(limit,20)):
+            if len(rows) >= max(1, min(limit, 20)):
                 break
         return rows
     except Exception as exc:
