@@ -24,6 +24,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, 
 from fastapi.responses import Response
 from places import router as places_router
 from services.destination_engine import router as destination_router
+from gem_scout import GemScout
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -3914,6 +3915,86 @@ Behavior:
             response["persistence_warning"] = str(exc)
 
     return response
+
+# -------------------------------------------------------------
+# 17B. GEM SCOUT — COMMUNITY DISCOVERY CANDIDATES
+# -------------------------------------------------------------
+@app.post("/api/v1/scout/community/run")
+async def run_community_gem_scout(
+    request: Request,
+):
+    """Run one Community Gem Scout job and persist candidates in Supabase.
+
+    Security: set GEM_SCOUT_KEY in Render and send it as X-Gem-Scout-Key.
+    The Scout stores open-data-derived candidate fields and only the Google
+    place ID from live Google verification.
+    """
+    configured_key = os.environ.get("GEM_SCOUT_KEY", "").strip()
+    supplied_key = request.headers.get("X-Gem-Scout-Key", "").strip()
+    if not configured_key or supplied_key != configured_key:
+        raise HTTPException(status_code=403, detail="Gem Scout authorization failed.")
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase is not configured.")
+
+    try:
+        body = await request.json()
+        city = str(body.get("city") or "").strip()
+        category = str(body.get("category") or "Food").strip()
+        quantity = int(body.get("quantity") or 10)
+        verify_google = bool(body.get("verify_google", True))
+        if not city:
+            raise HTTPException(status_code=422, detail="city is required")
+        if quantity < 1 or quantity > 50:
+            raise HTTPException(status_code=422, detail="quantity must be between 1 and 50")
+
+        result = await GemScout(supabase).run_community_scout(
+            city=city,
+            category=category,
+            quantity=quantity,
+            verify_google=verify_google,
+        )
+        return {
+            "status": "success",
+            "city": result.city,
+            "requested_category": result.requested_category,
+            "canonical_category": result.canonical_category,
+            "requested_quantity": result.requested_quantity,
+            "scanned": result.scanned,
+            "inserted": result.inserted,
+            "updated": result.updated,
+            "source_counts": result.source_counts,
+            "candidates": [c.__dict__ for c in result.candidates],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[Gem Scout Error] {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/v1/scout/community/candidates")
+async def get_community_gem_scout_candidates(
+    city: str = Query(""),
+    category: str = Query(""),
+    status: str = Query(""),
+    limit: int = Query(50, ge=1, le=100),
+):
+    """Read Scout candidates for the future Admin Console."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase is not configured.")
+    try:
+        query = supabase.table("gem_scout_candidates").select("*")
+        if city.strip():
+            query = query.ilike("city", f"%{city.strip()}%")
+        if category.strip():
+            query = query.eq("category", category.strip())
+        if status.strip():
+            query = query.eq("status", status.strip())
+        response = query.order("confidence", desc=True).limit(limit).execute()
+        return {"status": "success", "candidates": response.data or []}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 # -------------------------------------------------------------
 # 18. COMMUNITY INTELLIGENCE, MODERATION & 1-ON-1 SUITE
