@@ -122,6 +122,24 @@ CATEGORY_GOOGLE_QUERIES: Dict[str, str] = {
 }
 
 
+GOOGLE_DISCOVERY_FIELD_MASK = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.location",
+    "places.googleMapsUri",
+    "places.websiteUri",
+    "places.internationalPhoneNumber",
+    "places.nationalPhoneNumber",
+    "places.rating",
+    "places.userRatingCount",
+    "places.photos",
+    "places.primaryType",
+    "places.primaryTypeDisplayName",
+    "places.types",
+])
+
+
 def _normalize(value: Any) -> str:
     text = str(value or "").lower().strip()
     text = re.sub(r"[^a-z0-9]+", " ", text)
@@ -364,6 +382,127 @@ class GemScout:
             print(f"[Gem Scout OSM] {exc}")
             return []
 
+    @staticmethod
+    def _google_place_matches_category(place: Dict[str, Any], canonical_category: str) -> bool:
+        raw = " ".join([
+            str(place.get("primaryType") or ""),
+            str(place.get("primaryTypeDisplayName") or ""),
+            " ".join(str(x) for x in (place.get("types") or [])),
+        ]).lower()
+        checks = {
+            "Pharmacy / Chemist": ("pharmacy", "drugstore", "chemist"),
+            "Barber & Salon": ("barber", "hair_care", "beauty", "salon"),
+            "Bar & Restaurant": ("restaurant", "bar", "pub", "night_club"),
+            "Chai & Quick Bites": ("cafe", "coffee", "bakery", "tea", "fast_food"),
+            "Hotel & Stay": ("hotel", "resort", "hostel", "guest_house", "motel"),
+            "Market, Bazaar & Mall": ("shopping_mall", "department_store", "supermarket", "market"),
+            "Clothing & Fashion": ("clothing", "fashion", "shoe", "boutique"),
+            "Electronics & Mobile": ("electronics", "mobile_phone", "computer", "store"),
+            "Heritage & Sight": ("tourist_attraction", "museum", "landmark", "point_of_interest"),
+            "Picnic Spot & Landscape": ("park", "garden", "picnic", "campground"),
+        }
+        wanted = checks.get(canonical_category)
+        if not wanted:
+            return True
+        return any(token in raw for token in wanted)
+
+    async def _google_candidates(
+        self,
+        city: str,
+        canonical_category: str,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Discover named places directly from Google Places when open-data
+        providers are unreachable from the hosting network. Results are then
+        passed through the same rich-evidence gate before persistence."""
+        if not GOOGLE_PLACES_API_KEY:
+            return []
+
+        endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
+        category_hint = CATEGORY_GOOGLE_QUERIES.get(canonical_category, canonical_category)
+
+        resolved = await self._geocode_city(city)
+        payload: Dict[str, Any] = {
+            "textQuery": f"{category_hint} in {city}, India",
+            "pageSize": min(max(limit * 2, 10), 20),
+            "languageCode": "en",
+        }
+        if resolved:
+            lat, lng, _ = resolved
+            payload["locationBias"] = {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lng},
+                    "radius": 20000.0,
+                }
+            }
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+            "X-Goog-FieldMask": GOOGLE_DISCOVERY_FIELD_MASK,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=6)) as client:
+                response = await client.post(endpoint, json=payload, headers=headers)
+            if response.status_code != 200:
+                print(f"[Gem Scout Google Discovery] HTTP {response.status_code}: {response.text[:500]}")
+                return []
+
+            places = (response.json() or {}).get("places") or []
+            rows: List[Dict[str, Any]] = []
+            seen = set()
+            center = resolved[:2] if resolved else None
+
+            for place in places:
+                if not self._google_place_matches_category(place, canonical_category):
+                    continue
+                display = str((place.get("displayName") or {}).get("text") or "").strip()
+                if not display:
+                    continue
+                dedupe = _normalize(display)
+                if not dedupe or dedupe in seen:
+                    continue
+                loc = place.get("location") or {}
+                if loc.get("latitude") is None or loc.get("longitude") is None:
+                    continue
+                lat, lng = float(loc["latitude"]), float(loc["longitude"])
+                if center and _distance_m(center[0], center[1], lat, lng) > 25000:
+                    continue
+
+                photos = place.get("photos") or []
+                phone = str(place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber") or "").strip()
+                rating = place.get("rating")
+                reviews = place.get("userRatingCount")
+                address = str(place.get("formattedAddress") or "").strip()
+                place_id = str(place.get("id") or "").strip()
+                website = str(place.get("websiteUri") or "").strip()
+
+                rows.append({
+                    "osm_id": "",
+                    "name": display,
+                    "address": address,
+                    "city": city,
+                    "latitude": lat,
+                    "longitude": lng,
+                    "website_url": website,
+                    "contact_phone": phone,
+                    "source_url": str(place.get("googleMapsUri") or ""),
+                    "google_place": place,
+                    "google_place_id": place_id,
+                    "rating": rating,
+                    "review_count": int(reviews) if isinstance(reviews, (int, float)) else 0,
+                    "photo_count": len(photos),
+                })
+                seen.add(dedupe)
+                if len(rows) >= max(limit * 2, limit):
+                    break
+
+            print(f"[Gem Scout Google Discovery] discovered={len(rows)} category={canonical_category!r} city={city!r}")
+            return rows
+        except Exception as exc:
+            print(f"[Gem Scout Google Discovery] {exc}")
+            return []
+
     async def _google_verify(
         self,
         candidate: Dict[str, Any],
@@ -518,10 +657,25 @@ class GemScout:
             print("[Gem Scout] verify_google=false is intentionally ignored for evidence-first mode.")
             verify_google = True
 
-        candidates = await self._osm_candidates(city, profile, quantity)
+        # Google is the primary discovery path because this hosted service may
+        # not be able to reach Overpass/Nominatim reliably. OSM remains an
+        # optional secondary source when Google discovery returns too few rows.
+        google_candidates = await self._google_candidates(city, canonical_category, quantity)
+        candidates = google_candidates
+        discovery_source = "GOOGLE" if google_candidates else "OSM"
+        if len(candidates) < quantity:
+            osm_candidates = await self._osm_candidates(city, profile, quantity)
+            existing_names = {_normalize(row.get("name")) for row in candidates}
+            for row in osm_candidates:
+                if _normalize(row.get("name")) not in existing_names:
+                    candidates.append(row)
+                    existing_names.add(_normalize(row.get("name")))
+            if osm_candidates:
+                discovery_source = "GOOGLE+OPENSTREETMAP" if google_candidates else "OPENSTREETMAP"
+
         scanned = len(candidates)
         if scanned == 0:
-            print(f"[Gem Scout] No named OSM candidates discovered for city={city!r}, category={requested_category!r}")
+            print(f"[Gem Scout] No candidates discovered for city={city!r}, category={requested_category!r}")
         accepted: List[ScoutCandidate] = []
         skipped_duplicates = 0
         inserted = 0
@@ -535,6 +689,9 @@ class GemScout:
                 bool(row.get("address")),
                 bool(row.get("contact_phone")),
                 bool(row.get("website_url")),
+                int(row.get("review_count") or 0),
+                float(row.get("rating") or 0.0),
+                int(row.get("photo_count") or 0),
             ),
             reverse=True,
         )
@@ -544,11 +701,25 @@ class GemScout:
             if len(accepted) >= quantity:
                 break
 
-            google_place, google_match_score, evidence = await self._google_verify(
-                row,
-                city,
-                canonical_category,
-            )
+            if row.get("google_place"):
+                google_place = row.get("google_place")
+                google_match_score = 1.0
+                evidence = {
+                    "rating": row.get("rating"),
+                    "review_count": row.get("review_count") or 0,
+                    "phone": row.get("contact_phone") or "",
+                    "photo_count": row.get("photo_count") or 0,
+                    "formatted_address_present": bool(row.get("address")),
+                    "website_present": bool(row.get("website_url")),
+                    "place_id_present": bool(row.get("google_place_id")),
+                    "match_score": 1.0,
+                }
+            else:
+                google_place, google_match_score, evidence = await self._google_verify(
+                    row,
+                    city,
+                    canonical_category,
+                )
             passed, evidence_score, evidence_reason = self._rich_evidence_gate(evidence)
             if not passed:
                 rejection_counts[evidence_reason] = rejection_counts.get(evidence_reason, 0) + 1
@@ -573,7 +744,7 @@ class GemScout:
                 longitude=float(row["longitude"]),
                 website_url=str(row.get("website_url") or ""),
                 contact_phone=str(row.get("contact_phone") or ""),
-                source="OPENSTREETMAP+GOOGLE_VERIFIED",
+                source=f"{discovery_source}+GOOGLE_VERIFIED",
                 source_url=str(row.get("source_url") or ""),
                 google_place_id=google_place_id,
                 confidence=confidence,
@@ -618,7 +789,9 @@ class GemScout:
             accepted.append(candidate)
 
         source_counts: Dict[str, int] = {
-            "OPENSTREETMAP_SCANNED": scanned,
+            "DISCOVERY_SCANNED": scanned,
+            "GOOGLE_DISCOVERED": len(google_candidates),
+            "OPENSTREETMAP_SCANNED": max(0, scanned - len(google_candidates)),
             "GOOGLE_VERIFIED_RICH": len(accepted),
         }
         for reason, count in rejection_counts.items():
