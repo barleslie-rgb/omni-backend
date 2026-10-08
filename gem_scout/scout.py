@@ -223,6 +223,9 @@ class GemScout:
         self.supabase = supabase_client
 
     async def _geocode_city(self, city: str) -> Optional[Tuple[float, float, str]]:
+        # Prefer Nominatim for open-data discovery. If it is unavailable from
+        # the hosting network, fall back to a lightweight Google place lookup
+        # so the Scout can still obtain the search center.
         params = {
             "q": f"{city}, India",
             "format": "jsonv2",
@@ -233,16 +236,48 @@ class GemScout:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=6)) as client:
                 response = await client.get(NOMINATIM_API_URL, params=params, headers=headers)
-            if response.status_code != 200:
+            if response.status_code == 200:
+                rows = response.json() or []
+                if rows:
+                    chosen = rows[0]
+                    return float(chosen["lat"]), float(chosen["lon"]), str(chosen.get("display_name") or city)
+            else:
                 print(f"[Gem Scout Geocode] Nominatim HTTP {response.status_code}")
-                return None
-            rows = response.json() or []
-            if not rows:
-                return None
-            chosen = rows[0]
-            return float(chosen["lat"]), float(chosen["lon"]), str(chosen.get("display_name") or city)
         except Exception as exc:
-            print(f"[Gem Scout Geocode] {exc}")
+            print(f"[Gem Scout Geocode] Nominatim unavailable: {exc}")
+
+        if not GOOGLE_PLACES_API_KEY:
+            return None
+
+        try:
+            endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
+            payload = {
+                "textQuery": f"{city}, India",
+                "pageSize": 1,
+                "languageCode": "en",
+            }
+            g_headers = {
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location",
+            }
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5)) as client:
+                response = await client.post(endpoint, json=payload, headers=g_headers)
+            if response.status_code != 200:
+                print(f"[Gem Scout Geocode] Google fallback HTTP {response.status_code}: {response.text[:300]}")
+                return None
+            places = (response.json() or {}).get("places") or []
+            if not places:
+                return None
+            place = places[0]
+            loc = place.get("location") or {}
+            if loc.get("latitude") is None or loc.get("longitude") is None:
+                return None
+            label = str(place.get("formattedAddress") or city)
+            print("[Gem Scout Geocode] Using Google fallback for search center")
+            return float(loc["latitude"]), float(loc["longitude"]), label
+        except Exception as exc:
+            print(f"[Gem Scout Geocode] Google fallback unavailable: {exc}")
             return None
 
     async def _osm_candidates(
@@ -298,8 +333,9 @@ class GemScout:
                     tags.get("addr:postcode"),
                 ]
                 address = ", ".join(str(x).strip() for x in address_parts if str(x or "").strip())
-                if not address:
-                    continue
+                # OSM address data is optional here because Google verification
+                # is the rich-evidence gate. Do not discard a real named place
+                # just because OSM omitted addr:* tags.
 
                 osm_id = f"osm:{element.get('type', '')}/{element.get('id', '')}"
                 source_url = (
@@ -484,6 +520,8 @@ class GemScout:
 
         candidates = await self._osm_candidates(city, profile, quantity)
         scanned = len(candidates)
+        if scanned == 0:
+            print(f"[Gem Scout] No named OSM candidates discovered for city={city!r}, category={requested_category!r}")
         accepted: List[ScoutCandidate] = []
         skipped_duplicates = 0
         inserted = 0
