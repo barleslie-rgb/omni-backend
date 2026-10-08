@@ -25,75 +25,100 @@ GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
 
 
+# Each profile deliberately targets physical business/place tags rather than
+# broad or ambiguous OSM objects such as roads/highways.
 CATEGORY_PROFILES: Dict[str, Dict[str, str]] = {
     "pharmacy": {
         "canonical": "Pharmacy / Chemist",
-        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["healthcare"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
     },
     "chemist": {
         "canonical": "Pharmacy / Chemist",
-        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["healthcare"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
     },
-    "food": {
-        "canonical": "Food",
-        "query": 'nwr(around:{radius},{lat},{lng})["amenity"~"restaurant|cafe|fast_food|food_court|ice_cream",i];',
-    },
-    "restaurant": {
-        "canonical": "Bar & Restaurant",
-        "query": 'nwr(around:{radius},{lat},{lng})["amenity"~"restaurant|fast_food",i];',
-    },
-    "cafe": {
-        "canonical": "Chai & Quick Bites",
-        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="cafe"];',
-    },
-    "mall": {
-        "canonical": "Market, Bazaar & Mall",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"="mall"];nwr(around:{radius},{lat},{lng})["shop"="department_store"];nwr(around:{radius},{lat},{lng})["shop"="supermarket"];',
-    },
-    "shopping": {
-        "canonical": "Market, Bazaar & Mall",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"mall|department_store|supermarket|convenience|clothes|shoes|fashion",i];',
-    },
-    "clothing": {
-        "canonical": "Clothing & Fashion",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"clothes|fashion|shoes",i];',
-    },
-    "dresses": {
-        "canonical": "Clothing & Fashion",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"clothes|fashion|fabric|tailor",i];',
-    },
-    "hotel": {
-        "canonical": "Hotel & Stay",
-        "query": 'nwr(around:{radius},{lat},{lng})["tourism"~"hotel|guest_house|hostel|motel",i];',
-    },
-    "hotels": {
-        "canonical": "Hotel & Stay",
-        "query": 'nwr(around:{radius},{lat},{lng})["tourism"~"hotel|guest_house|hostel|motel",i];',
+    "medical store": {
+        "canonical": "Pharmacy / Chemist",
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["healthcare"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
     },
     "pharmacy chemist": {
         "canonical": "Pharmacy / Chemist",
-        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="pharmacy"];nwr(around:{radius},{lat},{lng})["healthcare"="pharmacy"];nwr(around:{radius},{lat},{lng})["shop"="chemist"];',
+    },
+    "food": {
+        "canonical": "Food",
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"~"restaurant|cafe|fast_food|food_court|ice_cream",i]["name"];',
+    },
+    "restaurant": {
+        "canonical": "Bar & Restaurant",
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"~"restaurant|fast_food",i]["name"];',
+    },
+    "cafe": {
+        "canonical": "Chai & Quick Bites",
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"="cafe"]["name"];',
+    },
+    "bar": {
+        "canonical": "Bar & Restaurant",
+        "query": 'nwr(around:{radius},{lat},{lng})["amenity"~"bar|pub",i]["name"];',
+    },
+    "mall": {
+        "canonical": "Market, Bazaar & Mall",
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"="mall"]["name"];nwr(around:{radius},{lat},{lng})["shop"="department_store"]["name"];nwr(around:{radius},{lat},{lng})["shop"="supermarket"]["name"];',
+    },
+    "shopping": {
+        "canonical": "Market, Bazaar & Mall",
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"mall|department_store|supermarket|convenience|clothes|shoes|fashion",i]["name"];',
+    },
+    "clothing": {
+        "canonical": "Clothing & Fashion",
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"clothes|fashion|shoes",i]["name"];',
+    },
+    "dresses": {
+        "canonical": "Clothing & Fashion",
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"clothes|fashion|fabric|tailor",i]["name"];',
+    },
+    "hotel": {
+        "canonical": "Hotel & Stay",
+        "query": 'nwr(around:{radius},{lat},{lng})["tourism"~"hotel|guest_house|hostel|motel",i]["name"];',
+    },
+    "hotels": {
+        "canonical": "Hotel & Stay",
+        "query": 'nwr(around:{radius},{lat},{lng})["tourism"~"hotel|guest_house|hostel|motel",i]["name"];',
     },
     "attractions": {
         "canonical": "Heritage & Sight",
-        "query": 'nwr(around:{radius},{lat},{lng})["tourism"~"attraction|museum|viewpoint|zoo|theme_park",i];nwr(around:{radius},{lat},{lng})["historic"];',
+        "query": 'nwr(around:{radius},{lat},{lng})["tourism"~"attraction|museum|viewpoint|zoo|theme_park",i]["name"];nwr(around:{radius},{lat},{lng})["historic"]["name"];',
     },
     "parks": {
         "canonical": "Picnic Spot & Landscape",
-        "query": 'nwr(around:{radius},{lat},{lng})["leisure"="park"];nwr(around:{radius},{lat},{lng})["leisure"="garden"];',
+        "query": 'nwr(around:{radius},{lat},{lng})["leisure"="park"]["name"];nwr(around:{radius},{lat},{lng})["leisure"="garden"]["name"];',
     },
     "barber": {
         "canonical": "Barber & Salon",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"hairdresser|beauty",i];',
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"hairdresser|beauty",i]["name"];',
     },
     "salon": {
         "canonical": "Barber & Salon",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"hairdresser|beauty",i];',
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"hairdresser|beauty",i]["name"];',
     },
     "electronics": {
         "canonical": "Electronics & Mobile",
-        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"electronics|mobile_phone|computer",i];',
+        "query": 'nwr(around:{radius},{lat},{lng})["shop"~"electronics|mobile_phone|computer",i]["name"];',
     },
+}
+
+
+CATEGORY_GOOGLE_QUERIES: Dict[str, str] = {
+    "Pharmacy / Chemist": "pharmacies chemists medical stores",
+    "Food": "restaurants cafes food places",
+    "Bar & Restaurant": "restaurants bars pubs",
+    "Chai & Quick Bites": "cafes tea shops snack places",
+    "Market, Bazaar & Mall": "malls markets supermarkets shopping",
+    "Clothing & Fashion": "clothing stores fashion dress shops",
+    "Hotel & Stay": "hotels resorts guest houses",
+    "Heritage & Sight": "tourist attractions landmarks",
+    "Picnic Spot & Landscape": "parks gardens picnic places",
+    "Barber & Salon": "barbers salons beauty parlours",
+    "Electronics & Mobile": "electronics mobile phone shops",
 }
 
 
@@ -128,7 +153,8 @@ def _resolve_profile(category: str) -> Dict[str, str]:
     if raw in CATEGORY_PROFILES:
         return CATEGORY_PROFILES[raw]
     for key, profile in CATEGORY_PROFILES.items():
-        if key in raw or raw in key:
+        key_norm = _normalize(key)
+        if key_norm and (key_norm in raw or raw in key_norm):
             return profile
     if any(token in raw for token in ("pharmacy", "chemist", "medical store")):
         return CATEGORY_PROFILES["pharmacy"]
@@ -138,7 +164,11 @@ def _resolve_profile(category: str) -> Dict[str, str]:
         return CATEGORY_PROFILES["clothing"]
     if any(token in raw for token in ("mall", "shopping", "market")):
         return CATEGORY_PROFILES["shopping"]
-    if any(token in raw for token in ("food", "restaurant", "eat", "dining")):
+    if any(token in raw for token in ("bar", "pub")):
+        return CATEGORY_PROFILES["bar"]
+    if any(token in raw for token in ("cafe", "tea", "chai")):
+        return CATEGORY_PROFILES["cafe"]
+    if any(token in raw for token in ("restaurant", "dining", "food", "eat")):
         return CATEGORY_PROFILES["food"]
     return CATEGORY_PROFILES["food"]
 
@@ -178,12 +208,15 @@ class ScoutRunResult:
 
 
 class GemScout:
-    """Community Gem discovery engine.
+    """Evidence-first Community Gem discovery engine.
 
-    V1 intentionally persists open-data-derived candidate records. Google is
-    used as live verification/enrichment and only the Google place ID is stored.
-    This keeps the scout useful without turning Google Places responses into a
-    permanent scraped database.
+    Discovery starts with permitted open data, then every candidate is checked
+    live against Google Places. A candidate is only persisted when the live
+    provider confirms the business/place and exposes the minimum evidence needed
+    for a useful Community Gem: rating, at least one review, phone and photo.
+
+    Google content is used only for live verification. The persistent candidate
+    record keeps open-data fields plus the Google place ID.
     """
 
     def __init__(self, supabase_client: Any):
@@ -197,17 +230,28 @@ class GemScout:
             "accept-language": "en",
         }
         headers = {"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=6)) as client:
-            response = await client.get(NOMINATIM_API_URL, params=params, headers=headers)
-        if response.status_code != 200:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=6)) as client:
+                response = await client.get(NOMINATIM_API_URL, params=params, headers=headers)
+            if response.status_code != 200:
+                print(f"[Gem Scout Geocode] Nominatim HTTP {response.status_code}")
+                return None
+            rows = response.json() or []
+            if not rows:
+                return None
+            chosen = rows[0]
+            return float(chosen["lat"]), float(chosen["lon"]), str(chosen.get("display_name") or city)
+        except Exception as exc:
+            print(f"[Gem Scout Geocode] {exc}")
             return None
-        rows = response.json() or []
-        if not rows:
-            return None
-        chosen = rows[0]
-        return float(chosen["lat"]), float(chosen["lon"]), str(chosen.get("display_name") or city)
 
-    async def _osm_candidates(self, city: str, profile: Dict[str, str], limit: int, radius_m: int = 15000) -> List[Dict[str, Any]]:
+    async def _osm_candidates(
+        self,
+        city: str,
+        profile: Dict[str, str],
+        limit: int,
+        radius_m: int = 15000,
+    ) -> List[Dict[str, Any]]:
         resolved = await self._geocode_city(city)
         if not resolved:
             return []
@@ -215,75 +259,105 @@ class GemScout:
         statement = profile["query"].format(radius=radius_m, lat=lat, lng=lng)
         query = f"[out:json][timeout:40];({statement});out center tags;"
         headers = {"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(50, connect=10)) as client:
-            response = await client.post(
-                OVERPASS_API_URL,
-                data={"data": query},
-                headers=headers,
-            )
-        if response.status_code != 200:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(50, connect=10)) as client:
+                response = await client.post(
+                    OVERPASS_API_URL,
+                    data={"data": query},
+                    headers=headers,
+                )
+            if response.status_code != 200:
+                print(f"[Gem Scout OSM] Overpass HTTP {response.status_code}: {response.text[:300]}")
+                return []
+
+            elements = (response.json() or {}).get("elements") or []
+            rows: List[Dict[str, Any]] = []
+            seen = set()
+            for element in elements:
+                tags = element.get("tags") or {}
+                name = str(tags.get("name") or tags.get("name:en") or "").strip()
+                if not name:
+                    continue
+                dedupe_name = _normalize(name)
+                if dedupe_name in seen:
+                    continue
+
+                if element.get("lat") is not None and element.get("lon") is not None:
+                    item_lat, item_lng = float(element["lat"]), float(element["lon"])
+                else:
+                    center = element.get("center") or {}
+                    if center.get("lat") is None or center.get("lon") is None:
+                        continue
+                    item_lat, item_lng = float(center["lat"]), float(center["lon"])
+
+                address_parts = [
+                    tags.get("addr:housenumber"),
+                    tags.get("addr:street"),
+                    tags.get("addr:suburb"),
+                    tags.get("addr:city"),
+                    tags.get("addr:postcode"),
+                ]
+                address = ", ".join(str(x).strip() for x in address_parts if str(x or "").strip())
+                if not address:
+                    continue
+
+                osm_id = f"osm:{element.get('type', '')}/{element.get('id', '')}"
+                source_url = (
+                    f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}"
+                    f"#map=17/{item_lat}/{item_lng}"
+                )
+                website = str(tags.get("website") or tags.get("contact:website") or "").strip()
+                phone = str(tags.get("phone") or tags.get("contact:phone") or "").strip()
+
+                rows.append({
+                    "osm_id": osm_id,
+                    "name": name,
+                    "address": address,
+                    "city": city.strip(),
+                    "latitude": item_lat,
+                    "longitude": item_lng,
+                    "website_url": website,
+                    "contact_phone": phone,
+                    "source_url": source_url,
+                })
+                seen.add(dedupe_name)
+                if len(rows) >= min(max(limit * 5, limit), 100):
+                    break
+            return rows
+        except Exception as exc:
+            print(f"[Gem Scout OSM] {exc}")
             return []
 
-        elements = (response.json() or {}).get("elements") or []
-        rows: List[Dict[str, Any]] = []
-        seen = set()
-        for element in elements:
-            tags = element.get("tags") or {}
-            name = str(tags.get("name") or tags.get("name:en") or "").strip()
-            if not name:
-                continue
-            dedupe_name = _normalize(name)
-            if dedupe_name in seen:
-                continue
-            if element.get("lat") is not None and element.get("lon") is not None:
-                item_lat, item_lng = float(element["lat"]), float(element["lon"])
-            else:
-                center = element.get("center") or {}
-                if center.get("lat") is None or center.get("lon") is None:
-                    continue
-                item_lat, item_lng = float(center["lat"]), float(center["lon"])
-
-            address_parts = [
-                tags.get("addr:housenumber"),
-                tags.get("addr:street"),
-                tags.get("addr:suburb"),
-                tags.get("addr:city"),
-                tags.get("addr:postcode"),
-            ]
-            address = ", ".join(str(x).strip() for x in address_parts if str(x or "").strip()) or city
-            osm_id = f"osm:{element.get('type', '')}/{element.get('id', '')}"
-            source_url = f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}"
-            website = str(tags.get("website") or tags.get("contact:website") or "").strip()
-            phone = str(tags.get("phone") or tags.get("contact:phone") or "").strip()
-
-            rows.append({
-                "osm_id": osm_id,
-                "name": name,
-                "address": address,
-                "city": city.strip(),
-                "latitude": item_lat,
-                "longitude": item_lng,
-                "website_url": website,
-                "contact_phone": phone,
-                "source_url": source_url,
-            })
-            seen.add(dedupe_name)
-            if len(rows) >= min(max(limit * 3, limit), 60):
-                break
-        return rows
-
-    async def _google_verify(self, candidate: Dict[str, Any], city: str) -> Tuple[str, float]:
+    async def _google_verify(
+        self,
+        candidate: Dict[str, Any],
+        city: str,
+        canonical_category: str,
+    ) -> Tuple[Optional[Dict[str, Any]], float, Dict[str, Any]]:
+        """Return (best_place, match_score, evidence) for live Google verification."""
         if not GOOGLE_PLACES_API_KEY:
-            return "", 0.0
+            return None, 0.0, {"reason": "google_key_missing"}
+
         endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
         field_mask = ",".join([
             "places.id",
             "places.displayName",
             "places.formattedAddress",
             "places.location",
+            "places.googleMapsUri",
+            "places.websiteUri",
+            "places.internationalPhoneNumber",
+            "places.nationalPhoneNumber",
+            "places.rating",
+            "places.userRatingCount",
+            "places.photos",
+            "places.primaryType",
+            "places.primaryTypeDisplayName",
+            "places.types",
         ])
+        category_hint = CATEGORY_GOOGLE_QUERIES.get(canonical_category, canonical_category)
         payload = {
-            "textQuery": f"{candidate['name']} {city}",
+            "textQuery": f"{candidate['name']} {category_hint} {city}",
             "pageSize": 5,
             "languageCode": "en",
         }
@@ -293,31 +367,103 @@ class GemScout:
             "X-Goog-FieldMask": field_mask,
         }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(12, connect=4)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5)) as client:
                 response = await client.post(endpoint, json=payload, headers=headers)
             if response.status_code != 200:
-                return "", 0.0
+                print(f"[Gem Scout Google] HTTP {response.status_code}: {response.text[:500]}")
+                return None, 0.0, {"reason": f"http_{response.status_code}"}
+
             places = (response.json() or {}).get("places") or []
-            best_id, best_score = "", 0.0
+            best_place: Optional[Dict[str, Any]] = None
+            best_score = 0.0
             for place in places:
                 display = (place.get("displayName") or {}).get("text") or ""
                 loc = place.get("location") or {}
                 plat, plng = loc.get("latitude"), loc.get("longitude")
                 name_score = _name_similarity(candidate["name"], display)
                 dist_score = 0.0
+                distance_m = None
                 if plat is not None and plng is not None:
-                    distance = _distance_m(
-                        float(candidate["latitude"]), float(candidate["longitude"]),
-                        float(plat), float(plng),
+                    distance_m = _distance_m(
+                        float(candidate["latitude"]),
+                        float(candidate["longitude"]),
+                        float(plat),
+                        float(plng),
                     )
-                    dist_score = max(0.0, 1.0 - min(distance, 5000.0) / 5000.0)
-                score = name_score * 0.75 + dist_score * 0.25
+                    dist_score = max(0.0, 1.0 - min(distance_m, 7500.0) / 7500.0)
+
+                score = name_score * 0.70 + dist_score * 0.30
                 if score > best_score:
                     best_score = score
-                    best_id = str(place.get("id") or "")
-            return (best_id if best_score >= 0.60 else "", best_score)
-        except Exception:
-            return "", 0.0
+                    best_place = place
+
+            if not best_place or best_score < 0.68:
+                return None, best_score, {"reason": "weak_match"}
+
+            phone = str(
+                best_place.get("internationalPhoneNumber")
+                or best_place.get("nationalPhoneNumber")
+                or ""
+            ).strip()
+            rating = best_place.get("rating")
+            reviews = best_place.get("userRatingCount")
+            photos = best_place.get("photos") or []
+            formatted_address = str(best_place.get("formattedAddress") or "").strip()
+            website = str(best_place.get("websiteUri") or "").strip()
+            place_id = str(best_place.get("id") or "").strip()
+
+            evidence = {
+                "rating": rating,
+                "review_count": int(reviews) if isinstance(reviews, (int, float)) else None,
+                "phone": phone,
+                "photo_count": len(photos),
+                "formatted_address_present": bool(formatted_address),
+                "website_present": bool(website),
+                "place_id_present": bool(place_id),
+                "match_score": round(best_score, 3),
+            }
+            return best_place, best_score, evidence
+        except Exception as exc:
+            print(f"[Gem Scout Google] {exc}")
+            return None, 0.0, {"reason": "exception"}
+
+    @staticmethod
+    def _rich_evidence_gate(evidence: Dict[str, Any]) -> Tuple[bool, float, str]:
+        """Require the business evidence the user asked the Scout to prioritize."""
+        rating = evidence.get("rating")
+        reviews = evidence.get("review_count") or 0
+        phone = str(evidence.get("phone") or "").strip()
+        photo_count = int(evidence.get("photo_count") or 0)
+        address_present = bool(evidence.get("formatted_address_present"))
+        place_id_present = bool(evidence.get("place_id_present"))
+        match_score = float(evidence.get("match_score") or 0.0)
+
+        # Hard gate: without these signals we do not persist the candidate.
+        if rating is None:
+            return False, 0.0, "missing_rating"
+        if int(reviews) < 1:
+            return False, 0.0, "no_reviews"
+        if not phone:
+            return False, 0.0, "missing_phone"
+        if photo_count < 1:
+            return False, 0.0, "missing_photo"
+        if not address_present:
+            return False, 0.0, "missing_google_address"
+        if not place_id_present:
+            return False, 0.0, "missing_place_id"
+        if match_score < 0.68:
+            return False, 0.0, "weak_match"
+
+        # Soft quality score for ranking candidates that passed the gate.
+        score = 0.30
+        score += 0.16 if float(rating) >= 4.0 else 0.10
+        score += 0.08 if int(reviews) >= 10 else 0.04
+        score += 0.08 if int(reviews) >= 50 else 0.00
+        score += 0.10  # phone
+        score += 0.10  # photo
+        score += 0.08 if address_present else 0.00
+        score += min(0.10, max(0.0, match_score) * 0.10)
+        return True, round(min(0.99, score), 3), "rich_google_evidence"
 
     async def run_community_scout(
         self,
@@ -332,6 +478,10 @@ class GemScout:
         profile = _resolve_profile(requested_category)
         canonical_category = profile["canonical"]
 
+        if not verify_google:
+            print("[Gem Scout] verify_google=false is intentionally ignored for evidence-first mode.")
+            verify_google = True
+
         candidates = await self._osm_candidates(city, profile, quantity)
         scanned = len(candidates)
         accepted: List[ScoutCandidate] = []
@@ -340,37 +490,35 @@ class GemScout:
         updated = 0
         now = datetime.now(timezone.utc).isoformat()
 
-        # Prefer records with addresses and official websites/phones.
+        # Strong local completeness first; then we will use live Google evidence
+        # as the actual publication gate.
         candidates.sort(
             key=lambda row: (
-                bool(row.get("address") and row.get("address") != city),
-                bool(row.get("website_url")),
+                bool(row.get("address")),
                 bool(row.get("contact_phone")),
+                bool(row.get("website_url")),
             ),
             reverse=True,
         )
 
+        rejection_counts: Dict[str, int] = {}
         for row in candidates:
             if len(accepted) >= quantity:
                 break
-            google_place_id, google_score = ("", 0.0)
-            if verify_google:
-                google_place_id, google_score = await self._google_verify(row, city)
 
-            completeness = 0.55
-            if row.get("address") and row.get("address") != city:
-                completeness += 0.12
-            if row.get("website_url"):
-                completeness += 0.07
-            if row.get("contact_phone"):
-                completeness += 0.06
-            if google_place_id:
-                completeness += 0.12
-                completeness += min(0.06, google_score * 0.06)
+            google_place, google_match_score, evidence = await self._google_verify(
+                row,
+                city,
+                canonical_category,
+            )
+            passed, evidence_score, evidence_reason = self._rich_evidence_gate(evidence)
+            if not passed:
+                rejection_counts[evidence_reason] = rejection_counts.get(evidence_reason, 0) + 1
+                continue
 
-            confidence = round(min(0.98, completeness), 3)
-            verification_status = "google_matched" if google_place_id else "open_data_unverified"
-            status = "candidate" if confidence >= 0.60 else "needs_review"
+            google_place_id = str(google_place.get("id") or "") if google_place else ""
+            confidence = round(min(0.995, evidence_score), 3)
+
             dedupe_key = "|".join([
                 _normalize(city),
                 _normalize(canonical_category),
@@ -387,12 +535,12 @@ class GemScout:
                 longitude=float(row["longitude"]),
                 website_url=str(row.get("website_url") or ""),
                 contact_phone=str(row.get("contact_phone") or ""),
-                source="OPENSTREETMAP",
+                source="OPENSTREETMAP+GOOGLE_VERIFIED",
                 source_url=str(row.get("source_url") or ""),
                 google_place_id=google_place_id,
                 confidence=confidence,
-                verification_status=verification_status,
-                status=status,
+                verification_status="google_verified_rich_evidence",
+                status="candidate",
                 discovered_at=now,
             )
 
@@ -427,15 +575,16 @@ class GemScout:
                     }).execute()
                     inserted += 1
             except Exception as exc:
-                # A bad table/schema should not turn a partially completed scout
-                # run into misleading success. Re-raise to make deployment logs loud.
                 raise RuntimeError(f"Gem Scout Supabase write failed: {exc}") from exc
 
             accepted.append(candidate)
 
-        source_counts = {"OPENSTREETMAP": len(accepted)}
-        if any(c.google_place_id for c in accepted):
-            source_counts["GOOGLE_VERIFIED"] = sum(1 for c in accepted if c.google_place_id)
+        source_counts: Dict[str, int] = {
+            "OPENSTREETMAP_SCANNED": scanned,
+            "GOOGLE_VERIFIED_RICH": len(accepted),
+        }
+        for reason, count in rejection_counts.items():
+            source_counts[f"REJECTED_{reason.upper()}"] = count
 
         return ScoutRunResult(
             city=city,
