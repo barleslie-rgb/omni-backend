@@ -34,7 +34,7 @@ GEOAPIFY_CATEGORIES: Dict[str, List[str]] = {
         "commercial.health_and_beauty.pharmacy",
         "commercial.chemist",
     ],
-    "Barber & Salon": ["service", "commercial.health_and_beauty"],
+    "Barber & Salon": ["service.beauty", "service.beauty.hairdresser"],
     "Bar & Restaurant": ["catering.restaurant", "catering.bar", "catering.pub"],
     "Chai & Quick Bites": [
         "catering.cafe",
@@ -63,7 +63,7 @@ GEOAPIFY_CATEGORIES: Dict[str, List[str]] = {
     "Clinic / Doctor": ["healthcare.clinic_or_praxis", "healthcare.hospital", "healthcare.pharmacy"],
     "Dental / Optical": ["healthcare.dentist", "commercial.health_and_beauty.optician"],
     "General Store / Supermarket": ["commercial.supermarket", "commercial.convenience", "commercial"],
-    "Beauty & Spa": ["service", "commercial.health_and_beauty"],
+    "Beauty & Spa": ["service.beauty"],
     "All": ["commercial", "catering", "accommodation", "healthcare", "tourism", "leisure", "entertainment"],
 }
 
@@ -190,6 +190,63 @@ def _meaningful_address(props: Dict[str, Any], address: str, city: str) -> bool:
     return "," in str(address or "") or bool(props.get("housenumber") or props.get("postcode"))
 
 
+def _geoapify_categories_match(categories: Any, canonical_category: str) -> bool:
+    """Return true only when Geoapify's own category metadata matches the request."""
+    if isinstance(categories, str):
+        actual_categories = [categories.strip().lower()]
+    elif isinstance(categories, list):
+        actual_categories = [str(item).strip().lower() for item in categories if str(item).strip()]
+    else:
+        actual_categories = []
+    requested_categories = [
+        str(item).strip().lower()
+        for item in GEOAPIFY_CATEGORIES.get(canonical_category, [])
+        if str(item).strip()
+    ]
+    if not actual_categories or not requested_categories:
+        return False
+    # Category keys are hierarchical. A requested parent includes its children,
+    # but a broader/unrelated returned category is not accepted as a match.
+    return any(
+        actual == requested or actual.startswith(requested + ".")
+        for actual in actual_categories
+        for requested in requested_categories
+    )
+
+
+def _is_in_requested_city(props: Dict[str, Any], address: str, city: str) -> bool:
+    """Reject obvious cross-city results, especially Mira-Bhayandar in a Vasai-Virar run."""
+    norm_city = _normalize(city)
+    local_fields = (
+        "city", "town", "village", "municipality", "suburb", "neighbourhood",
+        "neighborhood", "quarter", "district_name", "locality",
+    )
+    local_values = [str(props.get(key) or "").strip() for key in local_fields]
+    address_norm = _normalize(address)
+    local_blob = _normalize(" ".join(value for value in local_values if value))
+    combined = f" {local_blob} {address_norm} "
+
+    if norm_city in {"vasai virar", "vasai-virar"}:
+        # These nearby place names are not Vasai-Virar; reject them even when a
+        # large circular search radius overlaps their area.
+        blocked = ("mira bhayandar", "mira bhayander", "bhayandar", "bhayander")
+        if any(term in combined for term in blocked):
+            return False
+        accepted_localities = (
+            "vasai virar", "vasai", "naigaon", "nallasopara", "nalasopara", "virar",
+        )
+        return any(term in combined for term in accepted_localities)
+
+    # For other cities, prefer explicit locality/address evidence rather than
+    # trusting coordinates alone. Keep this generic and conservative.
+    if norm_city and (norm_city in local_blob or norm_city in address_norm):
+        return True
+    explicit_places = [value for value in local_values if value]
+    if explicit_places:
+        return any(norm_city in _normalize(value) for value in explicit_places)
+    return False
+
+
 def _osm_source_url(lat: float, lon: float) -> str:
     return f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=17/{lat}/{lon}"
 
@@ -244,6 +301,10 @@ class GemScout:
 
     def __init__(self, supabase_client: Any):
         self.supabase = supabase_client
+        # Cache Geoapify's geocoded place ID so searches can be constrained to
+        # the returned administrative/locality boundary instead of only a circle.
+        self._city_place_ids: Dict[str, str] = {}
+        self._last_geoapify_rejections: Dict[str, int] = {}
 
     async def _geocode_city(self, city: str) -> Optional[Tuple[float, float, str]]:
         if GEOAPIFY_API_KEY:
@@ -261,6 +322,9 @@ class GemScout:
                     rows = (response.json() or {}).get("results") or []
                     if rows:
                         row = rows[0]
+                        place_id = str(row.get("place_id") or "").strip()
+                        if place_id:
+                            self._city_place_ids[_normalize(city)] = place_id
                         return float(row["lat"]), float(row["lon"]), str(row.get("formatted") or city)
                 else:
                     body = response.text[:300].replace(GEOAPIFY_API_KEY, "[redacted]")
@@ -340,7 +404,9 @@ class GemScout:
             media_obj = {}
         return {
             "geoapify_place_id": place_id,
-            "name": str(props.get("name") or props.get("address_line1") or "").strip(),
+            # Do not promote address_line1 to a business name: for roads and
+            # unnamed map features, that field may simply be a street name.
+            "name": str(props.get("name") or "").strip(),
             "address": address,
             "latitude": float(lat) if lat is not None else None,
             "longitude": float(lon) if lon is not None else None,
@@ -364,9 +430,11 @@ class GemScout:
             return []
         lat, lon, _formatted_city = center
         categories = GEOAPIFY_CATEGORIES.get(canonical_category, GEOAPIFY_CATEGORIES["Food"])
+        city_place_id = self._city_place_ids.get(_normalize(city), "")
+        spatial_filter = f"place:{city_place_id}" if city_place_id else f"circle:{lon},{lat},20000"
         params = {
             "categories": ",".join(categories),
-            "filter": f"circle:{lon},{lat},20000",
+            "filter": spatial_filter,
             "bias": f"proximity:{lon},{lat}",
             "limit": str(max(1, min(50, max(limit * 3, limit)))),
             "lang": "en",
@@ -375,6 +443,11 @@ class GemScout:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=5)) as client:
                 response = await client.get(GEOAPIFY_PLACES_URL, params=params)
+                if response.status_code != 200 and city_place_id:
+                    body = response.text[:250].replace(GEOAPIFY_API_KEY, "[redacted]")
+                    print(f"[Gem Scout Geoapify Boundary Filter] HTTP {response.status_code}: {body}; retrying with bounded radius")
+                    params["filter"] = f"circle:{lon},{lat},20000"
+                    response = await client.get(GEOAPIFY_PLACES_URL, params=params)
             if response.status_code != 200:
                 body = response.text[:350].replace(GEOAPIFY_API_KEY, "[redacted]")
                 print(f"[Gem Scout Geoapify Discovery] HTTP {response.status_code}: {body}")
@@ -388,17 +461,28 @@ class GemScout:
         rows: List[Dict[str, Any]] = []
         seen = set()
         details_calls = 0
+        rejected = {"missing_real_name": 0, "wrong_category": 0, "outside_city": 0, "missing_place_id_or_coordinates": 0}
         max_details = min(max(limit * 3, limit), 40)
         for feature in features:
             row = self._geoapify_row(feature, city)
             pid, name = row.get("geoapify_place_id"), row.get("name")
             lat1, lon1 = row.get("latitude"), row.get("longitude")
-            if not pid or not name or lat1 is None or lon1 is None:
+            props = row.get("raw_properties") or {}
+            if not name:
+                rejected["missing_real_name"] += 1
+                continue
+            if not _geoapify_categories_match(row.get("categories"), canonical_category):
+                rejected["wrong_category"] += 1
+                continue
+            if not _is_in_requested_city(props, str(row.get("address") or ""), city):
+                rejected["outside_city"] += 1
+                continue
+            if not pid or lat1 is None or lon1 is None:
+                rejected["missing_place_id_or_coordinates"] += 1
                 continue
             dedupe = _normalize(pid) or _normalize(name)
             if dedupe in seen:
                 continue
-            props = row.get("raw_properties") or {}
             if not _meaningful_address(props, str(row.get("address") or ""), city):
                 # Do not discard it silently: it could still be useful after a
                 # manual review, but this queue is specifically for addressable leads.
@@ -437,13 +521,15 @@ class GemScout:
             if len(rows) >= max(1, min(limit * 3, 60)):
                 break
 
+        self._last_geoapify_rejections = rejected
         print(
             "[Gem Scout Geoapify Discovery] "
-            f"features={len(features)} addressable={len(rows)} details_requested={details_calls} "
+            f"features={len(features)} accepted={len(rows)} details_requested={details_calls} "
             f"with_phone={sum(bool(r.get('contact_phone')) for r in rows)} "
             f"with_website={sum(bool(r.get('website_url')) for r in rows)} "
             f"with_image_reference={sum(bool(r.get('image_url')) for r in rows)} "
-            f"category={canonical_category!r} city={city!r}"
+            f"rejected={rejected} category={canonical_category!r} city={city!r} "
+            f"spatial_filter={'place' if city_place_id else 'circle'}"
         )
         return rows
 
@@ -694,6 +780,8 @@ class GemScout:
         }
         for reason, count in rejected.items():
             source_counts[f"REJECTED_{reason.upper()}"] = count
+        for reason, count in self._last_geoapify_rejections.items():
+            source_counts[f"GEOAPIFY_REJECTED_{reason.upper()}"] = count
 
         print(
             f"[Gem Scout] city={city!r} category={canonical_category!r} "
