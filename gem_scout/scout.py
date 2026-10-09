@@ -21,8 +21,9 @@ NOMINATIM_API_URL = os.environ.get(
 OVERPASS_API_URL = os.environ.get(
     "OVERPASS_API_URL", "https://overpass-api.de/api/interpreter"
 ).strip()
-GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
-GOOGLE_PLACES_BASE_URL = "https://places.googleapis.com/v1"
+FSQ_SERVICE_API_KEY = os.environ.get("FSQ_SERVICE_API_KEY", "").strip()
+FSQ_PLACES_BASE_URL = "https://places-api.foursquare.com"
+FSQ_PLACES_API_VERSION = "2025-06-17"
 
 
 # Each profile deliberately targets physical business/place tags rather than
@@ -107,37 +108,34 @@ CATEGORY_PROFILES: Dict[str, Dict[str, str]] = {
 }
 
 
-CATEGORY_GOOGLE_QUERIES: Dict[str, str] = {
-    "Pharmacy / Chemist": "pharmacies chemists medical stores",
-    "Food": "restaurants cafes food places",
-    "Bar & Restaurant": "restaurants bars pubs",
-    "Chai & Quick Bites": "cafes tea shops snack places",
-    "Market, Bazaar & Mall": "malls markets supermarkets shopping",
-    "Clothing & Fashion": "clothing stores fashion dress shops",
-    "Hotel & Stay": "hotels resorts guest houses",
-    "Heritage & Sight": "tourist attractions landmarks",
-    "Picnic Spot & Landscape": "parks gardens picnic places",
-    "Barber & Salon": "barbers salons beauty parlours",
-    "Electronics & Mobile": "electronics mobile phone shops",
+CATEGORY_FOURSQUARE_QUERIES: Dict[str, str] = {
+    "Pharmacy / Chemist": "pharmacy",
+    "Food": "restaurant",
+    "Bar & Restaurant": "restaurant",
+    "Chai & Quick Bites": "cafe",
+    "Market, Bazaar & Mall": "shopping mall",
+    "Clothing & Fashion": "clothing store",
+    "Hotel & Stay": "hotel",
+    "Heritage & Sight": "tourist attraction",
+    "Picnic Spot & Landscape": "park",
+    "Barber & Salon": "salon",
+    "Electronics & Mobile": "electronics store",
 }
 
+FOURSQUARE_QUERY_VARIANTS: Dict[str, List[str]] = {
+    "Pharmacy / Chemist": ["pharmacy", "chemist", "medical store"],
+    "Food": ["restaurant", "cafe", "food"],
+    "Bar & Restaurant": ["restaurant", "bar", "pub"],
+    "Chai & Quick Bites": ["cafe", "tea shop", "bakery"],
+    "Market, Bazaar & Mall": ["shopping mall", "supermarket", "market"],
+    "Clothing & Fashion": ["clothing store", "fashion store", "boutique"],
+    "Hotel & Stay": ["hotel", "resort", "guest house"],
+    "Heritage & Sight": ["tourist attraction", "museum", "landmark"],
+    "Picnic Spot & Landscape": ["park", "garden", "picnic spot"],
+    "Barber & Salon": ["barber", "salon", "beauty salon"],
+    "Electronics & Mobile": ["electronics store", "mobile phone shop", "computer shop"],
+}
 
-GOOGLE_DISCOVERY_FIELD_MASK = ",".join([
-    "places.id",
-    "places.displayName",
-    "places.formattedAddress",
-    "places.location",
-    "places.googleMapsUri",
-    "places.websiteUri",
-    "places.internationalPhoneNumber",
-    "places.nationalPhoneNumber",
-    "places.rating",
-    "places.userRatingCount",
-    "places.photos",
-    "places.primaryType",
-    "places.primaryTypeDisplayName",
-    "places.types",
-])
 
 
 def _normalize(value: Any) -> str:
@@ -205,6 +203,7 @@ class ScoutCandidate:
     source: str
     source_url: str
     google_place_id: str
+    fsq_place_id: str
     confidence: float
     verification_status: str
     status: str = "candidate"
@@ -226,24 +225,22 @@ class ScoutRunResult:
 
 
 class GemScout:
-    """Evidence-first Community Gem discovery engine.
+    """Foursquare-first evidence gate for Community Gem candidates.
 
-    Discovery starts with permitted open data, then every candidate is checked
-    live against Google Places. A candidate is only persisted when the live
-    provider confirms the business/place and exposes the minimum evidence needed
-    for a useful Community Gem: rating, at least one review, phone and photo.
-
-    Google content is used only for live verification. The persistent candidate
-    record keeps open-data fields plus the Google place ID.
+    Foursquare Places is the primary discovery and verification provider.
+    OpenStreetMap is an optional fallback for candidate discovery only; any
+    OSM candidate must still match a Foursquare place with the required evidence
+    before it enters the candidate table. Google is not called by this module.
+    The returned Foursquare photo/tip payload is evaluated in memory and is not
+    copied into Supabase; only the fields required by the existing candidate
+    queue plus the stable Foursquare place ID are persisted.
     """
 
     def __init__(self, supabase_client: Any):
         self.supabase = supabase_client
 
     async def _geocode_city(self, city: str) -> Optional[Tuple[float, float, str]]:
-        # Prefer Nominatim for open-data discovery. If it is unavailable from
-        # the hosting network, fall back to a lightweight Google place lookup
-        # so the Scout can still obtain the search center.
+        """Resolve city coordinates with Nominatim for the optional OSM fallback."""
         params = {
             "q": f"{city}, India",
             "format": "jsonv2",
@@ -260,43 +257,10 @@ class GemScout:
                     chosen = rows[0]
                     return float(chosen["lat"]), float(chosen["lon"]), str(chosen.get("display_name") or city)
             else:
-                print(f"[Gem Scout Geocode] Nominatim HTTP {response.status_code}")
+                print(f"[Gem Scout Geocode] Nominatim HTTP {response.status_code}: {response.text[:250]}")
         except Exception as exc:
             print(f"[Gem Scout Geocode] Nominatim unavailable: {exc}")
-
-        if not GOOGLE_PLACES_API_KEY:
-            return None
-
-        try:
-            endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
-            payload = {
-                "textQuery": f"{city}, India",
-                "pageSize": 1,
-                "languageCode": "en",
-            }
-            g_headers = {
-                "Content-Type": "application/json",
-                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location",
-            }
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5)) as client:
-                response = await client.post(endpoint, json=payload, headers=g_headers)
-            if response.status_code != 200:
-                print(f"[Gem Scout Geocode] Google fallback HTTP {response.status_code}: {response.text[:300]}")
-                return None
-            places = (response.json() or {}).get("places") or []
-            if not places:
-                return None
-            place = places[0]
-            loc = place.get("location") or {}
-            if loc.get("latitude") is None or loc.get("longitude") is None:
-                return None
-            label = str(place.get("formattedAddress") or city)
-            print("[Gem Scout Geocode] Using Google fallback for search center")
-            return float(loc["latitude"]), float(loc["longitude"]), label
-        except Exception as exc:
-            print(f"[Gem Scout Geocode] Google fallback unavailable: {exc}")
-            return None
+        return None
 
     async def _osm_candidates(
         self,
@@ -351,7 +315,7 @@ class GemScout:
                     tags.get("addr:postcode"),
                 ]
                 address = ", ".join(str(x).strip() for x in address_parts if str(x or "").strip())
-                # OSM address data is optional here because Google verification
+                # OSM address data is optional here because Foursquare verification
                 # is the rich-evidence gate. Do not discard a real named place
                 # just because OSM omitted addr:* tags.
 
@@ -383,262 +347,259 @@ class GemScout:
             return []
 
     @staticmethod
-    def _google_place_matches_category(place: Dict[str, Any], canonical_category: str) -> bool:
-        raw = " ".join([
-            str(place.get("primaryType") or ""),
-            str(place.get("primaryTypeDisplayName") or ""),
-            " ".join(str(x) for x in (place.get("types") or [])),
-        ]).lower()
+    def _foursquare_place_matches_category(place: Dict[str, Any], canonical_category: str) -> bool:
+        categories = place.get("categories") or []
+        raw = " ".join(
+            str(item.get("name") or item.get("short_name") or "")
+            if isinstance(item, dict) else str(item)
+            for item in categories
+        ).lower()
         checks = {
-            "Pharmacy / Chemist": ("pharmacy", "drugstore", "chemist"),
-            "Barber & Salon": ("barber", "hair_care", "beauty", "salon"),
-            "Bar & Restaurant": ("restaurant", "bar", "pub", "night_club"),
-            "Chai & Quick Bites": ("cafe", "coffee", "bakery", "tea", "fast_food"),
-            "Hotel & Stay": ("hotel", "resort", "hostel", "guest_house", "motel"),
-            "Market, Bazaar & Mall": ("shopping_mall", "department_store", "supermarket", "market"),
-            "Clothing & Fashion": ("clothing", "fashion", "shoe", "boutique"),
-            "Electronics & Mobile": ("electronics", "mobile_phone", "computer", "store"),
-            "Heritage & Sight": ("tourist_attraction", "museum", "landmark", "point_of_interest"),
+            "Pharmacy / Chemist": ("pharmacy", "chemist", "drugstore", "medical store"),
+            "Barber & Salon": ("barber", "hair", "beauty", "salon"),
+            "Bar & Restaurant": ("restaurant", "bar", "pub", "nightclub", "night club"),
+            "Chai & Quick Bites": ("cafe", "coffee", "tea", "bakery", "snack", "fast food"),
+            "Hotel & Stay": ("hotel", "resort", "hostel", "guest house", "motel"),
+            "Market, Bazaar & Mall": ("shopping mall", "department store", "supermarket", "market"),
+            "Clothing & Fashion": ("clothing", "fashion", "shoe", "boutique", "apparel"),
+            "Electronics & Mobile": ("electronics", "mobile phone", "computer", "electronic store"),
+            "Heritage & Sight": ("tourist attraction", "museum", "landmark", "historic"),
             "Picnic Spot & Landscape": ("park", "garden", "picnic", "campground"),
         }
         wanted = checks.get(canonical_category)
-        if not wanted:
+        # Category metadata can be absent in some response tiers; the targeted
+        # query remains useful, but the evidence gate below is still mandatory.
+        if not raw:
             return True
-        return any(token in raw for token in wanted)
+        return not wanted or any(token in raw for token in wanted)
 
-    async def _google_candidates(
-        self,
-        city: str,
-        canonical_category: str,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        """Discover named places directly from Google Places when open-data
-        providers are unreachable from the hosting network. Results are then
-        passed through the same rich-evidence gate before persistence."""
-        if not GOOGLE_PLACES_API_KEY:
-            return []
+    @staticmethod
+    def _foursquare_location(place: Dict[str, Any]) -> Dict[str, Any]:
+        return place.get("location") or {}
 
-        endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
-        category_hint = CATEGORY_GOOGLE_QUERIES.get(canonical_category, canonical_category)
+    @classmethod
+    def _foursquare_address(cls, place: Dict[str, Any]) -> str:
+        location = cls._foursquare_location(place)
+        formatted = str(location.get("formatted_address") or "").strip()
+        if formatted:
+            return formatted
+        parts = [
+            location.get("address"),
+            location.get("locality"),
+            location.get("region"),
+            location.get("postcode"),
+            location.get("country"),
+        ]
+        return ", ".join(str(part).strip() for part in parts if str(part or "").strip())
 
-        resolved = await self._geocode_city(city)
-        payload: Dict[str, Any] = {
-            "textQuery": f"{category_hint} in {city}, India",
-            "pageSize": min(max(limit * 2, 10), 20),
-            "languageCode": "en",
+    @staticmethod
+    def _foursquare_evidence(place: Dict[str, Any], match_score: float = 1.0) -> Dict[str, Any]:
+        stats = place.get("stats") or {}
+        photos = place.get("photos") or []
+        tips = place.get("tips") or []
+        rating_count = stats.get("total_ratings") or 0
+        tip_count = max(int(stats.get("total_tips") or 0), len(tips))
+        photo_count = max(int(stats.get("total_photos") or 0), len(photos))
+        location = place.get("location") or {}
+        return {
+            "rating": place.get("rating"),
+            "rating_count": int(rating_count or 0),
+            # Foursquare's text feedback is returned as user tips rather than
+            # Google-style written reviews; it serves as the written-feedback signal.
+            "review_count": int(tip_count),
+            "phone": str(place.get("tel") or "").strip(),
+            "photo_count": int(photo_count),
+            "photo_urls_present": bool(photos),
+            "formatted_address_present": bool(
+                str(location.get("formatted_address") or "").strip()
+                or str(location.get("address") or "").strip()
+            ),
+            "place_id_present": bool(str(place.get("fsq_place_id") or "").strip()),
+            "match_score": round(float(match_score), 3),
         }
-        if resolved:
-            lat, lng, _ = resolved
-            payload["locationBias"] = {
-                "circle": {
-                    "center": {"latitude": lat, "longitude": lng},
-                    "radius": 20000.0,
-                }
-            }
 
+    @classmethod
+    def _foursquare_row(cls, place: Dict[str, Any], city: str, match_score: float = 1.0) -> Dict[str, Any]:
+        location = cls._foursquare_location(place)
+        evidence = cls._foursquare_evidence(place, match_score)
+        categories = place.get("categories") or []
+        category_name = ", ".join(
+            str(item.get("name") or item.get("short_name") or "")
+            for item in categories if isinstance(item, dict)
+            if item.get("name") or item.get("short_name")
+        )
+        lat = place.get("latitude")
+        lng = place.get("longitude")
+        if lat is None:
+            lat = location.get("latitude")
+        if lng is None:
+            lng = location.get("longitude")
+        return {
+            "name": str(place.get("name") or "").strip(),
+            "address": cls._foursquare_address(place),
+            "city": city.strip(),
+            "latitude": float(lat) if lat is not None else None,
+            "longitude": float(lng) if lng is not None else None,
+            "website_url": str(place.get("website") or "").strip(),
+            "contact_phone": str(place.get("tel") or "").strip(),
+            "source_url": str(place.get("link") or "").strip(),
+            "fsq_place_id": str(place.get("fsq_place_id") or "").strip(),
+            "source_category": category_name,
+            "rating": evidence["rating"],
+            "rating_count": evidence["rating_count"],
+            "review_count": evidence["review_count"],
+            "photo_count": evidence["photo_count"],
+            "foursquare_place": place,
+            "evidence": evidence,
+        }
+
+    async def _foursquare_search(self, city: str, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Call the current Foursquare Places Search API using a Service API Key."""
+        if not FSQ_SERVICE_API_KEY:
+            print("[Gem Scout Foursquare] FSQ_SERVICE_API_KEY is not configured")
+            return []
+        endpoint = f"{FSQ_PLACES_BASE_URL}/places/search"
+        params = {
+            "query": query,
+            "near": f"{city}, India",
+            "limit": str(max(1, min(int(limit), 50))),
+            "sort": "RATING",
+            "tel_format": "NATIONAL",
+        }
         headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-            "X-Goog-FieldMask": GOOGLE_DISCOVERY_FIELD_MASK,
+            "Authorization": f"Bearer {FSQ_SERVICE_API_KEY}",
+            "X-Places-Api-Version": FSQ_PLACES_API_VERSION,
+            "Accept": "application/json",
         }
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(20, connect=6)) as client:
-                response = await client.post(endpoint, json=payload, headers=headers)
+                response = await client.get(endpoint, params=params, headers=headers)
             if response.status_code != 200:
-                print(f"[Gem Scout Google Discovery] HTTP {response.status_code}: {response.text[:500]}")
+                print(f"[Gem Scout Foursquare] HTTP {response.status_code}: {response.text[:500]}")
                 return []
-
-            places = (response.json() or {}).get("places") or []
-            rows: List[Dict[str, Any]] = []
-            seen = set()
-            center = resolved[:2] if resolved else None
-
-            for place in places:
-                if not self._google_place_matches_category(place, canonical_category):
-                    continue
-                display = str((place.get("displayName") or {}).get("text") or "").strip()
-                if not display:
-                    continue
-                dedupe = _normalize(display)
-                if not dedupe or dedupe in seen:
-                    continue
-                loc = place.get("location") or {}
-                if loc.get("latitude") is None or loc.get("longitude") is None:
-                    continue
-                lat, lng = float(loc["latitude"]), float(loc["longitude"])
-                if center and _distance_m(center[0], center[1], lat, lng) > 25000:
-                    continue
-
-                photos = place.get("photos") or []
-                phone = str(place.get("internationalPhoneNumber") or place.get("nationalPhoneNumber") or "").strip()
-                rating = place.get("rating")
-                reviews = place.get("userRatingCount")
-                address = str(place.get("formattedAddress") or "").strip()
-                place_id = str(place.get("id") or "").strip()
-                website = str(place.get("websiteUri") or "").strip()
-
-                rows.append({
-                    "osm_id": "",
-                    "name": display,
-                    "address": address,
-                    "city": city,
-                    "latitude": lat,
-                    "longitude": lng,
-                    "website_url": website,
-                    "contact_phone": phone,
-                    "source_url": str(place.get("googleMapsUri") or ""),
-                    "google_place": place,
-                    "google_place_id": place_id,
-                    "rating": rating,
-                    "review_count": int(reviews) if isinstance(reviews, (int, float)) else 0,
-                    "photo_count": len(photos),
-                })
-                seen.add(dedupe)
-                if len(rows) >= max(limit * 2, limit):
-                    break
-
-            print(f"[Gem Scout Google Discovery] discovered={len(rows)} category={canonical_category!r} city={city!r}")
-            return rows
+            data = response.json() or {}
+            results = data.get("results") or []
+            return [row for row in results if isinstance(row, dict)]
         except Exception as exc:
-            print(f"[Gem Scout Google Discovery] {exc}")
+            print(f"[Gem Scout Foursquare] Search failed for query={query!r}: {exc}")
             return []
 
-    async def _google_verify(
-        self,
-        candidate: Dict[str, Any],
-        city: str,
-        canonical_category: str,
-    ) -> Tuple[Optional[Dict[str, Any]], float, Dict[str, Any]]:
-        """Return (best_place, match_score, evidence) for live Google verification."""
-        if not GOOGLE_PLACES_API_KEY:
-            return None, 0.0, {"reason": "google_key_missing"}
-
-        endpoint = f"{GOOGLE_PLACES_BASE_URL}/places:searchText"
-        field_mask = ",".join([
-            "places.id",
-            "places.displayName",
-            "places.formattedAddress",
-            "places.location",
-            "places.googleMapsUri",
-            "places.websiteUri",
-            "places.internationalPhoneNumber",
-            "places.nationalPhoneNumber",
-            "places.rating",
-            "places.userRatingCount",
-            "places.photos",
-            "places.primaryType",
-            "places.primaryTypeDisplayName",
-            "places.types",
-        ])
-        category_hint = CATEGORY_GOOGLE_QUERIES.get(canonical_category, canonical_category)
-        payload = {
-            "textQuery": f"{candidate['name']} {category_hint} {city}",
-            "pageSize": 5,
-            "languageCode": "en",
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-            "X-Goog-FieldMask": field_mask,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5)) as client:
-                response = await client.post(endpoint, json=payload, headers=headers)
-            if response.status_code != 200:
-                print(f"[Gem Scout Google] HTTP {response.status_code}: {response.text[:500]}")
-                return None, 0.0, {"reason": f"http_{response.status_code}"}
-
-            places = (response.json() or {}).get("places") or []
-            best_place: Optional[Dict[str, Any]] = None
-            best_score = 0.0
+    async def _foursquare_candidates(
+        self, city: str, canonical_category: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        """Discover a small user-requested category set through Foursquare."""
+        variants = FOURSQUARE_QUERY_VARIANTS.get(
+            canonical_category,
+            [CATEGORY_FOURSQUARE_QUERIES.get(canonical_category, canonical_category.lower())],
+        )
+        per_query = min(max(limit * 2, 10), 30)
+        seen_ids = set()
+        seen_names = set()
+        rows: List[Dict[str, Any]] = []
+        for term in variants[:3]:
+            places = await self._foursquare_search(city, term, per_query)
             for place in places:
-                display = (place.get("displayName") or {}).get("text") or ""
-                loc = place.get("location") or {}
-                plat, plng = loc.get("latitude"), loc.get("longitude")
-                name_score = _name_similarity(candidate["name"], display)
-                dist_score = 0.0
-                distance_m = None
-                if plat is not None and plng is not None:
-                    distance_m = _distance_m(
-                        float(candidate["latitude"]),
-                        float(candidate["longitude"]),
-                        float(plat),
-                        float(plng),
-                    )
-                    dist_score = max(0.0, 1.0 - min(distance_m, 7500.0) / 7500.0)
+                place_id = str(place.get("fsq_place_id") or "").strip()
+                name = str(place.get("name") or "").strip()
+                if not place_id or not name or not self._foursquare_place_matches_category(place, canonical_category):
+                    continue
+                normalized_name = _normalize(name)
+                identity = place_id or normalized_name
+                if identity in seen_ids or normalized_name in seen_names:
+                    continue
+                row = self._foursquare_row(place, city)
+                if row["latitude"] is None or row["longitude"] is None or not row["address"]:
+                    continue
+                row["osm_id"] = ""
+                rows.append(row)
+                seen_ids.add(identity)
+                seen_names.add(normalized_name)
+        rows.sort(
+            key=lambda row: (
+                int(row.get("review_count") or 0),
+                int(row.get("rating_count") or 0),
+                int(row.get("photo_count") or 0),
+                float(row.get("rating") or 0.0),
+            ),
+            reverse=True,
+        )
+        print(f"[Gem Scout Foursquare Discovery] discovered={len(rows)} category={canonical_category!r} city={city!r}")
+        return rows[: max(limit * 5, limit)]
 
-                score = name_score * 0.70 + dist_score * 0.30
-                if score > best_score:
-                    best_score = score
-                    best_place = place
-
-            if not best_place or best_score < 0.68:
-                return None, best_score, {"reason": "weak_match"}
-
-            phone = str(
-                best_place.get("internationalPhoneNumber")
-                or best_place.get("nationalPhoneNumber")
-                or ""
-            ).strip()
-            rating = best_place.get("rating")
-            reviews = best_place.get("userRatingCount")
-            photos = best_place.get("photos") or []
-            formatted_address = str(best_place.get("formattedAddress") or "").strip()
-            website = str(best_place.get("websiteUri") or "").strip()
-            place_id = str(best_place.get("id") or "").strip()
-
-            evidence = {
-                "rating": rating,
-                "review_count": int(reviews) if isinstance(reviews, (int, float)) else None,
-                "phone": phone,
-                "photo_count": len(photos),
-                "formatted_address_present": bool(formatted_address),
-                "website_present": bool(website),
-                "place_id_present": bool(place_id),
-                "match_score": round(best_score, 3),
-            }
-            return best_place, best_score, evidence
-        except Exception as exc:
-            print(f"[Gem Scout Google] {exc}")
-            return None, 0.0, {"reason": "exception"}
+    async def _foursquare_verify(
+        self, candidate: Dict[str, Any], city: str, canonical_category: str
+    ) -> Tuple[Optional[Dict[str, Any]], float, Dict[str, Any]]:
+        """Match a secondary OSM candidate to a live Foursquare place."""
+        name = str(candidate.get("name") or "").strip()
+        if not name or not FSQ_SERVICE_API_KEY:
+            return None, 0.0, {"reason": "name_or_foursquare_key_missing"}
+        category_hint = CATEGORY_FOURSQUARE_QUERIES.get(canonical_category, canonical_category.lower())
+        results = await self._foursquare_search(city, f"{name} {category_hint}", 5)
+        best_place: Optional[Dict[str, Any]] = None
+        best_score = 0.0
+        for place in results:
+            display = str(place.get("name") or "").strip()
+            if not self._foursquare_place_matches_category(place, canonical_category):
+                continue
+            name_score = _name_similarity(name, display)
+            plat = place.get("latitude")
+            plng = place.get("longitude")
+            if plat is None or plng is None:
+                continue
+            distance_m = _distance_m(
+                float(candidate["latitude"]), float(candidate["longitude"]), float(plat), float(plng)
+            )
+            distance_score = max(0.0, 1.0 - min(distance_m, 7500.0) / 7500.0)
+            score = name_score * 0.70 + distance_score * 0.30
+            if score > best_score:
+                best_score, best_place = score, place
+        if not best_place or best_score < 0.68:
+            return None, best_score, {"reason": "weak_foursquare_match", "match_score": round(best_score, 3)}
+        evidence = self._foursquare_evidence(best_place, best_score)
+        return best_place, best_score, evidence
 
     @staticmethod
     def _rich_evidence_gate(evidence: Dict[str, Any]) -> Tuple[bool, float, str]:
-        """Require the business evidence the user asked the Scout to prioritize."""
+        """Accept only records with a location, rating activity, text feedback, phone and image evidence."""
         rating = evidence.get("rating")
-        reviews = evidence.get("review_count") or 0
+        rating_count = int(evidence.get("rating_count") or 0)
+        tips_count = int(evidence.get("review_count") or 0)
         phone = str(evidence.get("phone") or "").strip()
         photo_count = int(evidence.get("photo_count") or 0)
         address_present = bool(evidence.get("formatted_address_present"))
         place_id_present = bool(evidence.get("place_id_present"))
         match_score = float(evidence.get("match_score") or 0.0)
 
-        # Hard gate: without these signals we do not persist the candidate.
         if rating is None:
             return False, 0.0, "missing_rating"
-        if int(reviews) < 1:
-            return False, 0.0, "no_reviews"
+        if rating_count < 1:
+            return False, 0.0, "no_rating_activity"
+        if tips_count < 1:
+            return False, 0.0, "no_written_feedback"
         if not phone:
             return False, 0.0, "missing_phone"
         if photo_count < 1:
             return False, 0.0, "missing_photo"
+        if not evidence.get("photo_urls_present"):
+            return False, 0.0, "photo_asset_not_returned"
         if not address_present:
-            return False, 0.0, "missing_google_address"
+            return False, 0.0, "missing_address"
         if not place_id_present:
-            return False, 0.0, "missing_place_id"
+            return False, 0.0, "missing_foursquare_place_id"
         if match_score < 0.68:
             return False, 0.0, "weak_match"
 
-        # Soft quality score for ranking candidates that passed the gate.
+        # Foursquare's rating scale is different from Google's. Reward ratings
+        # on the upper end of its scale while still retaining the evidence counts.
         score = 0.30
-        score += 0.16 if float(rating) >= 4.0 else 0.10
-        score += 0.08 if int(reviews) >= 10 else 0.04
-        score += 0.08 if int(reviews) >= 50 else 0.00
+        score += 0.14 if float(rating) >= 8.0 else 0.08 if float(rating) >= 6.0 else 0.00
+        score += 0.07 if rating_count >= 10 else 0.03
+        score += 0.07 if tips_count >= 5 else 0.03
         score += 0.10  # phone
-        score += 0.10  # photo
+        score += 0.10  # returned photo assets
         score += 0.08 if address_present else 0.00
         score += min(0.10, max(0.0, match_score) * 0.10)
-        return True, round(min(0.99, score), 3), "rich_google_evidence"
+        return True, round(min(0.99, score), 3), "foursquare_rich_evidence"
 
     async def run_community_scout(
         self,
@@ -647,31 +608,32 @@ class GemScout:
         quantity: int = 10,
         verify_google: bool = True,
     ) -> ScoutRunResult:
+        # verify_google remains in the signature for backwards compatibility with
+        # main.py callers, but V5 never sends requests to Google.
         city = city.strip()
         requested_category = category.strip() or "Food"
         quantity = max(1, min(int(quantity), 50))
         profile = _resolve_profile(requested_category)
         canonical_category = profile["canonical"]
+        if verify_google:
+            print("[Gem Scout] V5 uses Foursquare; the legacy verify_google flag is ignored.")
 
-        if not verify_google:
-            print("[Gem Scout] verify_google=false is intentionally ignored for evidence-first mode.")
-            verify_google = True
+        fsq_candidates = await self._foursquare_candidates(city, canonical_category, quantity)
+        candidates = list(fsq_candidates)
+        discovery_source = "FOURSQUARE"
 
-        # Google is the primary discovery path because this hosted service may
-        # not be able to reach Overpass/Nominatim reliably. OSM remains an
-        # optional secondary source when Google discovery returns too few rows.
-        google_candidates = await self._google_candidates(city, canonical_category, quantity)
-        candidates = google_candidates
-        discovery_source = "GOOGLE" if google_candidates else "OSM"
+        # Optional OSM fallback only expands the candidate pool. Any OSM result
+        # must still be verified against Foursquare before it can be saved.
         if len(candidates) < quantity:
             osm_candidates = await self._osm_candidates(city, profile, quantity)
             existing_names = {_normalize(row.get("name")) for row in candidates}
             for row in osm_candidates:
-                if _normalize(row.get("name")) not in existing_names:
+                key = _normalize(row.get("name"))
+                if key and key not in existing_names:
                     candidates.append(row)
-                    existing_names.add(_normalize(row.get("name")))
+                    existing_names.add(key)
             if osm_candidates:
-                discovery_source = "GOOGLE+OPENSTREETMAP" if google_candidates else "OPENSTREETMAP"
+                discovery_source = "FOURSQUARE+OPENSTREETMAP" if fsq_candidates else "OPENSTREETMAP"
 
         scanned = len(candidates)
         if scanned == 0:
@@ -681,17 +643,15 @@ class GemScout:
         inserted = 0
         updated = 0
         now = datetime.now(timezone.utc).isoformat()
-
-        # Strong local completeness first; then we will use live Google evidence
-        # as the actual publication gate.
         candidates.sort(
             key=lambda row: (
                 bool(row.get("address")),
                 bool(row.get("contact_phone")),
                 bool(row.get("website_url")),
                 int(row.get("review_count") or 0),
-                float(row.get("rating") or 0.0),
+                int(row.get("rating_count") or 0),
                 int(row.get("photo_count") or 0),
+                float(row.get("rating") or 0.0),
             ),
             reverse=True,
         )
@@ -700,55 +660,60 @@ class GemScout:
         for row in candidates:
             if len(accepted) >= quantity:
                 break
+            place = row.get("foursquare_place")
+            evidence = row.get("evidence")
+            match_score = float((evidence or {}).get("match_score") or 1.0)
+            if not place:
+                place, match_score, evidence = await self._foursquare_verify(row, city, canonical_category)
+            if not place:
+                reason = str((evidence or {}).get("reason") or "foursquare_match_not_found")
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                continue
 
-            if row.get("google_place"):
-                google_place = row.get("google_place")
-                google_match_score = 1.0
-                evidence = {
-                    "rating": row.get("rating"),
-                    "review_count": row.get("review_count") or 0,
-                    "phone": row.get("contact_phone") or "",
-                    "photo_count": row.get("photo_count") or 0,
-                    "formatted_address_present": bool(row.get("address")),
-                    "website_present": bool(row.get("website_url")),
-                    "place_id_present": bool(row.get("google_place_id")),
-                    "match_score": 1.0,
-                }
-            else:
-                google_place, google_match_score, evidence = await self._google_verify(
-                    row,
-                    city,
-                    canonical_category,
-                )
+            verified_row = self._foursquare_row(place, city, match_score)
+            evidence = verified_row.get("evidence") or evidence or {}
             passed, evidence_score, evidence_reason = self._rich_evidence_gate(evidence)
             if not passed:
                 rejection_counts[evidence_reason] = rejection_counts.get(evidence_reason, 0) + 1
                 continue
 
-            google_place_id = str(google_place.get("id") or "") if google_place else ""
-            confidence = round(min(0.995, evidence_score), 3)
+            fsq_place_id = str(place.get("fsq_place_id") or "").strip()
+            if not fsq_place_id:
+                rejection_counts["missing_foursquare_place_id"] = rejection_counts.get("missing_foursquare_place_id", 0) + 1
+                continue
+            # Use the verified provider's current address/contact/coordinates. The
+            # image and text-feedback payloads are used only in this run's gate.
+            name = str(verified_row.get("name") or row.get("name") or "").strip()
+            address = str(verified_row.get("address") or row.get("address") or "").strip()
+            latitude = verified_row.get("latitude") if verified_row.get("latitude") is not None else row.get("latitude")
+            longitude = verified_row.get("longitude") if verified_row.get("longitude") is not None else row.get("longitude")
+            phone = str(verified_row.get("contact_phone") or row.get("contact_phone") or "").strip()
+            website = str(verified_row.get("website_url") or row.get("website_url") or "").strip()
+            if not name or not address or latitude is None or longitude is None:
+                rejection_counts["missing_core_place_fields"] = rejection_counts.get("missing_core_place_fields", 0) + 1
+                continue
 
             dedupe_key = "|".join([
                 _normalize(city),
                 _normalize(canonical_category),
-                _normalize(row["name"]),
+                _normalize(fsq_place_id),
             ])
-
             candidate = ScoutCandidate(
                 dedupe_key=dedupe_key,
                 city=city,
                 category=canonical_category,
-                name=row["name"],
-                address=row["address"],
-                latitude=float(row["latitude"]),
-                longitude=float(row["longitude"]),
-                website_url=str(row.get("website_url") or ""),
-                contact_phone=str(row.get("contact_phone") or ""),
-                source=f"{discovery_source}+GOOGLE_VERIFIED",
-                source_url=str(row.get("source_url") or ""),
-                google_place_id=google_place_id,
-                confidence=confidence,
-                verification_status="google_verified_rich_evidence",
+                name=name,
+                address=address,
+                latitude=float(latitude),
+                longitude=float(longitude),
+                website_url=website,
+                contact_phone=phone,
+                source=f"{discovery_source}+FOURSQUARE_VERIFIED",
+                source_url=str(verified_row.get("source_url") or row.get("source_url") or ""),
+                google_place_id="",
+                fsq_place_id=fsq_place_id,
+                confidence=round(min(0.995, evidence_score), 3),
+                verification_status="foursquare_verified_rich_evidence",
                 status="candidate",
                 discovered_at=now,
             )
@@ -756,7 +721,7 @@ class GemScout:
             try:
                 existing = (
                     self.supabase.table("gem_scout_candidates")
-                    .select("id,status,confidence,google_place_id")
+                    .select("id,status,confidence,google_place_id,fsq_place_id")
                     .eq("dedupe_key", dedupe_key)
                     .limit(1)
                     .execute()
@@ -765,6 +730,7 @@ class GemScout:
                 if existing_rows:
                     record_id = existing_rows[0].get("id")
                     self.supabase.table("gem_scout_candidates").update({
+                        "name": candidate.name,
                         "address": candidate.address,
                         "latitude": candidate.latitude,
                         "longitude": candidate.longitude,
@@ -772,7 +738,8 @@ class GemScout:
                         "contact_phone": candidate.contact_phone,
                         "source": candidate.source,
                         "source_url": candidate.source_url,
-                        "google_place_id": candidate.google_place_id or existing_rows[0].get("google_place_id"),
+                        "google_place_id": "",
+                        "fsq_place_id": candidate.fsq_place_id,
                         "confidence": candidate.confidence,
                         "verification_status": candidate.verification_status,
                         "last_seen_at": now,
@@ -790,9 +757,9 @@ class GemScout:
 
         source_counts: Dict[str, int] = {
             "DISCOVERY_SCANNED": scanned,
-            "GOOGLE_DISCOVERED": len(google_candidates),
-            "OPENSTREETMAP_SCANNED": max(0, scanned - len(google_candidates)),
-            "GOOGLE_VERIFIED_RICH": len(accepted),
+            "FOURSQUARE_DISCOVERED": len(fsq_candidates),
+            "OPENSTREETMAP_SCANNED": max(0, scanned - len(fsq_candidates)),
+            "FOURSQUARE_VERIFIED_RICH": len(accepted),
         }
         for reason, count in rejection_counts.items():
             source_counts[f"REJECTED_{reason.upper()}"] = count
