@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Omni TouristOS · Gem Scout Evidence Review</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    :root{color-scheme:light;--ink:#142033;--muted:#66758a;--line:#dbe3ed;--paper:#f4f7fb;--card:#fff;--brand:#2857d9;--brand-dark:#1a3fae;--good:#176c43;--warn:#8a5600;--bad:#a52c37;--shadow:0 10px 28px rgba(20,32,51,.08)}
+    *{box-sizing:border-box}body{margin:0;background:var(--paper);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink);line-height:1.45}header{background:#0f1d35;color:#fff;padding:22px clamp(16px,4vw,48px)}header .brand{font-weight:800;font-size:19px;letter-spacing:.2px}header p{margin:7px 0 0;color:#c8d4e8;max-width:780px;font-size:14px}.wrap{max-width:1150px;margin:25px auto;padding:0 16px 48px}.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:20px;min-width:0}.wide{grid-column:1/-1}h1{font-size:24px;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}p{margin:7px 0;color:var(--muted)}.small{font-size:12px;color:var(--muted)}label{display:block;font-size:13px;font-weight:700;margin:13px 0 5px}input,select,textarea{width:100%;padding:11px 12px;border:1px solid #c9d4e2;border-radius:9px;font:inherit;background:#fff;color:var(--ink)}textarea{min-height:82px;resize:vertical}button{border:0;border-radius:9px;padding:11px 15px;font:inherit;font-weight:750;cursor:pointer;background:var(--brand);color:#fff}button:hover{background:var(--brand-dark)}button.secondary{background:#e8eef8;color:#22314c}button.danger{background:#fff0f1;color:var(--bad);border:1px solid #f1c7cb}button:disabled{opacity:.5;cursor:not-allowed}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:15px}.hidden{display:none!important}.alert{margin-top:12px;padding:11px 12px;border-radius:9px;background:#eef4ff;color:#23498e;font-size:13px}.alert.error{background:#fff0f1;color:var(--bad)}.alert.good{background:#e9f8ef;color:var(--good)}.candidate-list,.submission-list{display:grid;gap:10px}.candidate{border:1px solid var(--line);border-radius:11px;padding:13px;display:flex;gap:10px;align-items:flex-start}.candidate input{width:auto;margin-top:5px}.candidate strong,.submission strong{display:block}.candidate .meta,.submission .meta{font-size:12px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}.pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#fff2d6;color:var(--warn);font-size:11px;font-weight:800;margin-top:7px}.submission{border:1px solid var(--line);border-radius:12px;padding:14px}.submission a{color:var(--brand);overflow-wrap:anywhere}.submission .links{font-size:13px;display:grid;gap:4px;margin-top:7px}.subhead{display:flex;align-items:center;justify-content:space-between;gap:10px}.loading{color:var(--muted);font-size:13px}.footer-note{margin-top:20px;font-size:12px;color:var(--muted);border-top:1px solid var(--line);padding-top:14px}@media(max-width:800px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}.card{padding:16px}.subhead{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand">Omni TouristOS · Gem Scout</div>
+  <p>Evidence submission and manual review for discovered local businesses. This portal does not publish places to Community Gems and does not create ratings or reviews.</p>
+</header>
+<main class="wrap">
+  <section id="configWarning" class="card">
+    <h1>Portal configuration required</h1>
+    <p>Before deployment, set <code>SUPABASE_URL</code> and the public <code>SUPABASE_ANON_KEY</code> in this file. Never put a Supabase service-role key in a browser page.</p>
+  </section>
+  <section id="authPanel" class="card hidden">
+    <h1>Sign in to verify a local place</h1>
+    <p>Use your existing Omni TouristOS Supabase account, or create an account to submit supporting evidence. Approval remains restricted to admin/supervisor users.</p>
+    <label for="email">Email address</label><input id="email" type="email" autocomplete="username" required>
+    <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required>
+    <div class="actions"><button id="signInBtn">Sign in</button><button id="signUpBtn" class="secondary">Create account</button></div>
+    <div id="authMessage" class="alert hidden"></div>
+  </section>
+  <section id="appPanel" class="hidden">
+    <div class="subhead" style="margin-bottom:16px"><div><h1>Evidence review workspace</h1><p id="identity"></p></div><div class="actions" style="margin-top:0"><button id="refreshBtn" class="secondary">Refresh</button><button id="signOutBtn" class="secondary">Sign out</button></div></div>
+    <div class="grid">
+      <section class="card">
+        <h2>1. Select a pending candidate</h2>
+        <p class="small">Only active candidates are shown. Previously rejected rows are excluded.</p>
+        <div id="candidateList" class="candidate-list"><div class="loading">Loading candidates…</div></div>
+        <div id="candidateMessage" class="alert hidden"></div>
+      </section>
+      <section class="card">
+        <h2>2. Submit evidence</h2>
+        <p>Choose a candidate and provide at least one useful detail. Corrected name, phone, website, photo URLs, supporting source URLs, and notes may be left blank unless you have that information. A reviewer cannot approve the submission until it includes at least one credible source URL and at least one phone number, official website, or photo reference.</p>
+        <form id="evidenceForm">
+          <label for="candidateSelect">Candidate</label><select id="candidateSelect" required><option value="">Choose a candidate</option></select>
+          <label for="businessName">Correct business name (optional)</label><input id="businessName" maxlength="180" placeholder="Only if the discovered name is incorrect">
+          <label for="phone">Phone number (optional)</label><input id="phone" type="tel" maxlength="60" placeholder="Include country code when known">
+          <label for="website">Official website URL (optional)</label><input id="website" type="url" maxlength="500" placeholder="https://…">
+          <label for="photos">Photo URLs (one per line, optional)</label><textarea id="photos" placeholder="https://…"></textarea>
+          <label for="sources">Supporting source URLs (one per line; recommended, required before approval)</label><textarea id="sources" placeholder="Official website, verified business listing, or other credible source"></textarea>
+          <label for="notes">Evidence notes (optional)</label><textarea id="notes" maxlength="2000" placeholder="What does each source establish? Avoid adding unverified ratings or reviews."></textarea>
+          <div class="actions"><button type="submit" id="submitEvidenceBtn">Submit for review</button></div>
+        </form>
+        <div id="submitMessage" class="alert hidden"></div>
+      </section>
+      <section class="card wide">
+        <div class="subhead"><h2>3. Evidence submissions</h2><span id="reviewerBadge" class="pill hidden">ADMIN REVIEWER</span></div>
+        <p id="submissionHint">You can see your own submissions. Admins and supervisors can review all pending submissions.</p>
+        <div id="submissionList" class="submission-list"><div class="loading">Loading submissions…</div></div>
+        <div id="submissionMessage" class="alert hidden"></div>
+      </section>
+    </div>
+  </section>
+  <p class="footer-note">Security: authenticated Supabase client only. Evidence stays in a review queue until approved by an admin/supervisor. Approving evidence does not publish the place. This workflow does not accept externally copied ratings or reviews as first-party community feedback.</p>
+</main>
+<script>
+  // Replace only these two placeholders before deploying. Use the Supabase public anon key, NEVER service_role.
+  const SUPABASE_URL = "https://jzkbhbnrzkekbjxumvom.supabase.co";
+  const SUPABASE_ANON_KEY = "sb_publishable_ZRmTcrvjvvnJzWINRTXcxg_VVZmWxjZ";
+  const configured = SUPABASE_URL.startsWith("https://") && !SUPABASE_URL.includes("REPLACE_WITH") && SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.includes("REPLACE_WITH");
+  const $ = (id) => document.getElementById(id);
+  const state = { client: null, session: null, candidates: [], submissions: [], reviewer: false };
+  function message(id, text, type="") { const box=$(id); box.textContent=text; box.className="alert"+(type?" "+type:""); box.classList.remove("hidden"); }
+  function clearMessage(id){$(id).classList.add("hidden");$(id).textContent="";}
+  function node(tag, text, className){const n=document.createElement(tag); if(text!==undefined)n.textContent=text; if(className)n.className=className; return n;}
+  function lines(text){return String(text||"").split(/\r?\n/).map(v=>v.trim()).filter(Boolean);}
+  function isHttpUrl(value){try{const u=new URL(value); return u.protocol==="https:"||u.protocol==="http:";}catch{return false;}}
+  function showAuth(){ $("authPanel").classList.remove("hidden"); $("appPanel").classList.add("hidden"); }
+  function showApp(){ $("authPanel").classList.add("hidden"); $("appPanel").classList.remove("hidden"); }
+  function renderCandidates(){
+    const list=$("candidateList"), sel=$("candidateSelect"); list.replaceChildren(); sel.replaceChildren(new Option("Choose a candidate", ""));
+    if(!state.candidates.length){list.append(node("p","No active candidate rows were returned. Refresh after the SQL migration and check that the signed-in user has access."));return;}
+    state.candidates.forEach(c=>{
+      const title=`${c.name||"Unnamed place"} · ${c.category||"Uncategorised"}`;
+      const label=node("label",undefined,"candidate"); const radio=node("input"); radio.type="radio"; radio.name="candidateRadio"; radio.value=c.id; radio.addEventListener("change",()=>{sel.value=c.id;});
+      const body=node("div"); body.append(node("strong",title),node("div",`${c.city||""} · ${c.address||"Address unavailable"}`,"meta"),node("span",c.evidence_status||"not_submitted","pill")); label.append(radio,body); list.append(label);
+      sel.add(new Option(`${c.name||"Unnamed place"} — ${c.address||c.city||""}`,c.id));
+    });
+  }
+  function renderSubmissions(){
+    const list=$("submissionList"); list.replaceChildren();
+    if(!state.submissions.length){list.append(node("p","No evidence submissions yet."));return;}
+    state.submissions.forEach(s=>{
+      const card=node("article",undefined,"submission");
+      const candidate=state.candidates.find(c=>c.id===s.candidate_id);
+      card.append(node("strong",s.business_name||candidate?.name||"Business evidence submission"));
+      card.append(node("div",`${candidate?.category||"Candidate"} · ${candidate?.city||""} · status: ${s.status}`,"meta"));
+      const values=[];
+      if(s.phone) values.push(`Phone: ${s.phone}`);
+      if(s.website_url) values.push(`Website: ${s.website_url}`);
+      if(s.notes) values.push(`Notes: ${s.notes}`);
+      values.forEach(v=>card.append(node("p",v)));
+      const linkWrap=node("div",undefined,"links");
+      (s.source_urls||[]).forEach(u=>{if(isHttpUrl(u)){const a=node("a",u);a.href=u;a.target="_blank";a.rel="noopener noreferrer";linkWrap.append(a);}});
+      (s.photo_urls||[]).forEach(u=>{if(isHttpUrl(u)){const a=node("a",`Photo: ${u}`);a.href=u;a.target="_blank";a.rel="noopener noreferrer";linkWrap.append(a);}});
+      card.append(linkWrap);
+      if(state.reviewer && s.status==="pending"){
+        const note=node("textarea"); note.maxLength=2000; note.placeholder="Reviewer notes (optional; explain any decision)"; note.setAttribute("aria-label","Reviewer notes"); card.append(note);
+        const actions=node("div",undefined,"actions"); const approve=node("button","Approve evidence"); approve.addEventListener("click",()=>review(s.id,"approve",note.value)); const reject=node("button","Reject evidence","danger"); reject.addEventListener("click",()=>review(s.id,"reject",note.value)); actions.append(approve,reject); card.append(actions);
+      }
+      if(s.review_notes) card.append(node("p",`Reviewer note: ${s.review_notes}`));
+      list.append(card);
+    });
+  }
+  async function refresh(){
+    clearMessage("candidateMessage");clearMessage("submitMessage");clearMessage("submissionMessage");
+    const candidatesRes=await state.client.from("gem_scout_candidates").select("id,city,category,name,address,contact_phone,website_url,evidence_status,verification_status,status").eq("status","candidate").order("confidence",{ascending:false}).limit(200);
+    if(candidatesRes.error){message("candidateMessage",candidatesRes.error.message,"error");state.candidates=[];}else{state.candidates=candidatesRes.data||[];}
+    const reviewerRes=await state.client.rpc("gem_scout_is_reviewer"); state.reviewer=!reviewerRes.error && reviewerRes.data===true;
+    $("reviewerBadge").classList.toggle("hidden",!state.reviewer);
+    $("submissionHint").textContent=state.reviewer?"Reviewer mode: pending submissions can be approved or rejected after checking the source links.":"You can see your own submissions. Admins and supervisors can review all pending submissions.";
+    const subsRes=await state.client.from("gem_scout_evidence_submissions").select("*").order("created_at",{ascending:false}).limit(100);
+    if(subsRes.error){message("submissionMessage",subsRes.error.message,"error");state.submissions=[];}else{state.submissions=subsRes.data||[];}
+    renderCandidates(); renderSubmissions();
+  }
+  async function review(id,decision,notes){
+    if(!confirm(`${decision==="approve"?"Approve evidence":"Reject evidence"}? The candidate will not be published automatically.`)) return;
+    const result=await state.client.rpc("review_gem_scout_evidence",{p_submission_id:id,p_decision:decision,p_review_notes:notes||""});
+    if(result.error){message("submissionMessage",result.error.message,"error");return;}
+    message("submissionMessage",result.data?.note||`Submission ${decision}d.`,"good"); await refresh();
+  }
+  async function signIn(){
+    clearMessage("authMessage"); const email=$("email").value.trim(), password=$("password").value;
+    const r=await state.client.auth.signInWithPassword({email,password});
+    if(r.error){message("authMessage",r.error.message,"error");return;}
+    state.session=r.data.session; $("identity").textContent=`Signed in as ${state.session.user.email||state.session.user.id}`; showApp(); await refresh();
+  }
+  async function signUp(){
+    clearMessage("authMessage"); const email=$("email").value.trim(), password=$("password").value;
+    if(password.length<8){message("authMessage","Use a password of at least 8 characters.","error");return;}
+    const r=await state.client.auth.signUp({email,password});
+    if(r.error){message("authMessage",r.error.message,"error");return;}
+    message("authMessage",r.data.session?"Account created. You can submit evidence now.":"Account created. Check your email for confirmation, then sign in.","good");
+    if(r.data.session){state.session=r.data.session;$("identity").textContent=`Signed in as ${state.session.user.email||state.session.user.id}`;showApp();await refresh();}
+  }
+  async function submitEvidence(event){
+    event.preventDefault(); clearMessage("submitMessage");
+    const candidateId=$("candidateSelect").value;
+    const businessName=$("businessName").value.trim();
+    const phone=$("phone").value.trim();
+    const website=$("website").value.trim();
+    const photoUrls=lines($("photos").value);
+    const sourceUrls=lines($("sources").value);
+    const notes=$("notes").value.trim();
+    if(!candidateId){message("submitMessage","Choose a candidate first.","error");return;}
+    if(!businessName && !phone && !website && !photoUrls.length && !sourceUrls.length){
+      message("submitMessage","Add at least one useful detail: a corrected name, phone, website, photo URL, or supporting source URL. Notes alone are not enough.","error");return;
+    }
+    if(phone && phone.replace(/\D/g,"").length < 7){
+      message("submitMessage","That phone entry looks incomplete. Enter the full business number, or leave the field blank.","error");return;
+    }
+    if([...sourceUrls,...photoUrls].some(u=>!isHttpUrl(u))){message("submitMessage","All photo and source links must begin with http:// or https://.","error");return;}
+    if(website&&!isHttpUrl(website)){message("submitMessage","The website must be a valid http:// or https:// URL.","error");return;}
+    const payload={candidate_id:candidateId,submitted_by:state.session.user.id,business_name:businessName,phone,website_url:website,photo_urls:photoUrls,source_urls:sourceUrls,notes};
+    const btn=$("submitEvidenceBtn");btn.disabled=true;
+    try {
+      const result=await state.client.from("gem_scout_evidence_submissions").insert(payload).select("id").single();
+      if(result.error){message("submitMessage",result.error.message,"error");return;}
+      $("evidenceForm").reset();
+      message("submitMessage","Evidence submitted for manual review. Empty optional fields are allowed; a reviewer will require a source URL and a phone, website, or photo before approval. This does not publish the place.","good");
+      await refresh();
+    } catch (error) {
+      message("submitMessage",error?.message||"The submission could not be saved.","error");
+    } finally { btn.disabled=false; }
+  }
+  if(configured){
+    $("configWarning").classList.add("hidden");$("authPanel").classList.remove("hidden");
+    state.client=window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+    $("signInBtn").addEventListener("click",signIn);$("signUpBtn").addEventListener("click",signUp);$("evidenceForm").addEventListener("submit",submitEvidence);$("refreshBtn").addEventListener("click",refresh);
+    $("signOutBtn").addEventListener("click",async()=>{await state.client.auth.signOut();state.session=null;showAuth();});
+    state.client.auth.getSession().then(async r=>{state.session=r.data.session;if(state.session){$("identity").textContent=`Signed in as ${state.session.user.email||state.session.user.id}`;showApp();await refresh();}else showAuth();});
+  } else { $("configWarning").classList.remove("hidden"); }
+</script>
+</body>
+</html>
