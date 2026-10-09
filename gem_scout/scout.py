@@ -288,7 +288,7 @@ class ScoutRunResult:
 
 
 class GemScout:
-    """Geoapify-first discovery using open-data evidence.
+    """V10 Geoapify-first discovery using open-data evidence.
 
     This module never calls Google or Foursquare. Geoapify/OSM data can find
     named places, categories, coordinates and address details; contact data and
@@ -721,7 +721,7 @@ class GemScout:
             try:
                 existing = (
                     self.supabase.table("gem_scout_candidates")
-                    .select("id,status,confidence,google_place_id,fsq_place_id,geoapify_place_id")
+                    .select("id,status,confidence,google_place_id,fsq_place_id,geoapify_place_id,evidence_status")
                     .eq("dedupe_key", dedupe_key)
                     .limit(1)
                     .execute()
@@ -731,6 +731,20 @@ class GemScout:
                     previous = existing_rows[0]
                     record_id = previous.get("id")
                     previous_status = str(previous.get("status") or "candidate").lower()
+                    previous_evidence_status = str(previous.get("evidence_status") or "not_submitted").lower()
+
+                    # V10 safety guard: once a reviewer approves manual evidence,
+                    # later discovery runs must not overwrite the reviewed business
+                    # name, phone, website, source links, photo references or status.
+                    # Only refresh the discovery timestamp for such a row.
+                    if previous_evidence_status == "approved":
+                        self.supabase.table("gem_scout_candidates").update({
+                            "last_seen_at": now,
+                            "updated_at": now,
+                        }).eq("id", record_id).execute()
+                        skipped_duplicates += 1
+                        continue
+
                     if previous_status in {"approved", "published", "rejected", "dismissed"}:
                         self.supabase.table("gem_scout_candidates").update({
                             "last_seen_at": now,
