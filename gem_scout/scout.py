@@ -465,6 +465,24 @@ class GemScout:
             "limit": str(max(1, min(int(limit), 50))),
             "sort": "RATING",
             "tel_format": "NATIONAL",
+            # The new Places API defaults to Pro fields when this is omitted.
+            # Ask explicitly for the richer evidence needed by Gem Scout; the
+            # API will tell us if the account is not entitled to Premium fields.
+            "fields": ",".join([
+                "fsq_place_id",
+                "name",
+                "categories",
+                "location",
+                "latitude",
+                "longitude",
+                "tel",
+                "website",
+                "link",
+                "rating",
+                "stats",
+                "photos",
+                "tips",
+            ]),
         }
         headers = {
             "Authorization": f"Bearer {FSQ_SERVICE_API_KEY}",
@@ -523,7 +541,16 @@ class GemScout:
             ),
             reverse=True,
         )
-        print(f"[Gem Scout Foursquare Discovery] discovered={len(rows)} category={canonical_category!r} city={city!r}")
+        print(
+            "[Gem Scout Foursquare Discovery] "
+            f"discovered={len(rows)} "
+            f"with_rating={sum(row.get('rating') is not None for row in rows)} "
+            f"with_rating_stats={sum(bool(row.get('rating_count')) for row in rows)} "
+            f"with_tips={sum(bool(row.get('review_count')) for row in rows)} "
+            f"with_photos={sum(bool(row.get('photo_count')) for row in rows)} "
+            f"with_phone={sum(bool(row.get('contact_phone')) for row in rows)} "
+            f"category={canonical_category!r} city={city!r}"
+        )
         return rows[: max(limit * 5, limit)]
 
     async def _foursquare_verify(
