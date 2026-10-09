@@ -237,8 +237,9 @@ class GemScout:
     named places, categories, coordinates and address details; contact data and
     image metadata are included only when the source actually provides them.
     Ratings and written reviews are not claimed because this provider does not
-    supply them. Records stay in the pending candidate queue for manual evidence
-    review and are not published directly into Community Gems.
+    supply them. Named, addressable and geolocated records are queued even when phone/site/image
+    evidence is absent. They remain pending manual evidence review and are never
+    published directly into Community Gems.
     """
 
     def __init__(self, supabase_client: Any):
@@ -603,11 +604,10 @@ class GemScout:
             if not provider_id and not osm_id:
                 rejected["missing_source_place_id"] = rejected.get("missing_source_place_id", 0) + 1
                 continue
-            # If neither phone nor website exists, this is too weak for the
-            # business-focused candidate queue; don't save it as a verified gem.
-            if not str(row.get("contact_phone") or "").strip() and not str(row.get("website_url") or "").strip():
-                rejected["missing_contact_and_website"] = rejected.get("missing_contact_and_website", 0) + 1
-                continue
+            # This is a candidate queue, not the published Community Gems feed.
+            # Missing phone/site/image/rating/reviews must remain explicit gaps
+            # for manual enrichment; it must not erase a named, addressable,
+            # geolocated place with a stable source ID from the review queue.
 
             external_id = provider_id or osm_id
             dedupe_key = "|".join([_normalize(city), _normalize(canonical_category), _normalize(external_id)])
@@ -685,6 +685,9 @@ class GemScout:
             "GEOAPIFY_DISCOVERED": len(primary_rows),
             "OPENSTREETMAP_SCANNED": max(0, scanned - len(primary_rows)),
             "QUEUED_PENDING_RICH_EVIDENCE": len(accepted),
+            "QUEUED_WITH_PHONE": sum(bool(str(item.get("contact_phone") or "").strip()) for item in rows[:quantity]),
+            "QUEUED_WITH_WEBSITE": sum(bool(str(item.get("website_url") or "").strip()) for item in rows[:quantity]),
+            "QUEUED_WITH_IMAGE_REFERENCE": sum(bool(str(item.get("image_url") or "").strip()) for item in rows[:quantity]),
             "INSERTED": inserted,
             "UPDATED": updated,
             "SKIPPED_EXISTING_DECISIONS": skipped_duplicates,
