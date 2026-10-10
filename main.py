@@ -2693,7 +2693,7 @@ async def _get_groww_access_token(client: httpx.AsyncClient) -> str:
         except (TypeError, ValueError, OverflowError):
             pass
     _groww_token_cache["token"] = str(token)
-    _groww_token_cache["expires_at"] = max(now + 60, expires_at)
+    _groww_token_cache["expires_at"] = expires_at
     return str(token)
 
 
@@ -2716,7 +2716,7 @@ async def get_market_indices():
             # Groww documents these exchange-symbol identifiers for index LTP.
             ltp_response = await client.get(
                 "https://api.groww.in/v1/live-data/ltp",
-                params={"segment": "CASH", "exchange_symbols": "NSE_NIFTY,BSE_SENSEX"},
+                params={"segment": "CASH", "exchange_trading_symbols": "NSE_NIFTY,BSE_SENSEX"},
                 headers=headers,
             )
             if ltp_response.status_code != 200:
@@ -2729,7 +2729,7 @@ async def get_market_indices():
             # OHLC provides the prior close used to calculate a displayed daily change.
             ohlc_response = await client.get(
                 "https://api.groww.in/v1/live-data/ohlc",
-                params={"segment": "CASH", "exchange_symbols": "NSE_NIFTY,BSE_SENSEX"},
+                params={"segment": "CASH", "exchange_trading_symbols": "NSE_NIFTY,BSE_SENSEX"},
                 headers=headers,
             )
             ohlc_payload: Dict[str, Any] = {}
