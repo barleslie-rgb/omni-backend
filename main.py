@@ -2488,6 +2488,185 @@ async def get_live_flight_offer(
         }
 
 
+# -------------------------------------------------------------
+# NEWS, MARKET INDICES & CRYPTO DATA
+# Provider credentials stay on the server; never ship them in Flutter.
+# GNews: set GNEWS_API_KEY. CoinGecko: set COINGECKO_DEMO_API_KEY.
+# Upstox: set UPSTOX_ACCESS_TOKEN and UPSTOX_INSTRUMENT_KEYS (comma-separated).
+# -------------------------------------------------------------
+NEWS_REFRESH_SECONDS = 15 * 60
+_news_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _news_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    item = _news_cache.get(key)
+    if item and time.time() - item.get("cached_at", 0) < NEWS_REFRESH_SECONDS:
+        return item.get("data")
+    return None
+
+
+def _news_cache_put(key: str, data: Dict[str, Any]) -> None:
+    _news_cache[key] = {"cached_at": time.time(), "data": data}
+
+
+@app.get("/api/v1/news/feed")
+async def get_news_feed(
+    category: str = Query("world"),
+    town: str = Query(""),
+    city: str = Query(""),
+    country: str = Query("India"),
+    language: str = Query("en"),
+    limit: int = Query(10, ge=1, le=10),
+):
+    api_key = os.environ.get("GNEWS_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="News provider is not configured. Set GNEWS_API_KEY on the backend.")
+    category = category.lower().strip()
+    allowed = {"local", "city", "national", "world", "financial", "business", "sports", "technology"}
+    if category not in allowed:
+        raise HTTPException(status_code=400, detail=f"category must be one of: {', '.join(sorted(allowed))}")
+    place = ", ".join(part.strip() for part in (town, city, country) if part and part.strip())
+    query_by_category = {
+        "local": place or "local news",
+        "city": (city.strip() or place or "city news"),
+        "national": (country.strip() or "India") + " news",
+        "world": "world news",
+        "financial": "financial markets stock market economy",
+        "business": "business startups companies",
+        "sports": "sports",
+        "technology": "technology AI innovation",
+    }
+    query = query_by_category[category]
+    cache_key = "|".join([category, query, language, str(limit)])
+    cached = _news_cache_get(cache_key)
+    if cached:
+        return {**cached, "cached": True}
+    params = {"q": query, "lang": language[:2], "max": limit, "apikey": api_key, "sortby": "publishedAt"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://gnews.io/api/v4/search", params=params)
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"News provider returned HTTP {response.status_code}.")
+        payload = response.json()
+        articles = []
+        for article in payload.get("articles", []):
+            articles.append({
+                "title": article.get("title"),
+                "description": article.get("description"),
+                "url": article.get("url"),
+                "image": article.get("image"),
+                "published_at": article.get("publishedAt"),
+                "source": (article.get("source") or {}).get("name", "News source"),
+            })
+        result = {"status": "success", "provider": "GNews", "category": category,
+                  "query": query, "articles": articles, "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False}
+        _news_cache_put(cache_key, result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        stale = _news_cache.get(cache_key, {}).get("data")
+        if stale:
+            return {**stale, "cached": True, "warning": "Provider temporarily unavailable; showing cached results."}
+        raise HTTPException(status_code=502, detail="News provider is temporarily unavailable.") from exc
+
+
+@app.get("/api/v1/news/breaking")
+async def get_breaking_news(country: str = Query("in"), language: str = Query("en"), limit: int = Query(5, ge=1, le=10)):
+    api_key = os.environ.get("GNEWS_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="News provider is not configured. Set GNEWS_API_KEY on the backend.")
+    cache_key = f"breaking|{country}|{language}|{limit}"
+    cached = _news_cache_get(cache_key)
+    if cached:
+        return {**cached, "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://gnews.io/api/v4/top-headlines", params={
+                "country": country[:2].lower(), "lang": language[:2], "max": limit, "apikey": api_key})
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"News provider returned HTTP {response.status_code}.")
+        payload = response.json()
+        result = {"status": "success", "provider": "GNews", "articles": [{
+            "title": a.get("title"), "description": a.get("description"), "url": a.get("url"),
+            "image": a.get("image"), "published_at": a.get("publishedAt"),
+            "source": (a.get("source") or {}).get("name", "News source")
+        } for a in payload.get("articles", [])], "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False}
+        _news_cache_put(cache_key, result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Breaking-news provider is temporarily unavailable.") from exc
+
+
+@app.get("/api/v1/markets/crypto")
+async def get_crypto_markets(vs_currency: str = Query("usd"), ids: str = Query("bitcoin,ethereum,solana,ripple")):
+    api_key = os.environ.get("COINGECKO_DEMO_API_KEY", "").strip()
+    cache_key = f"crypto|{vs_currency.lower()}|{ids}"
+    cached = _news_cache_get(cache_key)
+    if cached:
+        return {**cached, "cached": True}
+    headers = {"accept": "application/json"}
+    if api_key:
+        headers["x-cg-demo-api-key"] = api_key
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://api.coingecko.com/api/v3/coins/markets", params={
+                "vs_currency": vs_currency.lower(), "ids": ids, "order": "market_cap_desc", "per_page": 10,
+                "page": 1, "sparkline": "false", "price_change_percentage": "24h"}, headers=headers)
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Crypto provider returned HTTP {response.status_code}; configure COINGECKO_DEMO_API_KEY if needed.")
+        rows = [{"id": x.get("id"), "symbol": x.get("symbol", "").upper(), "name": x.get("name"),
+                 "price": x.get("current_price"), "change_24h": x.get("price_change_percentage_24h"),
+                 "market_cap": x.get("market_cap"), "last_updated": x.get("last_updated"), "image": x.get("image")}
+                for x in response.json()]
+        result = {"status": "success", "provider": "CoinGecko", "currency": vs_currency.lower(),
+                  "assets": rows, "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False,
+                  "attribution": "Market data provided by CoinGecko"}
+        _news_cache_put(cache_key, result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Crypto market data is temporarily unavailable.") from exc
+
+
+@app.get("/api/v1/markets/indices")
+async def get_market_indices():
+    token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+    instrument_keys = os.environ.get("UPSTOX_INSTRUMENT_KEYS", "NSE_INDEX|Nifty 50,NSE_INDEX|Nifty Bank").strip()
+    if not token:
+        return {"status": "unavailable", "provider": "Upstox", "indices": [],
+                "message": "Live Indian index quotes are not configured. Set UPSTOX_ACCESS_TOKEN and verify public display/redistribution rights."}
+    keys = [x.strip() for x in instrument_keys.split(",") if x.strip()]
+    cache_key = "indices|" + ",".join(keys)
+    cached = _news_cache_get(cache_key)
+    if cached:
+        return {**cached, "cached": True}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get("https://api.upstox.com/v2/market-quote/quotes", params={"instrument_key": ",".join(keys)},
+                                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Market quote provider returned HTTP {response.status_code}.")
+        data = response.json().get("data", {})
+        indices = []
+        for key, row in data.items():
+            display_name = key.split("|", 1)[-1] if "|" in key else key
+            indices.append({"instrument_key": key, "name": display_name,
+                            "last_price": row.get("last_price"), "net_change": row.get("net_change"),
+                            "ohlc": row.get("ohlc"), "timestamp": row.get("timestamp")})
+        result = {"status": "success", "provider": "Upstox", "indices": indices,
+                  "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False}
+        _news_cache_put(cache_key, result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Indian market index data is temporarily unavailable.") from exc
+
+
 @app.get("/api/v1/currency-rate")
 async def get_currency_rate(base: str = Query(...), quote: str = Query(...)):
     base_code = str(base or "").strip().upper()
