@@ -2525,7 +2525,7 @@ async def get_news_feed(
     if not api_key:
         raise HTTPException(status_code=503, detail="News provider is not configured. Set GNEWS_API_KEY on the backend.")
     category = category.lower().strip()
-    allowed = {"local", "city", "national", "world", "financial", "business", "sports", "technology"}
+    allowed = {"local", "city", "national", "world", "financial", "business", "sports", "technology", "tourism"}
     if category not in allowed:
         raise HTTPException(status_code=400, detail=f"category must be one of: {', '.join(sorted(allowed))}")
     place = ", ".join(part.strip() for part in (town, city, country) if part and part.strip())
@@ -2538,6 +2538,7 @@ async def get_news_feed(
         "business": "business startups companies",
         "sports": "sports",
         "technology": "technology AI innovation",
+        "tourism": "tourism travel destinations hotels resorts airlines airports travel advisories",
     }
     query = query_by_category[category]
     cache_key = "|".join([category, query, language, str(limit)])
