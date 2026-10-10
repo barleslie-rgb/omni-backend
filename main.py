@@ -2492,10 +2492,12 @@ async def get_live_flight_offer(
 # NEWS, MARKET INDICES & CRYPTO DATA
 # Provider credentials stay on the server; never ship them in Flutter.
 # GNews: set GNEWS_API_KEY. CoinGecko: set COINGECKO_DEMO_API_KEY.
-# Upstox: set UPSTOX_ACCESS_TOKEN and UPSTOX_INSTRUMENT_KEYS (comma-separated).
+# Groww: set GROWW_API_KEY and GROWW_API_SECRET in Render environment.
+# The Groww API key must be approved in the Groww Cloud API Keys page as required.
 # -------------------------------------------------------------
 NEWS_REFRESH_SECONDS = 15 * 60
 _news_cache: Dict[str, Dict[str, Any]] = {}
+_groww_token_cache: Dict[str, Any] = {"token": None, "expires_at": 0.0}
 
 
 def _news_cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -2632,39 +2634,164 @@ async def get_crypto_markets(vs_currency: str = Query("usd"), ids: str = Query("
         raise HTTPException(status_code=502, detail="Crypto market data is temporarily unavailable.") from exc
 
 
+async def _get_groww_access_token(client: httpx.AsyncClient) -> str:
+    """Return a cached Groww access token, generating one from the API key/secret when needed.
+
+    Groww API-key/secret authentication requires the key to be approved in Groww Cloud.
+    Tokens are short-lived (daily expiry), so the backend caches them until shortly
+    before the documented expiry time. No Groww credentials are returned to clients.
+    """
+    now = time.time()
+    cached_token = _groww_token_cache.get("token")
+    if cached_token and now < float(_groww_token_cache.get("expires_at", 0)):
+        return str(cached_token)
+
+    api_key = os.environ.get("GROWW_API_KEY", "").strip().strip('"').strip("'")
+    api_secret = os.environ.get("GROWW_API_SECRET", "").strip().strip('"').strip("'")
+    if not api_key or not api_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Groww market data is not configured. Set GROWW_API_KEY and GROWW_API_SECRET in the backend environment.",
+        )
+
+    timestamp = str(int(now))
+    checksum = __import__("hashlib").sha256(f"{api_secret}{timestamp}".encode("utf-8")).hexdigest()
+    try:
+        response = await client.post(
+            "https://api.groww.in/v1/token/api/access",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"},
+            json={"key_type": "approval", "checksum": checksum, "timestamp": timestamp},
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Could not reach Groww authentication service.") from exc
+
+    if response.status_code != 200:
+        # Avoid returning provider response text, which could contain sensitive details.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Groww authentication failed (HTTP {response.status_code}). Confirm the API key is approved in Groww Cloud and the Render credentials are correct.",
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Groww authentication returned an invalid response.") from exc
+
+    token = payload.get("token")
+    if not token:
+        raise HTTPException(status_code=502, detail="Groww authentication response did not contain an access token.")
+
+    # Prefer the provider expiry timestamp when present; otherwise refresh in 20 hours,
+    # safely before Groww's daily token expiry.
+    expires_at = now + (20 * 60 * 60)
+    expiry_text = payload.get("expiry")
+    if expiry_text:
+        try:
+            expiry_dt = datetime.fromisoformat(str(expiry_text).replace("Z", "+00:00"))
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            expires_at = min(expires_at, expiry_dt.timestamp() - 300)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    _groww_token_cache["token"] = str(token)
+    _groww_token_cache["expires_at"] = max(now + 60, expires_at)
+    return str(token)
+
+
 @app.get("/api/v1/markets/indices")
 async def get_market_indices():
-    token = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
-    instrument_keys = os.environ.get("UPSTOX_INSTRUMENT_KEYS", "NSE_INDEX|Nifty 50,NSE_INDEX|Nifty Bank").strip()
-    if not token:
-        return {"status": "unavailable", "provider": "Upstox", "indices": [],
-                "message": "Live Indian index quotes are not configured. Set UPSTOX_ACCESS_TOKEN and verify public display/redistribution rights."}
-    keys = [x.strip() for x in instrument_keys.split(",") if x.strip()]
-    cache_key = "indices|" + ",".join(keys)
+    """Fetch Nifty 50 and Sensex last-traded prices through Groww's live-data API."""
+    cache_key = "indices|groww|NSE_NIFTY|BSE_SENSEX"
     cached = _news_cache_get(cache_key)
     if cached:
         return {**cached, "cached": True}
+
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get("https://api.upstox.com/v2/market-quote/quotes", params={"instrument_key": ",".join(keys)},
-                                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-        if response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Market quote provider returned HTTP {response.status_code}.")
-        data = response.json().get("data", {})
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            token = await _get_groww_access_token(client)
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "X-API-VERSION": "1.0",
+            }
+            # Groww documents these exchange-symbol identifiers for index LTP.
+            ltp_response = await client.get(
+                "https://api.groww.in/v1/live-data/ltp",
+                params={"segment": "CASH", "exchange_symbols": "NSE_NIFTY,BSE_SENSEX"},
+                headers=headers,
+            )
+            if ltp_response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Groww index quote request failed (HTTP {ltp_response.status_code}).")
+            ltp_json = ltp_response.json()
+            if str(ltp_json.get("status", "SUCCESS")).upper() not in {"SUCCESS", "OK"}:
+                raise HTTPException(status_code=502, detail="Groww did not return successful index quote data.")
+            ltp_payload = ltp_json.get("payload", ltp_json)
+
+            # OHLC provides the prior close used to calculate a displayed daily change.
+            ohlc_response = await client.get(
+                "https://api.groww.in/v1/live-data/ohlc",
+                params={"segment": "CASH", "exchange_symbols": "NSE_NIFTY,BSE_SENSEX"},
+                headers=headers,
+            )
+            ohlc_payload: Dict[str, Any] = {}
+            if ohlc_response.status_code == 200:
+                try:
+                    ohlc_json = ohlc_response.json()
+                    ohlc_payload = ohlc_json.get("payload", ohlc_json) if isinstance(ohlc_json, dict) else {}
+                except ValueError:
+                    ohlc_payload = {}
+
         indices = []
-        for key, row in data.items():
-            display_name = key.split("|", 1)[-1] if "|" in key else key
-            indices.append({"instrument_key": key, "name": display_name,
-                            "last_price": row.get("last_price"), "net_change": row.get("net_change"),
-                            "ohlc": row.get("ohlc"), "timestamp": row.get("timestamp")})
-        result = {"status": "success", "provider": "Upstox", "indices": indices,
-                  "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False}
+        specs = [
+            ("NSE_NIFTY", "Nifty 50", "NSE"),
+            ("BSE_SENSEX", "Sensex", "BSE"),
+        ]
+        for symbol, display_name, exchange in specs:
+            raw_price = ltp_payload.get(symbol) if isinstance(ltp_payload, dict) else None
+            try:
+                price = float(raw_price) if raw_price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            if price is None:
+                continue
+            candle = ohlc_payload.get(symbol, {}) if isinstance(ohlc_payload, dict) else {}
+            previous_close = None
+            if isinstance(candle, dict):
+                try:
+                    # Groww OHLC's close is used as the reference close for day change.
+                    previous_close = float(candle.get("close")) if candle.get("close") is not None else None
+                except (TypeError, ValueError):
+                    previous_close = None
+            net_change = round(price - previous_close, 2) if previous_close is not None else None
+            change_percent = round((net_change / previous_close) * 100, 2) if net_change is not None and previous_close else None
+            indices.append({
+                "instrument_key": symbol,
+                "name": display_name,
+                "exchange": exchange,
+                "last_price": price,
+                "net_change": net_change,
+                "change_percent": change_percent,
+                "ohlc": candle if isinstance(candle, dict) else None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        if not indices:
+            raise HTTPException(status_code=502, detail="Groww returned no Nifty or Sensex index prices. Check the API subscription and index symbols.")
+        result = {
+            "status": "success",
+            "provider": "Groww",
+            "indices": indices,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "cached": False,
+        }
         _news_cache_put(cache_key, result)
         return result
     except HTTPException:
         raise
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail="Groww index data is temporarily unavailable. Check the Groww API subscription, approval and market-data access.") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="Indian market index data is temporarily unavailable.") from exc
+        print(f"[Groww index data notice]: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail="Groww index data is temporarily unavailable.") from exc
 
 
 @app.get("/api/v1/currency-rate")
