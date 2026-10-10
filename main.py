@@ -4723,11 +4723,14 @@ async def create_gem(request: Request):
     try:
         body = await request.json()
         creator_id = body.get("creator_id")
-        
-        if creator_id:
-            chk = supabase.table("users").select("is_banned").eq("id", creator_id).single().execute()
-            if chk.data and chk.data.get("is_banned"):
-                raise HTTPException(status_code=403, detail="Banned accounts cannot add gems.")
+
+        # Do not query users.is_banned here: that column is not present in the
+        # deployed Supabase users table and causes PostgreSQL 42703 on every
+        # gem submission. Account moderation must use a real, migrated column
+        # or a verified auth/role policy; this endpoint only inserts the gem.
+        title = str(body.get("title") or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="Gem name is required.")
 
         response = supabase.table("gems").insert({
             "community_id": body.get("community_id", "vasai-virar"),
@@ -4739,8 +4742,11 @@ async def create_gem(request: Request):
             "status": "New"
         }).execute()
         return {"status": "success", "gem": response.data}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[Community Gems create error]: {e}")
+        raise HTTPException(status_code=500, detail="Could not save the community gem. Check the gems table schema and backend logs.") from e
 
 @app.get("/api/v1/community/messages")
 async def get_community_messages(community_id: str = Query("vasai-virar")):
