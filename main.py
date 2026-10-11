@@ -2524,46 +2524,120 @@ async def get_news_feed(
     api_key = os.environ.get("GNEWS_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=503, detail="News provider is not configured. Set GNEWS_API_KEY on the backend.")
+
     category = category.lower().strip()
     allowed = {"local", "city", "national", "world", "financial", "business", "sports", "technology", "tourism"}
     if category not in allowed:
         raise HTTPException(status_code=400, detail=f"category must be one of: {', '.join(sorted(allowed))}")
-    place = ", ".join(part.strip() for part in (town, city, country) if part and part.strip())
-    query_by_category = {
-        "local": place or "local news",
-        "city": (city.strip() or place or "city news"),
-        "national": (country.strip() or "India") + " news",
-        "world": "world news",
-        "financial": "financial markets stock market economy",
-        "business": "business startups companies",
-        "sports": "sports",
-        "technology": "technology AI innovation",
-        "tourism": "tourism travel destinations hotels resorts airlines airports travel advisories",
-    }
-    query = query_by_category[category]
-    cache_key = "|".join([category, query, language, str(limit)])
+
+    town = town.strip()
+    city = city.strip()
+    country = country.strip() or "India"
+    language = (language or "en").strip().lower()[:2]
+
+    def _phrase(value: str) -> str:
+        # GNews supports quoted phrase matching; remove embedded quotes to keep q valid.
+        cleaned = value.replace('"', '').strip()
+        return f'"{cleaned}"' if cleaned else ""
+
+    # GNews treats spaces as AND. Use OR between location alternatives and travel topics
+    # so the query doesn't require one article to mention every location/keyword.
+    queries: list[str] = []
+    if category == "local":
+        locations = []
+        for value in (town, city):
+            term = _phrase(value)
+            if term and term.lower() not in [x.lower() for x in locations]:
+                locations.append(term)
+        if len(locations) >= 2:
+            queries.append(" OR ".join(locations))
+        elif locations:
+            queries.append(locations[0])
+        else:
+            # Don't turn a missing town/city into a strict search for the word "India".
+            queries.append('("local news" OR traffic OR civic OR municipal OR transport)')
+        # More focused fallback for local reporting if the first search has no stories.
+        if city:
+            queries.append(f'{_phrase(city)} AND (news OR traffic OR civic OR transport OR weather OR police)')
+        elif town:
+            queries.append(f'{_phrase(town)} AND (news OR traffic OR civic OR transport OR weather OR police)')
+    elif category == "tourism":
+        queries = [
+            '(tourism OR travel OR hotel OR hotels OR destination OR destinations OR "travel advisory" OR "tourist attraction" OR airline OR airlines OR airport OR hospitality)',
+            '("tourism industry" OR "travel industry" OR "tourist arrivals" OR "travel advisory" OR "new flight route" OR "hotel industry")',
+        ]
+    else:
+        query_by_category = {
+            # Keep existing working categories' original queries unchanged.
+            "city": city.strip() or place or "city news",
+            "national": (country.strip() or "India") + " news",
+            "world": "world news",
+            "financial": "financial markets stock market economy",
+            "business": "business startups companies",
+            "sports": "sports",
+            "technology": "technology AI innovation",
+        }
+        queries = [query_by_category[category]]
+
+    # Remove duplicate queries while preserving their intended fallback order.
+    queries = list(dict.fromkeys(q for q in queries if q and len(q) <= 200))
+    cache_key = "|".join([category, town.casefold(), city.casefold(), country.casefold(), language, str(limit)])
     cached = _news_cache_get(cache_key)
     if cached:
         return {**cached, "cached": True}
-    params = {"q": query, "lang": language[:2], "max": limit, "apikey": api_key, "sortby": "publishedAt"}
+
+    last_provider_status = None
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get("https://gnews.io/api/v4/search", params=params)
-        if response.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"News provider returned HTTP {response.status_code}.")
-        payload = response.json()
-        articles = []
-        for article in payload.get("articles", []):
-            articles.append({
-                "title": article.get("title"),
-                "description": article.get("description"),
-                "url": article.get("url"),
-                "image": article.get("image"),
-                "published_at": article.get("publishedAt"),
-                "source": (article.get("source") or {}).get("name", "News source"),
-            })
-        result = {"status": "success", "provider": "GNews", "category": category,
-                  "query": query, "articles": articles, "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False}
+            for query in queries:
+                response = await client.get("https://gnews.io/api/v4/search", params={
+                    "q": query,
+                    "lang": language or "en",
+                    "max": limit,
+                    "apikey": api_key,
+                    "sortby": "publishedAt",
+                })
+                last_provider_status = response.status_code
+                if response.status_code != 200:
+                    # A malformed query or provider/plan issue is not fixed by retrying a different query.
+                    raise HTTPException(status_code=502, detail=f"News provider returned HTTP {response.status_code}.")
+                payload = response.json()
+                raw_articles = payload.get("articles", [])
+                if not raw_articles:
+                    continue
+                articles = []
+                seen_urls = set()
+                for article in raw_articles:
+                    url = article.get("url")
+                    if url and url in seen_urls:
+                        continue
+                    if url:
+                        seen_urls.add(url)
+                    articles.append({
+                        "title": article.get("title"),
+                        "description": article.get("description"),
+                        "url": url,
+                        "image": article.get("image"),
+                        "published_at": article.get("publishedAt"),
+                        "source": (article.get("source") or {}).get("name", "News source"),
+                    })
+                if articles:
+                    result = {
+                        "status": "success", "provider": "GNews", "category": category,
+                        "query": query, "articles": articles,
+                        "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False,
+                    }
+                    _news_cache_put(cache_key, result)
+                    return result
+
+        # A valid search with no matching articles is not an API failure. Return an empty
+        # feed with diagnostic query information so the app can show a useful message.
+        result = {
+            "status": "success", "provider": "GNews", "category": category,
+            "query": " OR ".join(queries), "articles": [],
+            "updated_at": datetime.now(timezone.utc).isoformat(), "cached": False,
+            "message": "No matching articles were returned for this location/topic. Try adding a town or city, or refresh later.",
+        }
         _news_cache_put(cache_key, result)
         return result
     except HTTPException:
@@ -2572,6 +2646,7 @@ async def get_news_feed(
         stale = _news_cache.get(cache_key, {}).get("data")
         if stale:
             return {**stale, "cached": True, "warning": "Provider temporarily unavailable; showing cached results."}
+        print(f"[News feed error] category={category!r}, last_provider_status={last_provider_status}: {exc}")
         raise HTTPException(status_code=502, detail="News provider is temporarily unavailable.") from exc
 
 
