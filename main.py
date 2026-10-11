@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 import base64
+import hashlib
 import zipfile
 import mimetypes
 import subprocess
@@ -4794,13 +4795,73 @@ async def search_community_places_nearby(
         "places": rows[:limit],
     }
 
+@app.post("/api/v1/community/places/upload-photo")
+async def upload_community_place_photo(file: UploadFile = File(...)):
+    """Securely upload a Community Gems photo to Cloudinary and return its URL.
+
+    Configure CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET
+    in the hosting provider's environment variables. No Cloudinary secret is sent to Flutter.
+    """
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+    api_key = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+    api_secret = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+    if not (cloud_name and api_key and api_secret):
+        raise HTTPException(status_code=503, detail="Photo uploads are not configured on the backend yet.")
+
+    content_type = (file.content_type or "").lower().strip()
+    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=415, detail="Choose a JPG, PNG, or WEBP image.")
+    image_bytes = await file.read(8 * 1024 * 1024 + 1)
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The selected photo is empty.")
+    if len(image_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Photo must be 8 MB or smaller.")
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("Unsupported format")
+            image.verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="The uploaded file is not a valid image.") from exc
+
+    timestamp = int(time.time())
+    folder = "omni_touristos/community_gems"
+    signed_params = {"folder": folder, "timestamp": timestamp}
+    signature_base = "&".join(f"{key}={signed_params[key]}" for key in sorted(signed_params)) + api_secret
+    signature = hashlib.sha1(signature_base.encode("utf-8")).hexdigest()
+    upload_url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
+    data = {**signed_params, "api_key": api_key, "signature": signature}
+    filename = os.path.basename(file.filename or "community-gem-image")[:120]
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
+            response = await client.post(
+                upload_url,
+                data=data,
+                files={"file": (filename, image_bytes, content_type)},
+            )
+        if response.status_code not in (200, 201):
+            print(f"[Community Gems photo upload error] Cloudinary HTTP {response.status_code}: {response.text[:250]}")
+            raise HTTPException(status_code=502, detail="Cloudinary could not store the photo. Please retry.")
+        payload = response.json()
+        secure_url = str(payload.get("secure_url") or "").strip()
+        if not secure_url.startswith("https://res.cloudinary.com/"):
+            raise HTTPException(status_code=502, detail="Photo provider did not return a secure image URL.")
+        return {"status": "success", "image_url": secure_url, "photo_url": secure_url, "public_id": payload.get("public_id")}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[Community Gems photo upload error]: {exc}")
+        raise HTTPException(status_code=502, detail="Photo upload failed. Please retry.") from exc
+
+
 @app.post("/api/v1/gems/create")
 async def create_gem(request: Request):
-    """Create a user recommendation in community_places, the same table used by the Gems list.
+    """Insert a user recommendation directly into community_places and make it live immediately.
 
-    The earlier version inserted into `gems`, but `/api/v1/community/places/search`
-    reads `community_places`. This mismatch prevented recommendations from appearing
-    in the mobile Community Gems feed and also caused schema-specific insert failures.
+    The selected image is uploaded separately to Cloudinary; this route persists its secure
+    URL in image_url/photo_urls. is_verified is set true because this app uses admin
+    notification rather than a manual approval queue.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured.")
@@ -4843,9 +4904,13 @@ async def create_gem(request: Request):
             "maps_url": body.get("maps_url") or body.get("location_string"),
             "latitude": body.get("latitude"),
             "longitude": body.get("longitude"),
+            "image_url": body.get("image_url"),
+            "photo_urls": body.get("photo_urls") or ([body.get("image_url")] if body.get("image_url") else []),
+            "is_verified": True,
+            "state": body.get("state") or "Maharashtra",
+            "country": body.get("country") or "India",
             "endorsement_tags": body.get("endorsement_tags") or [],
             "community_tags": body.get("community_tags") or body.get("endorsement_tags") or [],
-            "status": str(body.get("status") or "New"),
         }
         payload.update({key: value for key, value in optional_fields.items() if value is not None})
 
