@@ -2533,6 +2533,8 @@ async def get_news_feed(
     town = town.strip()
     city = city.strip()
     country = country.strip() or "India"
+    # Keep a normalized combined location for city-category fallback queries.
+    place = ", ".join(part for part in (town, city, country) if part)
     language = (language or "en").strip().lower()[:2]
 
     def _phrase(value: str) -> str:
@@ -4794,35 +4796,90 @@ async def search_community_places_nearby(
 
 @app.post("/api/v1/gems/create")
 async def create_gem(request: Request):
+    """Create a user recommendation in community_places, the same table used by the Gems list.
+
+    The earlier version inserted into `gems`, but `/api/v1/community/places/search`
+    reads `community_places`. This mismatch prevented recommendations from appearing
+    in the mobile Community Gems feed and also caused schema-specific insert failures.
+    """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured.")
     try:
         body = await request.json()
-        creator_id = body.get("creator_id")
-
-        # Do not query users.is_banned here: that column is not present in the
-        # deployed Supabase users table and causes PostgreSQL 42703 on every
-        # gem submission. Account moderation must use a real, migrated column
-        # or a verified auth/role policy; this endpoint only inserts the gem.
-        title = str(body.get("title") or "").strip()
+        title = str(body.get("name") or body.get("title") or "").strip()
+        city = str(body.get("city") or body.get("active_city") or "").strip()
+        category = str(body.get("category") or "Services").strip()
+        address = str(body.get("address") or body.get("location_string") or city).strip()
         if not title:
             raise HTTPException(status_code=400, detail="Gem name is required.")
+        if not city:
+            # Backward-compatible fallback for older Flutter builds.
+            city = str(body.get("community_id") or "Vasai-Virar").replace("-", " ").title()
+        if not address:
+            raise HTTPException(status_code=400, detail="Gem address is required.")
 
-        response = supabase.table("gems").insert({
-            "community_id": body.get("community_id", "vasai-virar"),
-            "creator_id": creator_id,
-            "title": body.get("title"),
-            "category": body.get("category", "Markets"),
-            "description": body.get("description"),
-            "location_string": body.get("location_string"),
-            "status": "New"
-        }).execute()
-        return {"status": "success", "gem": response.data}
+        creator_id = body.get("created_by_user_id") or body.get("creator_id")
+        description = str(body.get("description") or "").strip()
+        tip = str(body.get("must_try_tip") or "").strip()
+        phone = str(body.get("contact_phone") or "").strip()
+        contributor = str(body.get("contributor_name") or "Local Scout").strip() or "Local Scout"
+
+        # These base fields are referenced by the existing community_places query,
+        # filters, and edit actions. Other metadata is optional and schema-tolerant.
+        payload = {
+            "name": title,
+            "city": city,
+            "category": category,
+            "address": address,
+            "description": description,
+            "contact_phone": phone,
+            "must_try_tip": tip,
+            "upvotes": 0,
+        }
+        optional_fields = {
+            "created_by_user_id": creator_id,
+            "contributor_name": contributor,
+            "google_place_id": body.get("google_place_id"),
+            "maps_url": body.get("maps_url") or body.get("location_string"),
+            "latitude": body.get("latitude"),
+            "longitude": body.get("longitude"),
+            "endorsement_tags": body.get("endorsement_tags") or [],
+            "community_tags": body.get("community_tags") or body.get("endorsement_tags") or [],
+            "status": str(body.get("status") or "New"),
+        }
+        payload.update({key: value for key, value in optional_fields.items() if value is not None})
+
+        # Supabase/PostgREST reports an exact missing column (PGRST204 / 42703).
+        # Drop only that field and retry. Never retry arbitrary database failures.
+        missing_column_patterns = (
+            re.compile(r"Could not find the ['\"]([A-Za-z_][A-Za-z0-9_]*)['\"] column", re.IGNORECASE),
+            re.compile(r"column ['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]? does not exist", re.IGNORECASE),
+        )
+        last_error = None
+        for _attempt in range(len(payload) + 1):
+            try:
+                response = supabase.table("community_places").insert(payload).execute()
+                created = response.data[0] if response.data else {"name": title, "city": city, "category": category, "address": address}
+                return {"status": "success", "gem": created, "place": created}
+            except Exception as exc:
+                last_error = exc
+                error_text = str(exc)
+                match = next((pattern.search(error_text) for pattern in missing_column_patterns if pattern.search(error_text)), None)
+                if match:
+                    missing_column = match.group(1)
+                    if missing_column in payload and missing_column not in {"name", "city", "category", "address", "description", "upvotes"}:
+                        print(f"[Community Gems create] Optional community_places column '{missing_column}' is unavailable; retrying without it.")
+                        payload.pop(missing_column, None)
+                        continue
+                print(f"[Community Gems create error] city={city!r}, title={title!r}: {error_text}")
+                # Include a short DB message for actionable app feedback while keeping credentials out of the response.
+                raise HTTPException(status_code=500, detail=f"Could not save the community gem: {error_text[:350]}") from exc
+        raise HTTPException(status_code=500, detail=f"Could not save the community gem: {str(last_error)[:350] if last_error else 'database insert failed'}")
     except HTTPException:
         raise
     except Exception as e:
         print(f"[Community Gems create error]: {e}")
-        raise HTTPException(status_code=500, detail="Could not save the community gem. Check the gems table schema and backend logs.") from e
+        raise HTTPException(status_code=500, detail=f"Could not save the community gem: {str(e)[:350]}") from e
 
 @app.get("/api/v1/community/messages")
 async def get_community_messages(community_id: str = Query("vasai-virar")):
