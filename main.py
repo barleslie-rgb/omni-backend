@@ -5290,21 +5290,52 @@ async def create_gem(request: Request):
         print(f"[Community Gems create error]: {e}")
         raise HTTPException(status_code=500, detail=f"Could not save the community gem: {str(e)[:350]}") from e
 
+def _community_city_label(community_id: str) -> str:
+    """Convert a websocket/API slug to the city label stored in community_city_pulse."""
+    raw = str(community_id or "Vasai-Virar").strip()
+    slug = re.sub(r"[\s_]+", "-", raw.lower()).strip("-")
+    if slug in {"vasai-virar", "vasai-virar-city"}:
+        return "Vasai-Virar"
+    return raw.replace("_", " ").replace("-", " ").title()
+
+
+def _normalise_city_pulse_row(row: dict, community_id: str) -> dict:
+    content = row.get("content") or row.get("message") or ""
+    return {
+        **row,
+        "community_id": community_id,
+        "sender_id": row.get("user_id") or row.get("sender_id"),
+        "sender_name": row.get("user_name") or row.get("sender_name") or "Local Scout",
+        "sender_avatar_url": row.get("sender_avatar_url") or row.get("avatar_url"),
+        "text": content,
+        "message": content,
+        "type": "text",
+        "tag": row.get("tag") or "General",
+        "local_status": "delivered",
+    }
+
+
 @app.get("/api/v1/community/messages")
 async def get_community_messages(community_id: str = Query("vasai-virar")):
+    """Read existing Public City Hub messages from the app's community_city_pulse table."""
     if not supabase:
         return {"status": "success", "messages": []}
+    city_label = _community_city_label(community_id)
     try:
-        res = supabase.table("messages") \
-            .select("*, users(display_name, avatar_url, role)") \
-            .eq("community_id", community_id) \
-            .neq("is_deleted", True) \
-            .order("created_at", desc=False) \
-            .limit(50) \
+        res = (
+            supabase.table("community_city_pulse")
+            .select("*")
+            .eq("city", city_label)
+            .order("created_at", desc=False)
+            .limit(100)
             .execute()
-        return {"status": "success", "messages": res.data}
+        )
+        rows = res.data or []
+        messages = [_normalise_city_pulse_row(row, community_id) for row in rows]
+        return {"status": "success", "messages": messages}
     except Exception as e:
-        return {"status": "error", "message": str(e), "messages": []}
+        print(f"[Community City Pulse history error] city={city_label!r}: {e}")
+        return {"status": "error", "message": "Community history is temporarily unavailable.", "messages": []}
 
 @app.post("/api/v1/community/report")
 async def report_community_item(request: Request):
@@ -5519,10 +5550,10 @@ async def send_moderated_private_message(request: Request):
                 pass
             raise HTTPException(status_code=403, detail=f"Message blocked by Supervisor Bot: {violation}.")
 
-        inserted = supabase.table("direct_messages").insert({
+        # The existing app data is in community_direct_messages, not direct_messages.
+        inserted = supabase.table("community_direct_messages").insert({
             "sender_id": sender_id,
             "sender_name": sender_name,
-            "sender_avatar_url": sender_avatar_url,
             "receiver_id": receiver_id,
             "message": message,
             "created_at": datetime.utcnow().isoformat(),
@@ -8064,9 +8095,12 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
                 msg_id = data.get("message_id")
                 if supabase and msg_id:
                     try:
-                        supabase.table("messages").update({"is_deleted": True}).eq("id", msg_id).execute()
+                        # community_city_pulse is the canonical public hub table in this app.
+                        supabase.table("community_city_pulse").delete().eq("id", msg_id).execute()
                     except Exception as exc:
-                        print(f"[Community message delete notice]: {exc}")
+                        print(f"[Community City Pulse delete error] id={msg_id!r}: {exc}")
+                        await websocket.send_json({"type": "error", "message": "The message could not be deleted from the community database."})
+                        continue
                 await manager.broadcast(community_id, {"type": "delete_message", "message_id": msg_id})
                 continue
 
@@ -8115,64 +8149,86 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
                         pass
                 continue
 
-            # 3. Delivery is not confirmed until the row is persisted. The migration adds
-            # client_message_id + a unique partial index so retrying the same message is idempotent.
+            # 3. Persist to the existing table shown in the production Supabase project:
+            # community_city_pulse(city, user_id, user_name, content, tag, created_at).
+            # Do not write to the unrelated generic "messages" table.
             if not supabase:
-                await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Chat storage is unavailable. Please retry when the service reconnects."})
+                await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Community storage is unavailable. Please retry when the service reconnects."})
                 continue
 
+            city_label = _community_city_label(community_id)
             saved_row = None
             try:
                 if client_message_id and sender_id:
-                    existing = supabase.table("messages").select("id, created_at, client_message_id").eq("community_id", community_id).eq("sender_id", sender_id).eq("client_message_id", client_message_id).maybe_single().execute()
+                    existing = (
+                        supabase.table("community_city_pulse")
+                        .select("id, city, user_id, user_name, content, tag, created_at, client_message_id")
+                        .eq("city", city_label)
+                        .eq("user_id", str(sender_id))
+                        .eq("client_message_id", client_message_id)
+                        .maybe_single()
+                        .execute()
+                    )
                     saved_row = existing.data if getattr(existing, "data", None) else None
 
                 if saved_row is None:
                     payload_to_insert = {
-                        "community_id": community_id,
-                        "sender_id": sender_id,
-                        "text": raw_text,
-                        "type": data.get("type", "text"),
-                        "gem_id": data.get("gem_id"),
+                        "city": city_label,
+                        "user_id": str(sender_id or ""),
+                        "user_name": sender_name,
+                        "content": raw_text,
+                        "tag": str(data.get("tag") or "General")[:80],
                     }
                     if client_message_id:
                         payload_to_insert["client_message_id"] = client_message_id
-                    inserted = supabase.table("messages").insert(payload_to_insert).execute()
+                    inserted = supabase.table("community_city_pulse").insert(payload_to_insert).execute()
                     if inserted.data:
                         saved_row = inserted.data[0]
-                    else:
-                        # A retry can race the first insert. Look for its idempotency key once more.
-                        if client_message_id and sender_id:
-                            existing = supabase.table("messages").select("id, created_at, client_message_id").eq("community_id", community_id).eq("sender_id", sender_id).eq("client_message_id", client_message_id).maybe_single().execute()
-                            saved_row = existing.data if getattr(existing, "data", None) else None
+                    elif client_message_id and sender_id:
+                        existing = (
+                            supabase.table("community_city_pulse")
+                            .select("id, city, user_id, user_name, content, tag, created_at, client_message_id")
+                            .eq("city", city_label)
+                            .eq("user_id", str(sender_id))
+                            .eq("client_message_id", client_message_id)
+                            .maybe_single()
+                            .execute()
+                        )
+                        saved_row = existing.data if getattr(existing, "data", None) else None
                 if not saved_row:
-                    raise RuntimeError("Database did not return a saved message row.")
+                    raise RuntimeError("Supabase did not return the saved community_city_pulse row.")
             except Exception as exc:
-                # The insert may have failed because another retry inserted first. Confirm before failing.
+                # A duplicate idempotency key can occur when a client retries after a timeout.
                 try:
                     if client_message_id and sender_id:
-                        existing = supabase.table("messages").select("id, created_at, client_message_id").eq("community_id", community_id).eq("sender_id", sender_id).eq("client_message_id", client_message_id).maybe_single().execute()
+                        existing = (
+                            supabase.table("community_city_pulse")
+                            .select("id, city, user_id, user_name, content, tag, created_at, client_message_id")
+                            .eq("city", city_label)
+                            .eq("user_id", str(sender_id))
+                            .eq("client_message_id", client_message_id)
+                            .maybe_single()
+                            .execute()
+                        )
                         saved_row = existing.data if getattr(existing, "data", None) else None
                 except Exception:
                     saved_row = None
                 if not saved_row:
-                    print(f"[Supabase WS Insert Error] community={community_id!r}: {exc}")
+                    print(f"[Community City Pulse insert error] city={city_label!r}, sender={sender_id!r}: {exc}")
                     await websocket.send_json({
                         "type": "message_failed",
                         "client_message_id": client_message_id,
-                        "reason": "Message could not be saved. Check connection and retry.",
+                        "reason": "Message could not be saved to the community database. Please check the connection and retry.",
                     })
                     continue
 
             # 4. Only persisted/confirmed messages are broadcast. Echo client_message_id
             # so the sender's optimistic row is updated instead of duplicated.
-            data["id"] = saved_row.get("id")
-            data["created_at"] = saved_row.get("created_at") or data.get("created_at")
-            data["client_message_id"] = client_message_id or data.get("client_message_id")
+            # Normalise the saved Supabase row for all connected Flutter clients.
+            data = _normalise_city_pulse_row(saved_row, community_id)
+            data["client_message_id"] = client_message_id or saved_row.get("client_message_id")
             data["delivery_status"] = "delivered"
-            data["sender_name"] = sender_name
-            data["sender_avatar_url"] = sender_avatar_url
-            data["text"] = raw_text
+            data["local_status"] = "delivered"
             await manager.broadcast(community_id, data)
     except WebSocketDisconnect:
         manager.disconnect(community_id, websocket)
