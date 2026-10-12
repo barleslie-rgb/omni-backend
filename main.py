@@ -8044,36 +8044,62 @@ manager = ConnectionManager()
 
 @app.websocket("/ws/community/{community_id}")
 async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
+    """Persist community messages before broadcasting and echo delivery IDs to clients."""
     await manager.connect(community_id, websocket)
     try:
         while True:
             data = await websocket.receive_json()
-            sender_id = data.get("sender_id")
-            sender_name = data.get("sender_name", "Scout")
-            sender_avatar_url = data.get("sender_avatar_url")
-            raw_text = (data.get("text") or "").strip()
+            if not isinstance(data, dict):
+                await websocket.send_json({"type": "error", "message": "Invalid chat packet."})
+                continue
 
-            # 1. Enforcement Check: Banned or Muted
+            sender_id = data.get("sender_id")
+            sender_name = str(data.get("sender_name") or "Scout")[:120]
+            sender_avatar_url = data.get("sender_avatar_url")
+            raw_text = str(data.get("text") or "").strip()
+            client_message_id = str(data.get("client_message_id") or "").strip()[:120]
+
+            # Handle deletion before message validation, preserving the existing admin/user workflow.
+            if data.get("type") == "delete_message":
+                msg_id = data.get("message_id")
+                if supabase and msg_id:
+                    try:
+                        supabase.table("messages").update({"is_deleted": True}).eq("id", msg_id).execute()
+                    except Exception as exc:
+                        print(f"[Community message delete notice]: {exc}")
+                await manager.broadcast(community_id, {"type": "delete_message", "message_id": msg_id})
+                continue
+
+            if not raw_text:
+                await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Message is empty."})
+                continue
+            if len(raw_text) > 2000:
+                await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Message is too long."})
+                continue
+
+            # 1. Existing banned/muted safety check.
             if supabase and sender_id:
                 try:
                     user_row = supabase.table("users").select("is_banned, muted_until").eq("id", sender_id).single().execute()
                     if user_row.data:
                         if user_row.data.get("is_banned"):
-                            await websocket.send_json({"type": "error", "message": "Account banned for community violations."})
+                            await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Account banned for community violations."})
                             continue
                         muted_until = user_row.data.get("muted_until")
                         if muted_until and datetime.fromisoformat(muted_until.replace("Z", "+00:00")) > datetime.utcnow().replace(tzinfo=datetime.utcnow().astimezone().tzinfo):
-                            await websocket.send_json({"type": "error", "message": "Account temporarily muted."})
+                            await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Account temporarily muted."})
                             continue
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Preserve the existing compatibility behavior for deployments where the optional user columns are absent.
+                    print(f"[Community account-check notice]: {exc}")
 
-            # 2. Automated Supervisor Bot Inspection
-            bot_violation = evaluate_supervisor_bot_flag(raw_text) if raw_text else None
+            # 2. Existing Supervisor Bot moderation. A blocked optimistic bubble gets a real failure update.
+            bot_violation = evaluate_supervisor_bot_flag(raw_text)
             if bot_violation:
                 await websocket.send_json({
                     "type": "bot_warning",
-                    "text": f"Message blocked by Supervisor Bot: {bot_violation}."
+                    "client_message_id": client_message_id,
+                    "text": f"Message blocked by Supervisor Bot: {bot_violation}.",
                 })
                 if supabase and sender_id:
                     try:
@@ -8083,29 +8109,25 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
                             "community_id": community_id,
                             "reason": "Supervisor Bot Auto-Flag",
                             "details": f"Flagged Content: '{raw_text}' | Issue: {bot_violation}",
-                            "status": "pending"
+                            "status": "pending",
                         }).execute()
                     except Exception:
                         pass
                 continue
 
-            # 3. Handle Message Deletion
-            if data.get("type") == "delete_message":
-                msg_id = data.get("message_id")
-                if supabase and msg_id:
-                    try:
-                        supabase.table("messages").update({"is_deleted": True}).eq("id", msg_id).execute()
-                    except Exception:
-                        pass
-                await manager.broadcast(community_id, {
-                    "type": "delete_message",
-                    "message_id": msg_id
-                })
+            # 3. Delivery is not confirmed until the row is persisted. The migration adds
+            # client_message_id + a unique partial index so retrying the same message is idempotent.
+            if not supabase:
+                await websocket.send_json({"type": "message_failed", "client_message_id": client_message_id, "reason": "Chat storage is unavailable. Please retry when the service reconnects."})
                 continue
 
-            # 4. Standard Message Insertion & Broadcast
-            if supabase and raw_text:
-                try:
+            saved_row = None
+            try:
+                if client_message_id and sender_id:
+                    existing = supabase.table("messages").select("id, created_at, client_message_id").eq("community_id", community_id).eq("sender_id", sender_id).eq("client_message_id", client_message_id).maybe_single().execute()
+                    saved_row = existing.data if getattr(existing, "data", None) else None
+
+                if saved_row is None:
                     payload_to_insert = {
                         "community_id": community_id,
                         "sender_id": sender_id,
@@ -8113,21 +8135,55 @@ async def community_websocket_endpoint(websocket: WebSocket, community_id: str):
                         "type": data.get("type", "text"),
                         "gem_id": data.get("gem_id"),
                     }
-                    ins_res = supabase.table("messages").insert(payload_to_insert).execute()
-                    if ins_res.data and len(ins_res.data) > 0:
-                        data["id"] = ins_res.data[0].get("id")
-                        data["created_at"] = ins_res.data[0].get("created_at")
-                except Exception as e:
-                    print(f"[Supabase WS Insert Notice]: {e}")
+                    if client_message_id:
+                        payload_to_insert["client_message_id"] = client_message_id
+                    inserted = supabase.table("messages").insert(payload_to_insert).execute()
+                    if inserted.data:
+                        saved_row = inserted.data[0]
+                    else:
+                        # A retry can race the first insert. Look for its idempotency key once more.
+                        if client_message_id and sender_id:
+                            existing = supabase.table("messages").select("id, created_at, client_message_id").eq("community_id", community_id).eq("sender_id", sender_id).eq("client_message_id", client_message_id).maybe_single().execute()
+                            saved_row = existing.data if getattr(existing, "data", None) else None
+                if not saved_row:
+                    raise RuntimeError("Database did not return a saved message row.")
+            except Exception as exc:
+                # The insert may have failed because another retry inserted first. Confirm before failing.
+                try:
+                    if client_message_id and sender_id:
+                        existing = supabase.table("messages").select("id, created_at, client_message_id").eq("community_id", community_id).eq("sender_id", sender_id).eq("client_message_id", client_message_id).maybe_single().execute()
+                        saved_row = existing.data if getattr(existing, "data", None) else None
+                except Exception:
+                    saved_row = None
+                if not saved_row:
+                    print(f"[Supabase WS Insert Error] community={community_id!r}: {exc}")
+                    await websocket.send_json({
+                        "type": "message_failed",
+                        "client_message_id": client_message_id,
+                        "reason": "Message could not be saved. Check connection and retry.",
+                    })
+                    continue
 
-            # Ensure sender metadata is preserved for live peers
+            # 4. Only persisted/confirmed messages are broadcast. Echo client_message_id
+            # so the sender's optimistic row is updated instead of duplicated.
+            data["id"] = saved_row.get("id")
+            data["created_at"] = saved_row.get("created_at") or data.get("created_at")
+            data["client_message_id"] = client_message_id or data.get("client_message_id")
+            data["delivery_status"] = "delivered"
             data["sender_name"] = sender_name
             data["sender_avatar_url"] = sender_avatar_url
-
+            data["text"] = raw_text
             await manager.broadcast(community_id, data)
     except WebSocketDisconnect:
         manager.disconnect(community_id, websocket)
         await manager.broadcast(community_id, {"type": "system", "text": "A scout disconnected."})
+    except Exception as exc:
+        print(f"[Community WebSocket unexpected error] room={community_id!r}: {exc}")
+        manager.disconnect(community_id, websocket)
+        try:
+            await websocket.close(code=1011, reason="Community chat temporarily unavailable")
+        except Exception:
+            pass
 
 @app.get("/api/v1/wake")
 @app.get("/")
