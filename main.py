@@ -8,6 +8,10 @@ import time
 import uuid
 import base64
 import hashlib
+import hmac as _agora_hmac
+import struct as _agora_struct
+import zlib as _agora_zlib
+import secrets as _agora_secrets
 import zipfile
 import mimetypes
 import subprocess
@@ -8252,3 +8256,143 @@ def wake():
         "groq": bool(os.environ.get("GROQ_API_KEY")),
         "supabase_connected": bool(supabase)
     }
+
+# -----------------------------------------------------------------------------
+# AGORA RTC VOICE CALLING — server-side AccessToken2 generation
+# Keep AGORA_APP_CERTIFICATE only in Render environment variables.
+# -----------------------------------------------------------------------------
+def _agora_pack_u16(value: int) -> bytes:
+    return _agora_struct.pack("<H", int(value))
+
+
+def _agora_pack_u32(value: int) -> bytes:
+    return _agora_struct.pack("<I", int(value))
+
+
+def _agora_pack_string(value: Any) -> bytes:
+    raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
+    if len(raw) > 65535:
+        raise ValueError("Agora token field is too long.")
+    return _agora_pack_u16(len(raw)) + raw
+
+
+def _build_agora_access_token2(app_id: str, app_certificate: str, channel_name: str, uid: int, ttl_seconds: int = 3600) -> str:
+    """Build Agora RTC AccessToken2 (007) for join + publish-audio privileges.
+
+    The layout follows Agora's official AccessToken2/RtcTokenBuilder2 format.
+    The caller must validate app credentials, channel and participant before calling.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", app_id or ""):
+        raise ValueError("AGORA_APP_ID must be a 32-character Agora App ID.")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", app_certificate or ""):
+        raise ValueError("AGORA_APP_CERTIFICATE must be a 32-character App Certificate.")
+    if not channel_name or len(channel_name.encode("utf-8")) >= 64:
+        raise ValueError("Invalid Agora channel name.")
+    if uid < 1 or uid > 2147483647:
+        raise ValueError("Invalid Agora UID.")
+
+    issued_at = int(time.time())
+    privilege_expiry = issued_at + ttl_seconds
+    salt = _agora_secrets.randbelow(99_999_999) + 1
+
+    # Agora AccessToken2 key derivation: HMAC(issue timestamp, certificate),
+    # then HMAC(salt, prior signing key), then sign the serialized payload.
+    signing_key = _agora_hmac.new(
+        _agora_pack_u32(issued_at), app_certificate.encode("utf-8"), hashlib.sha256
+    ).digest()
+    signing_key = _agora_hmac.new(_agora_pack_u32(salt), signing_key, hashlib.sha256).digest()
+
+    # RTC service type 1; privileges: 1 = join channel, 2 = publish audio.
+    privileges = _agora_pack_u16(2)
+    privileges += _agora_pack_u16(1) + _agora_pack_u32(privilege_expiry)
+    privileges += _agora_pack_u16(2) + _agora_pack_u32(privilege_expiry)
+    rtc_service = _agora_pack_u16(1) + privileges + _agora_pack_string(channel_name) + _agora_pack_string(str(uid))
+
+    signing_info = (
+        _agora_pack_string(app_id)
+        + _agora_pack_u32(issued_at)
+        + _agora_pack_u32(ttl_seconds)
+        + _agora_pack_u32(salt)
+        + _agora_pack_u16(1)
+        + rtc_service
+    )
+    signature = _agora_hmac.new(signing_key, signing_info, hashlib.sha256).digest()
+    packed = _agora_pack_string(signature) + signing_info
+    return "007" + base64.b64encode(_agora_zlib.compress(packed)).decode("ascii")
+
+
+@app.post("/api/v1/calls/agora-token")
+async def issue_agora_voice_call_token(request: Request):
+    """Issue a short-lived Agora token only to a participant in a live call."""
+    if not supabase or not SUPABASE_URL:
+        raise HTTPException(status_code=503, detail="Supabase is not configured on the calling backend.")
+
+    app_id = os.environ.get("AGORA_APP_ID", "").strip()
+    app_certificate = os.environ.get("AGORA_APP_CERTIFICATE", "").strip()
+    if not app_id or not app_certificate:
+        raise HTTPException(status_code=503, detail="Voice calling is not configured yet. Add AGORA_APP_ID and AGORA_APP_CERTIFICATE to Render.")
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sign in to request a call token.")
+    access_token = auth_header.split(" ", 1)[1].strip()
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Missing Supabase access token.")
+
+    # Validate the caller's Supabase session with Auth; do not trust a user ID
+    # sent in the JSON body. SUPABASE_ANON_KEY is preferred, with service key
+    # retained as a compatibility fallback for installations that only have it.
+    public_key = (os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_PUBLISHABLE_KEY") or SUPABASE_KEY or "").strip()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            auth_response = await client.get(
+                f"{SUPABASE_URL.rstrip('/')}/auth/v1/user",
+                headers={"apikey": public_key, "Authorization": f"Bearer {access_token}"},
+            )
+        if auth_response.status_code != 200:
+            raise HTTPException(status_code=401, detail="Your Supabase session is invalid or expired. Please sign in again.")
+        auth_user = auth_response.json()
+        user_id = str(auth_user.get("id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Could not verify the signed-in user.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[Agora auth validation error]: {exc}")
+        raise HTTPException(status_code=503, detail="Could not validate the Supabase session right now.")
+
+    try:
+        body = await request.json()
+        call_id = str(body.get("call_id") or "").strip()
+        if not call_id:
+            raise HTTPException(status_code=400, detail="call_id is required.")
+
+        result = supabase.table("call_signals").select(
+            "id,caller_id,receiver_id,channel_name,status,created_at"
+        ).eq("id", call_id).limit(1).execute()
+        rows = result.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Call invitation was not found.")
+        call_row = rows[0]
+        caller_id = str(call_row.get("caller_id") or "")
+        receiver_id = str(call_row.get("receiver_id") or "")
+        status_value = str(call_row.get("status") or "")
+        if user_id not in (caller_id, receiver_id):
+            raise HTTPException(status_code=403, detail="You are not a participant in this call.")
+        if status_value not in ("ringing", "accepted"):
+            raise HTTPException(status_code=409, detail="This call is no longer active.")
+        if user_id == receiver_id and status_value != "accepted":
+            raise HTTPException(status_code=403, detail="Answer the call before requesting its media token.")
+
+        channel_name = str(call_row.get("channel_name") or "")
+        if not channel_name.startswith("omni_"):
+            raise HTTPException(status_code=400, detail="The call has an invalid channel name.")
+        # Stable numeric UID derived server-side from the verified Supabase UUID.
+        uid = (int.from_bytes(hashlib.sha256(user_id.encode("utf-8")).digest()[:4], "big") % 2147483646) + 1
+        token = _build_agora_access_token2(app_id, app_certificate, channel_name, uid, ttl_seconds=3600)
+        return {"status": "success", "app_id": app_id, "channel_name": channel_name, "uid": uid, "token": token, "expires_in": 3600}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[Agora token issue error]: {exc}")
+        raise HTTPException(status_code=500, detail="Could not issue a calling token. Check the call-signaling table and backend logs.")
