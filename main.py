@@ -5133,21 +5133,32 @@ async def upload_community_place_photo(file: UploadFile = File(...)):
     if not (cloud_name and api_key and api_secret):
         raise HTTPException(status_code=503, detail="Photo uploads are not configured on the backend yet.")
 
-    content_type = (file.content_type or "").lower().strip()
-    if content_type not in {"image/jpeg", "image/png", "image/webp"}:
-        raise HTTPException(status_code=415, detail="Choose a JPG, PNG, or WEBP image.")
+    # Do not trust only UploadFile.content_type: Android/iOS pickers can send
+    # application/octet-stream or an extension-based type that does not match
+    # the compressed bytes. Detect the actual image format from the file itself.
+    reported_content_type = (file.content_type or "").lower().strip()
     image_bytes = await file.read(8 * 1024 * 1024 + 1)
     if not image_bytes:
         raise HTTPException(status_code=400, detail="The selected photo is empty.")
     if len(image_bytes) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Photo must be 8 MB or smaller.")
+
+    detected_format = None
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
-            if image.format not in {"JPEG", "PNG", "WEBP"}:
-                raise ValueError("Unsupported format")
+            detected_format = (image.format or "").upper()
+            if detected_format not in {"JPEG", "PNG", "WEBP"}:
+                raise ValueError("Unsupported image format")
             image.verify()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="The uploaded file is not a valid image.") from exc
+        raise HTTPException(
+            status_code=415,
+            detail="The selected file is not a valid JPG, PNG, or WEBP image. Please choose the image again from Gallery.",
+        ) from exc
+
+    detected_mime = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}[detected_format]
+    # Trust the detected bytes, not a stale/missing extension or reported MIME type.
+    content_type = detected_mime
 
     timestamp = int(time.time())
     folder = "omni_touristos/community_gems"
@@ -5156,7 +5167,15 @@ async def upload_community_place_photo(file: UploadFile = File(...)):
     signature = hashlib.sha1(signature_base.encode("utf-8")).hexdigest()
     upload_url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
     data = {**signed_params, "api_key": api_key, "signature": signature}
-    filename = os.path.basename(file.filename or "community-gem-image")[:120]
+    original_filename = os.path.basename(file.filename or "community-gem-image")[:120]
+    expected_extension = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}[detected_format]
+    original_stem, original_extension = os.path.splitext(original_filename)
+    if original_extension.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+        filename = (original_stem or "community-gem-image") + expected_extension
+    elif (original_extension.lower() == ".png" and detected_format != "PNG") or (original_extension.lower() in {".jpg", ".jpeg"} and detected_format != "JPEG") or (original_extension.lower() == ".webp" and detected_format != "WEBP"):
+        filename = (original_stem or "community-gem-image") + expected_extension
+    else:
+        filename = original_filename
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
