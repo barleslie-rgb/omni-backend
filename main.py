@@ -3174,6 +3174,209 @@ async def place_details(request: Request):
         return {"status": "error", "message": "Could not load verified place details."}
 
 
+# -----------------------------------------------------------------------------
+# Destination Hub: submit-based global destination disambiguation
+# Add this block to the CURRENT main.py (do not replace your current backend).
+# Requires the existing globals already present in Omni TouristOS main.py:
+# httpx, asyncio, time, re, Query, Dict, List, Any,
+# NOMINATIM_API_URL, OPEN_DATA_USER_AGENT, _open_geo_semaphore,
+# and _open_destination_cache.
+# -----------------------------------------------------------------------------
+
+_DESTINATION_SUGGESTIONS_CACHE: Dict[str, Any] = {}
+_DESTINATION_SUGGESTIONS_CACHE_TTL = 15 * 60
+_DESTINATION_SUGGESTIONS_LAST_REQUEST = 0.0
+
+
+@app.get("/api/v1/destination-suggestions")
+async def destination_suggestions(
+    q: str = Query(..., min_length=2, max_length=200),
+    limit: int = Query(6, ge=1, le=8),
+):
+    """Resolve a submitted destination/region query into selectable real places.
+
+    This route is called only when the user submits Search, not on each keystroke.
+    Results are cached and requests to the public Nominatim service are serialized
+    and spaced to avoid autocomplete-style request bursts.
+    """
+    global _DESTINATION_SUGGESTIONS_LAST_REQUEST
+
+    query = re.sub(r"\s+", " ", str(q or "")).strip()
+    if len(query) < 2:
+        return {"status": "empty", "query": query, "results": []}
+
+    cache_key = f"{query.casefold()}|{limit}"
+    cached = _DESTINATION_SUGGESTIONS_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] < _DESTINATION_SUGGESTIONS_CACHE_TTL:
+        return {"status": "success" if cached[1] else "empty", "query": query, "results": cached[1]}
+
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "addressdetails": "1",
+        "namedetails": "1",
+        "limit": str(limit),
+        "accept-language": "en",
+    }
+
+    try:
+        async with _open_geo_semaphore:
+            # Public Nominatim should not be treated as a per-keystroke autocomplete
+            # provider. This small server-side spacing is in addition to query cache.
+            elapsed = time.monotonic() - _DESTINATION_SUGGESTIONS_LAST_REQUEST
+            wait_seconds = 1.1 - elapsed
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+
+            _DESTINATION_SUGGESTIONS_LAST_REQUEST = time.monotonic()
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(12.0, connect=5.0),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    NOMINATIM_API_URL,
+                    params=params,
+                    headers={
+                        "User-Agent": OPEN_DATA_USER_AGENT,
+                        "Accept": "application/json",
+                    },
+                )
+
+        if response.status_code != 200:
+            print(f"[Destination Suggestions Notice] HTTP {response.status_code}: {response.text[:300]}")
+            return {"status": "unavailable", "query": query, "results": [], "message": "Destination lookup is temporarily unavailable."}
+
+        raw_results = response.json()
+        if not isinstance(raw_results, list):
+            raw_results = []
+
+        results: List[Dict[str, Any]] = []
+        seen = set()
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+            address = item.get("address") or {}
+            if not isinstance(address, dict):
+                address = {}
+
+            display_name = str(item.get("display_name") or "").strip()
+            names = item.get("namedetails") or {}
+            if not isinstance(names, dict):
+                names = {}
+            name = str(item.get("name") or names.get("name") or "").strip()
+            if not name:
+                name = display_name.split(",", 1)[0].strip()
+            if not name or not display_name:
+                continue
+
+            city = str(
+                address.get("city")
+                or address.get("town")
+                or address.get("village")
+                or address.get("municipality")
+                or address.get("borough")
+                or address.get("hamlet")
+                or address.get("suburb")
+                or ""
+            ).strip()
+            state = str(
+                address.get("state")
+                or address.get("province")
+                or address.get("region")
+                or address.get("state_district")
+                or address.get("county")
+                or ""
+            ).strip()
+            country = str(address.get("country") or "").strip()
+            country_code = str(address.get("country_code") or "").strip().upper()
+            lat = item.get("lat")
+            lon = item.get("lon")
+            try:
+                latitude = float(lat)
+                longitude = float(lon)
+            except (TypeError, ValueError):
+                continue
+
+            osm_type = str(item.get("osm_type") or "").strip().lower()
+            osm_id = str(item.get("osm_id") or "").strip()
+            item_class = str(item.get("class") or "").strip().lower()
+            item_type = str(item.get("type") or "").strip().lower()
+            addresstype = str(item.get("addresstype") or item.get("type") or item.get("class") or "place").strip()
+            region_types = {"state", "province", "region", "county", "state_district", "country", "archipelago"}
+            is_region = addresstype.strip().lower() in region_types or (item_class == "boundary" and item_type == "administrative")
+            dedupe_key = (display_name.casefold(), round(latitude, 5), round(longitude, 5))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            record = {
+                "name": name,
+                "city": city,
+                "state": state,
+                "country": country,
+                "country_code": country_code,
+                "display_name": display_name,
+                "type": addresstype,
+                "category": item_class or "place",
+                "is_region": is_region,
+                "lat": latitude,
+                "lng": longitude,
+                "source": "OpenStreetMap Nominatim",
+                "osm_type": osm_type,
+                "osm_id": osm_id,
+                "importance": item.get("importance"),
+                "maps_url": f"https://www.openstreetmap.org/{osm_type}/{osm_id}" if osm_type and osm_id else "",
+            }
+            results.append(record)
+
+            # Seed the existing open-data destination resolver cache with the exact
+            # selected name/region/country tuple. This avoids immediately repeating
+            # the same Nominatim lookup when /explore-city is called after selection.
+            if country and isinstance(_open_destination_cache, dict):
+                resolved_destination = {
+                    "city": name,
+                    "state": state,
+                    "country": country,
+                    "display_name": display_name,
+                    "place_id": f"osm:{osm_type}:{osm_id}" if osm_type and osm_id else None,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "formatted_address": display_name,
+                    "google_maps_url": "",
+                    "website_url": "",
+                    "types": [addresstype, str(item.get("class") or "place")],
+                    "address_components": address,
+                    "source": "OpenStreetMap Nominatim",
+                    "data_state": "VERIFIED_OPEN_DATA",
+                    "open_data": True,
+                    "is_region": is_region,
+                    "osm_type": osm_type,
+                    "osm_id": osm_id,
+                }
+                destination_key = (name.strip().lower(), state.strip().lower(), country.strip().lower())
+                _open_destination_cache[destination_key] = resolved_destination
+                # A prior city-radius response must not be reused when the same
+                # query is now being selected as a region.
+                if isinstance(_open_places_cache, dict):
+                    _open_places_cache.pop(destination_key, None)
+
+            if len(results) >= limit:
+                break
+
+        _DESTINATION_SUGGESTIONS_CACHE[cache_key] = (time.monotonic(), results)
+        return {
+            "status": "success" if results else "empty",
+            "query": query,
+            "results": results,
+            "source": "OpenStreetMap Nominatim",
+            "attribution": "© OpenStreetMap contributors",
+        }
+    except Exception as exc:
+        print(f"[Destination Suggestions Error] {type(exc).__name__}: {exc}")
+        return {"status": "unavailable", "query": query, "results": [], "message": "Destination lookup is temporarily unavailable."}
+
+
 @app.post("/api/v1/explore-city")
 async def explore_city(request: Request):
     try:
