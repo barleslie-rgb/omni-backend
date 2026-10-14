@@ -4432,20 +4432,18 @@ async def sarathi_delete_conversation(conversation_id: str, request: Request):
 # -------------------------------------------------------------
 @app.post("/api/v1/sarathi/generate-image")
 async def sarathi_generate_image(request: Request):
-    """Generate a high-resolution image through Gemini server-side.
+    """Generate or edit an image through Cloudflare Workers AI FLUX.2 Klein 4B.
 
-    The API key must live in Render as GEMINI_API_KEY or GOOGLE_API_KEY.
-    Image generation is account-only to reduce anonymous API abuse.
+    Credentials are read only from Render environment variables:
+    CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN.
     """
     user = _require_sarathi_user(request)
-    api_key = (
-        os.environ.get("GEMINI_API_KEY", "").strip()
-        or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
-    if not api_key:
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip().strip('"').strip("'")
+    api_token = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip().strip('"').strip("'")
+    if not account_id or not api_token:
         raise HTTPException(
             status_code=503,
-            detail="Image generation is not configured. Add GEMINI_API_KEY to the Render environment.",
+            detail="Cloudflare image generation is not configured. Add CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN to Render.",
         )
 
     try:
@@ -4464,9 +4462,15 @@ async def sarathi_generate_image(request: Request):
     if aspect_ratio not in allowed_ratios:
         aspect_ratio = "16:9"
 
-    image_size = str(body.get("image_size") or "2K").upper().strip()
-    if image_size not in {"1K", "2K", "4K"}:
-        image_size = "2K"
+    # FLUX.2 Klein accepts explicit width/height, not Gemini's image_size option.
+    # Keep dimensions within the model's documented 256–1920 range.
+    ratio_dimensions = {
+        "1:1": (1024, 1024), "3:2": (1152, 768), "4:3": (1024, 768),
+        "16:9": (1024, 576), "2:3": (768, 1152), "9:16": (576, 1024),
+        "3:4": (768, 1024), "4:5": (819, 1024), "5:4": (1024, 819),
+        "21:9": (1344, 576),
+    }
+    width, height = ratio_dimensions[aspect_ratio]
 
     # Confirm that any supplied conversation belongs to the authenticated user.
     conversation_id = str(body.get("conversation_id") or "").strip()
@@ -4496,106 +4500,86 @@ async def sarathi_generate_image(request: Request):
     if len(reference_image_base64) > 14_000_000:
         raise HTTPException(status_code=413, detail="Reference image must be smaller than 10 MB.")
 
-    if reference_image_base64:
-        image_prompt = (
+    image_prompt = (
+        (
             "Edit the provided reference image according to the user's instructions. Preserve the main subject "
-            "and all details the user did not ask to change. Make the requested changes look intentional, "
-            "high-quality, coherent with the original lighting and perspective, and professionally finished. "
-            "Do not add unintended text, watermarks, logos, or borders.\n\n"
-            "Requested edits:\n" + prompt
+            "and details not requested to change. Make the result coherent, polished, and professionally finished. "
+            "Do not add unintended text, watermarks, logos, or borders.\n\nRequested edits:\n"
         )
-        image_input = [
-            {"type": "text", "text": image_prompt},
-            {
-                "type": "image",
-                "mime_type": reference_image_mime_type,
-                "data": reference_image_base64,
-            },
-        ]
-    else:
-        image_prompt = (
-            "Create a polished, high-quality image with deliberate composition, crisp details, "
-            "coherent lighting, accurate anatomy and materials, and professional color grading. "
-            "Follow the user's brief closely. Do not add unintended text, watermarks, logos, or borders.\n\n"
-            "User's visual brief:\n" + prompt
+        + prompt
+        if reference_image_base64
+        else
+        (
+            "Create a polished, high-quality image with deliberate composition, crisp details, coherent lighting, "
+            "accurate anatomy and materials, and professional color grading. Follow the user's brief closely. "
+            "Do not add unintended text, watermarks, logos, or borders.\n\nUser's visual brief:\n"
         )
-        image_input = image_prompt
+        + prompt
+    )
 
-    request_body = {
-        "model": "gemini-3.1-flash-image",
-        "input": image_input,
-        "response_format": {
-            "type": "image",
-            "mime_type": "image/jpeg",
-            "aspect_ratio": aspect_ratio,
-            "image_size": image_size,
-        },
+    # Cloudflare's FLUX.2 Klein endpoint requires multipart/form-data even for
+    # text-only generation. For editing, its reference image must be a binary
+    # multipart field named input_image_0; reference images must be <512x512.
+    # Passing every field through httpx's files parameter forces multipart/form-data
+    # for both generation and editing (the model rejects JSON/urlencoded bodies).
+    multipart_files = {
+        "prompt": (None, image_prompt),
+        "width": (None, str(width)),
+        "height": (None, str(height)),
     }
+    if reference_image_base64:
+        try:
+            raw_reference = base64.b64decode(reference_image_base64, validate=True)
+            with Image.open(io.BytesIO(raw_reference)) as source_image:
+                source_image = ImageOps.exif_transpose(source_image).convert("RGB")
+                source_image.thumbnail((511, 511), Image.Resampling.LANCZOS)
+                prepared = io.BytesIO()
+                source_image.save(prepared, format="JPEG", quality=90, optimize=True)
+                reference_bytes = prepared.getvalue()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="The reference image could not be decoded. Please select a valid PNG, JPEG, or WebP image.") from exc
+        multipart_files["input_image_0"] = ("reference.jpg", reference_bytes, "image/jpeg")
 
+    cloudflare_url = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{account_id}/ai/run/@cf/black-forest-labs/flux-2-klein-4b"
+    )
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
             provider_response = await client.post(
-                "https://generativelanguage.googleapis.com/v1beta/interactions",
-                headers={
-                    "x-goog-api-key": api_key,
-                    "Content-Type": "application/json",
-                },
-                json=request_body,
+                cloudflare_url,
+                headers={"Authorization": f"Bearer {api_token}", "Accept": "application/json"},
+                files=multipart_files,
             )
 
         if provider_response.status_code < 200 or provider_response.status_code >= 300:
             print(
-                f"[Sarathi image provider error] HTTP {provider_response.status_code}: "
-                f"{provider_response.text[:600]}"
+                f"[Sarathi Cloudflare image provider error] HTTP {provider_response.status_code}: "
+                f"{provider_response.text[:1000]}"
             )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"The image provider returned HTTP {provider_response.status_code}. "
-                    "Check the Gemini API key, model access, and billing/usage limits in Render."
-                ),
-            )
+            if provider_response.status_code in {401, 403}:
+                detail = "Cloudflare rejected the API token or account permissions. Check CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in Render."
+            elif provider_response.status_code == 429:
+                detail = "Cloudflare Workers AI rate limit or usage allowance was reached. Try again later."
+            else:
+                detail = f"Cloudflare image generation returned HTTP {provider_response.status_code}. Check the Render logs."
+            raise HTTPException(status_code=502, detail=detail)
 
         result = provider_response.json()
-        image_base64 = ""
-        mime_type = "image/png"
-
-        # The Interactions API returns output_image on normal responses. Also
-        # tolerate output-array variants so a harmless response-shape change does
-        # not prevent an otherwise successful image generation.
-        output_image = result.get("output_image") or {}
-        if isinstance(output_image, dict):
-            image_base64 = str(output_image.get("data") or "")
-            mime_type = str(output_image.get("mime_type") or output_image.get("mimeType") or mime_type)
-
+        image_base64 = str(result.get("image") or "")
+        # Some API responses wrap the model output in a result property.
+        if not image_base64 and isinstance(result.get("result"), dict):
+            image_base64 = str(result["result"].get("image") or "")
         if not image_base64:
-            output_items = result.get("output") or []
-            if isinstance(output_items, list):
-                for item in output_items:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") in {"image", "output_image"}:
-                        image_base64 = str(item.get("data") or item.get("image_data") or "")
-                        mime_type = str(item.get("mime_type") or item.get("mimeType") or mime_type)
-                        if image_base64:
-                            break
-                    # Some gateways normalize image content into a nested content field.
-                    nested = item.get("content") or {}
-                    if isinstance(nested, dict) and nested.get("type") == "image":
-                        image_base64 = str(nested.get("data") or "")
-                        mime_type = str(nested.get("mime_type") or mime_type)
-                        if image_base64:
-                            break
+            print(f"[Sarathi Cloudflare response contained no image]: {str(result)[:700]}")
+            raise HTTPException(status_code=502, detail="Cloudflare returned no image. Try again with a different prompt.")
 
-        if not image_base64:
-            print(f"[Sarathi image provider returned no image]: {str(result)[:700]}")
-            raise HTTPException(
-                status_code=502,
-                detail="The image service returned no image. Try a more specific prompt or retry later.",
-            )
+        # Validate that the returned payload is usable before sending it to Flutter.
+        try:
+            base64.b64decode(image_base64, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail="Cloudflare returned an invalid image payload. Please retry.") from exc
 
-        # Persist textual records only; image bytes stay with the client unless
-        # the user deliberately exports/saves them. Do not put large base64 blobs in Postgres.
         if conversation_id and supabase:
             try:
                 supabase.table("sarathi_messages").insert([
@@ -4621,19 +4605,19 @@ async def sarathi_generate_image(request: Request):
         return {
             "status": "success",
             "image_base64": image_base64,
-            "mime_type": mime_type,
+            "mime_type": "image/png",
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
-            "image_size": image_size,
+            "image_size": "1K",
             "message": "Image generated successfully.",
         }
     except HTTPException:
         raise
     except Exception as exc:
-        print(f"[Sarathi image generation error]: {exc}")
+        print(f"[Sarathi Cloudflare image generation error]: {exc}")
         raise HTTPException(
             status_code=502,
-            detail="Image generation failed. Check the Render logs and Gemini API usage.",
+            detail="Image generation failed. Check the Render logs and Cloudflare Workers AI usage.",
         ) from exc
 
 
