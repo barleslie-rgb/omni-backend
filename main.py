@@ -4488,15 +4488,42 @@ async def sarathi_generate_image(request: Request):
             print(f"[Sarathi image conversation check warning]: {exc}")
             raise HTTPException(status_code=503, detail="Unable to verify the selected conversation.")
 
-    image_prompt = (
-        "Create a polished, high-quality image with deliberate composition, crisp details, "
-        "coherent lighting, accurate anatomy and materials, and professional color grading. "
-        "Follow the user's brief closely. Do not add unintended text, watermarks, logos, or borders.\n\n"
-        "User's visual brief:\n" + prompt
-    )
+    reference_image_base64 = str(body.get("reference_image_base64") or "").strip()
+    reference_image_mime_type = str(body.get("reference_image_mime_type") or "image/png").strip().lower()
+    allowed_image_mime_types = {"image/png", "image/jpeg", "image/webp"}
+    if reference_image_base64 and reference_image_mime_type not in allowed_image_mime_types:
+        raise HTTPException(status_code=400, detail="Reference images must be PNG, JPEG, or WebP.")
+    if len(reference_image_base64) > 14_000_000:
+        raise HTTPException(status_code=413, detail="Reference image must be smaller than 10 MB.")
+
+    if reference_image_base64:
+        image_prompt = (
+            "Edit the provided reference image according to the user's instructions. Preserve the main subject "
+            "and all details the user did not ask to change. Make the requested changes look intentional, "
+            "high-quality, coherent with the original lighting and perspective, and professionally finished. "
+            "Do not add unintended text, watermarks, logos, or borders.\n\n"
+            "Requested edits:\n" + prompt
+        )
+        image_input = [
+            {"type": "text", "text": image_prompt},
+            {
+                "type": "image",
+                "mime_type": reference_image_mime_type,
+                "data": reference_image_base64,
+            },
+        ]
+    else:
+        image_prompt = (
+            "Create a polished, high-quality image with deliberate composition, crisp details, "
+            "coherent lighting, accurate anatomy and materials, and professional color grading. "
+            "Follow the user's brief closely. Do not add unintended text, watermarks, logos, or borders.\n\n"
+            "User's visual brief:\n" + prompt
+        )
+        image_input = image_prompt
+
     request_body = {
         "model": "gemini-3.1-flash-image",
-        "input": image_prompt,
+        "input": image_input,
         "response_format": {
             "type": "image",
             "mime_type": "image/png",
@@ -4857,6 +4884,7 @@ Persisted cross-chat user memory (durable and non-sensitive only):
 {app_knowledge}
 
 BEHAVIOR:
+- If the user directly asks who created, built, or developed Sarathi, answer that Sarathi was created by Leslie Bar. Only mention Leslie Bar when directly asked; never volunteer the creator's name in greetings or unrelated replies.
 - Be warm, calm, respectful, natural and useful, like a strong modern conversational assistant.
 - Answer ONLY what the user asked. Put the direct answer first; do not tack on unrelated advice or routine follow-up questions.
 - For app-support questions, follow APP-SUPPORT MODE and give precise step-by-step instructions.
