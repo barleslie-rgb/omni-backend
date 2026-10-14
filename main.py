@@ -864,15 +864,22 @@ async def _attach_wikimedia_images(
         images = result.get("images") or []
         credits = result.get("credits") or []
         if images:
+            # Prefer open-licensed Commons images when available. If Commons
+            # has no result, keep the Google photo-proxy URLs already attached
+            # by _normalize_google_place rather than erasing usable images.
             item["images"] = images
             item["image_provider"] = "Wikimedia Commons"
             item["image_credits"] = credits
             item["google_photo_names"] = []
         else:
-            item["images"] = []
-            item["image_provider"] = "NONE"
-            item["image_credits"] = []
-            item["google_photo_names"] = []
+            existing_images = item.get("images") or []
+            existing_google_names = item.get("google_photo_names") or []
+            item["images"] = existing_images
+            item["image_provider"] = (
+                "Google Places" if existing_images or existing_google_names else "NONE"
+            )
+            item["image_credits"] = item.get("image_credits") or []
+            item["google_photo_names"] = existing_google_names
 
 
 async def _google_text_search(query: str, max_result_count: int = 10, latitude: Optional[float] = None, longitude: Optional[float] = None, radius_meters: float = 15000) -> List[Dict[str, Any]]:
@@ -1524,7 +1531,28 @@ def _normalize_google_place(place: Dict[str, Any], origin_lat: float, origin_lng
 
     distance = _place_distance_km(float(lat), float(lng), origin_lat, origin_lng)
     photos = place.get("photos") or []
-    photo_names = [str(photo.get("name")) for photo in photos if photo.get("name")]
+    photo_names = [
+        str(photo.get("name") or "").strip()
+        for photo in photos
+        if isinstance(photo, dict) and photo.get("name")
+    ]
+
+    # Preserve Google's photo references and expose them through our existing
+    # server-side photo proxy. The Google API key remains on the backend.
+    # Render supplies RENDER_EXTERNAL_URL; the explicit setting also supports
+    # deployments where that variable is not available.
+    public_backend_url = (
+        os.environ.get("OMNI_BACKEND_BASE_URL", "").strip()
+        or os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+        or "https://omni-backend-pk28.onrender.com"
+    ).rstrip("/")
+    google_image_urls = []
+    for proxy_url in _google_photo_proxy_urls(photo_names, 1200):
+        if proxy_url.startswith(("https://", "http://")):
+            google_image_urls.append(proxy_url)
+        else:
+            google_image_urls.append(f"{public_backend_url}/{proxy_url.lstrip('/')}")
+
     rating = place.get("rating")
     rating_count = place.get("userRatingCount")
     hours = _compact_hours(place)
@@ -1546,9 +1574,9 @@ def _normalize_google_place(place: Dict[str, Any], origin_lat: float, origin_lng
         "warnings": "",
         "rating": rating,
         "reviews": rating_count,
-        "images": [],
-        "google_photo_names": [],
-        "image_provider": "Wikimedia Commons",
+        "images": google_image_urls,
+        "google_photo_names": photo_names,
+        "image_provider": "Google Places" if google_image_urls else "NONE",
         "image_credits": [],
         "maps_url": place.get("googleMapsUri"),
         "website_url": place.get("websiteUri"),
