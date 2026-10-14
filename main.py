@@ -4348,14 +4348,18 @@ async def sarathi_get_conversation(conversation_id: str, request: Request):
         # conversation return HTTP 500. The raw messages remain usable.
         memory = {}
         try:
-            memory = (
+            memory_response = (
                 supabase.table("sarathi_conversation_memory")
                 .select("summary, summarized_message_count, updated_at")
                 .eq("conversation_id", conversation_id)
                 .eq("user_id", user["id"])
                 .maybe_single()
                 .execute()
-            ).data or {}
+            )
+            # Some transient/abnormal responses may be None. Treat memory as
+            # optional so conversation history remains available without a warning.
+            memory_data = getattr(memory_response, "data", None)
+            memory = memory_data if isinstance(memory_data, dict) else {}
         except Exception as memory_exc:
             print(f"[Sarathi memory warning]: {memory_exc}")
 
