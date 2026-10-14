@@ -845,19 +845,40 @@ async def _attach_wikimedia_images(
     city: str,
     country: str,
     limit_places: int = 15,
+    state: str = "",
 ) -> None:
-    """Attach open destination photos without changing provider place facts."""
+    """Attach open destination photos, retrying with regional names for smaller places."""
     targets = places[:max(0, int(limit_places))]
-    tasks = []
-    for item in targets:
+
+    async def find_images(item: Dict[str, Any]) -> Dict[str, Any]:
         name = str(item.get("name") or "").strip()
         if not name:
-            tasks.append(asyncio.sleep(0, result={"images": [], "credits": []}))
-            continue
-        query = f"{name} {city} {country}".strip()
-        tasks.append(_wikimedia_image_search(query, 5))
+            return {"images": [], "credits": []}
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Local attractions are often indexed under their district/state rather
+        # than the nearest small city. Try the most specific query first, then
+        # progressively broader regional variants without using unrelated stock imagery.
+        context_parts = [str(city or "").strip(), str(state or "").strip(), str(country or "").strip()]
+        specific_query = " ".join(part for part in context_parts if part)
+        queries = [
+            f"{name} {specific_query}".strip(),
+            f"{name} {city} {country}".strip(),
+        ]
+        if state:
+            queries.append(f"{name} {state} {country}".strip())
+
+        seen_queries = set()
+        for query in queries:
+            query = re.sub(r"\s+", " ", query).strip()
+            if not query or query.casefold() in seen_queries:
+                continue
+            seen_queries.add(query.casefold())
+            result = await _wikimedia_image_search(query, 5)
+            if result.get("images"):
+                return result
+        return {"images": [], "credits": []}
+
+    results = await asyncio.gather(*(find_images(item) for item in targets), return_exceptions=True)
     for item, result in zip(targets, results):
         if isinstance(result, Exception) or not isinstance(result, dict):
             continue
@@ -865,8 +886,7 @@ async def _attach_wikimedia_images(
         credits = result.get("credits") or []
         if images:
             # Prefer open-licensed Commons images when available. If Commons
-            # has no result, keep the Google photo-proxy URLs already attached
-            # by _normalize_google_place rather than erasing usable images.
+            # has no result, keep the Google photo-proxy URLs already attached.
             item["images"] = images
             item["image_provider"] = "Wikimedia Commons"
             item["image_credits"] = credits
@@ -1673,9 +1693,11 @@ async def _load_google_destination_places(city: str, state: str, country: str) -
     if not destination:
         return None, []
 
+    region = ", ".join(part for part in (city, state, country) if str(part or "").strip())
     queries = [
-        f"top attractions and landmarks in {city}, {country}",
-        f"things to do and tourist attractions in {city}, {country}",
+        f"top attractions and landmarks in {region}",
+        f"things to do and tourist attractions in {region}",
+        f"popular local places and sightseeing near {region}",
     ]
     batches = await asyncio.gather(*[_google_text_search(q, 10) for q in queries], return_exceptions=True)
     merged: Dict[str, Dict[str, Any]] = {}
@@ -1701,7 +1723,7 @@ async def _load_google_destination_places(city: str, state: str, country: str) -
 
     normalized.sort(key=lambda x: (-(float(x.get("rating") or 0)), -(int(x.get("reviews") or 0))))
     normalized = normalized[:20]
-    await _attach_wikimedia_images(normalized, city, country, limit_places=15)
+    await _attach_wikimedia_images(normalized, city, country, limit_places=20, state=state)
     return destination, normalized
 
 
