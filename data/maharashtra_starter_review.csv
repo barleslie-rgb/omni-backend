@@ -1,0 +1,9 @@
+slug,name,category,description,city,state_region,country,country_code,latitude,longitude,source_name,is_published
+gateway-of-india-mumbai,Gateway of India,Heritage & Forts,Historic waterfront monument in south Mumbai.,Mumbai,Maharashtra,India,IN,18.9220,72.8347,curated,false
+elephanta-caves-mumbai,Elephanta Caves,Heritage & Forts,Rock-cut cave temples on Elephanta Island near Mumbai.,Mumbai,Maharashtra,India,IN,18.9633,72.9315,curated,false
+ajanta-caves,Ajanta Caves,Heritage & Forts,Buddhist rock-cut cave complex in Maharashtra.,Aurangabad region,Maharashtra,India,IN,20.5519,75.7033,curated,false
+ellora-caves,Ellora Caves,Heritage & Forts,Rock-cut cave complex near Chhatrapati Sambhajinagar.,Chhatrapati Sambhajinagar,Maharashtra,India,IN,20.0268,75.1772,curated,false
+shaniwar-wada-pune,Shaniwar Wada,Heritage & Forts,Historic fortification in Pune.,Pune,Maharashtra,India,IN,18.5195,73.8553,curated,false
+mahabaleshwar,Mahabaleshwar,Nature & Wildlife,Hill station in the Western Ghats.,Mahabaleshwar,Maharashtra,India,IN,17.9307,73.6477,curated,false
+raigad-fort,Raigad Fort,Heritage & Forts,Hill fort in the Sahyadri range.,Mahad region,Maharashtra,India,IN,18.2345,73.4408,curated,false
+tadoba-national-park,Tadoba-Andhari Tiger Reserve,Nature & Wildlife,Tiger reserve in Maharashtra.,Chandrapur region,Maharashtra,India,IN,20.2489,79.3667,curated,false

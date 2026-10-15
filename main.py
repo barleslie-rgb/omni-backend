@@ -208,48 +208,82 @@ async def ask_fast_text(prompt: str, system_prompt: str) -> str:
 
     raise HTTPException(status_code=500, detail="Groq API request failed across all active models.")
 
-async def ask_fast_vision(image_bytes: bytes, filename: str, target_language: str) -> str:
-    """High-quality multimodal document extraction for images.
+async def ask_fast_vision(
+    image_bytes: bytes,
+    filename: str,
+    target_language: str,
+    analysis_mode: str = "document",
+) -> str:
+    """Multimodal image analysis for PaperPilot.
 
-    Llama 4 Scout was deprecated by Groq in July 2026, so Paper Pilot now
-    uses the current Qwen 3.8 multimodal model. The vision pass is deliberately
-    extraction-heavy: the following text auditor receives the visible evidence
-    instead of a vague image caption.
+    The default remains the established document/OCR workflow. The optional
+    plant mode uses the same configured vision model and image pipeline, but
+    asks for cautious, evidence-based crop observations instead of OCR-first
+    document analysis.
     """
     client = get_groq_client()
     if not client:
         return ""
     try:
         encoded = base64.b64encode(image_bytes).decode("ascii")
-        prompt = (
-            "You are Paper Pilot's visual document intelligence engine. "
-            "Analyze the uploaded image as if a user handed the document to an expert human analyst.\n\n"
-            "FIRST, inspect the entire image carefully. Do not say that OCR failed if the image is readable. "
-            "Read visible text in every language/script you can identify, including headings, names, dates, "
-            "phone numbers, addresses, prices, amounts, times, contact details, labels, tables and small print. "
-            "Also describe important visual facts such as logos, photographs, seals, signatures, stamps, "
-            "checkboxes, highlighted items, layout, document type, and obvious inconsistencies.\n\n"
-            "RETURN A FACTUAL EVIDENCE REPORT with these headings:\n"
-            "DOCUMENT TYPE / PURPOSE\n"
-            "VISIBLE TEXT (transcribe faithfully; preserve important original wording)\n"
-            "PEOPLE / ORGANIZATIONS / PLACES\n"
-            "DATES / TIMES / NUMBERS\n"
-            "FINANCIAL OR OTHER NUMERICAL DETAILS\n"
-            "IMPORTANT VISUAL ELEMENTS\n"
-            "POTENTIAL ISSUES OR ITEMS TO VERIFY\n"
-            "CONFIDENCE / UNREADABLE AREAS\n\n"
-            "Rules: Never invent missing text. If something is uncertain, mark it as uncertain. "
-            "Do not replace readable content with a generic failure message. "
-            f"Write the evidence report in {target_language}."
-        )
+        if str(analysis_mode or "document").strip().lower() == "plant":
+            prompt = (
+                "You are PaperPilot's plant and crop photo observation assistant. "
+                "Analyze only what can reasonably be inferred from this image.\n\n"
+                "Return a practical report with these headings:\n"
+                "VISIBLE OBSERVATIONS\n"
+                "POSSIBLE EXPLANATIONS (rank as possibilities, not confirmed diagnoses)\n"
+                "WHAT TO CHECK NEXT\n"
+                "SAFE FIRST STEPS\n"
+                "WHEN TO SEEK LOCAL EXPERT HELP\n"
+                "PHOTO / CONTEXT THAT WOULD IMPROVE THE ASSESSMENT\n\n"
+                "Rules: distinguish visible symptoms from hypotheses; do not claim certainty from a photo alone; "
+                "do not invent the crop, location, weather, soil condition, pest, or disease. If the plant or symptom "
+                "is unclear, say what is uncertain and ask for a clearer photo of the whole plant and close-ups of "
+                "affected and healthy leaves. Prefer low-risk steps such as checking soil moisture, inspecting both "
+                "sides of leaves, and isolating a visibly affected potted plant when practical. Do not prescribe a "
+                "pesticide, chemical mixture, application rate, or dosage based only on the image. Recommend confirming "
+                "suspected disease or pest problems with a local agricultural extension officer or qualified agronomist. "
+                f"Write the report in {target_language}."
+            )
+            system_prompt = (
+                "You are a cautious multimodal plant-observation assistant. Be practical, honest about uncertainty, "
+                "and never present a photo-based guess as a confirmed diagnosis."
+            )
+        else:
+            prompt = (
+                "You are Paper Pilot's visual document intelligence engine. "
+                "Analyze the uploaded image as if a user handed the document to an expert human analyst.\n\n"
+                "FIRST, inspect the entire image carefully. Do not say that OCR failed if the image is readable. "
+                "Read visible text in every language/script you can identify, including headings, names, dates, "
+                "phone numbers, addresses, prices, amounts, times, contact details, labels, tables and small print. "
+                "Also describe important visual facts such as logos, photographs, seals, signatures, stamps, "
+                "checkboxes, highlighted items, layout, document type, and obvious inconsistencies.\n\n"
+                "RETURN A FACTUAL EVIDENCE REPORT with these headings:\n"
+                "DOCUMENT TYPE / PURPOSE\n"
+                "VISIBLE TEXT (transcribe faithfully; preserve important original wording)\n"
+                "PEOPLE / ORGANIZATIONS / PLACES\n"
+                "DATES / TIMES / NUMBERS\n"
+                "FINANCIAL OR OTHER NUMERICAL DETAILS\n"
+                "IMPORTANT VISUAL ELEMENTS\n"
+                "POTENTIAL ISSUES OR ITEMS TO VERIFY\n"
+                "CONFIDENCE / UNREADABLE AREAS\n\n"
+                "Rules: Never invent missing text. If something is uncertain, mark it as uncertain. "
+                "Do not replace readable content with a generic failure message. "
+                f"Write the evidence report in {target_language}."
+            )
+            system_prompt = (
+                "You are an expert multimodal document/OCR analyst. Accuracy is more important than brevity."
+            )
+
         completion = client.chat.completions.create(
             model="qwen/qwen3.8-27b",
             messages=[
-                {"role":"system","content":"You are an expert multimodal document/OCR analyst. Accuracy is more important than brevity."},
-                {"role":"user","content":[
-                    {"type":"text","text":prompt},
-                    {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{encoded}"}}
-                ]}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                ]},
             ],
             temperature=0.1,
             max_completion_tokens=5000,
@@ -3927,7 +3961,8 @@ async def _transcribe_media(file_bytes: bytes, filename: str) -> str:
 @app.post("/api/v1/analyze-document")
 async def analyze_document(
     file: UploadFile = File(...),
-    target_language: str = Form("English")
+    target_language: str = Form("English"),
+    analysis_mode: str = Form("document"),
 ):
     """Universal Paper Pilot ingestion pipeline.
 
@@ -3940,6 +3975,16 @@ async def analyze_document(
         file_bytes = await file.read()
         filename = file.filename or "uploaded_file"
         kind = _file_kind(filename, file.content_type or "")
+        # Optional, backward-compatible mode: existing clients omit this field
+        # and continue to use the original document-analysis behavior.
+        requested_mode = str(analysis_mode or "document").strip().lower()
+        if requested_mode not in {"document", "plant"}:
+            requested_mode = "document"
+        if requested_mode == "plant" and kind != "image":
+            raise HTTPException(
+                status_code=400,
+                detail="Plant analysis currently requires a plant photo (JPG, PNG, WEBP, BMP, GIF, TIF, or TIFF).",
+            )
         ext = os.path.splitext(filename.lower())[1]
         mime = file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         extracted_text = ""
@@ -3957,8 +4002,20 @@ async def analyze_document(
                     extracted_text = visual_text
         elif kind == "image":
             normalized = prepare_image_bytes(file_bytes)
-            visual_text = await ask_fast_vision(normalized or file_bytes, filename, target_language)
-            extracted_text = visual_text or "Image document received. Visual/OCR inspection could not be completed by the configured vision model."
+            visual_text = await ask_fast_vision(
+                normalized or file_bytes,
+                filename,
+                target_language,
+                analysis_mode=requested_mode,
+            )
+            if requested_mode == "plant":
+                fallback_text = (
+                    "Plant photo received, but the configured vision model could not complete the assessment. "
+                    "Please try a well-lit photo showing the whole plant and close-ups of affected leaves."
+                )
+            else:
+                fallback_text = "Image document received. Visual/OCR inspection could not be completed by the configured vision model."
+            extracted_text = visual_text or fallback_text
             if normalized and not visual_text:
                 extracted_text += f"\nNormalized image size: {len(normalized)} bytes."
         elif kind == "word":
@@ -4001,7 +4058,11 @@ async def analyze_document(
 
         type_guidance = {
             "pdf":"Treat this as a document/legal/financial record.",
-            "image":"Treat this as a photographed or scanned document/image. Identify visible text, entities, tables and risks.",
+            "image": (
+                "Treat this as a plant/crop photograph. Build a cautious, evidence-based plant observation report."
+                if requested_mode == "plant" else
+                "Treat this as a photographed or scanned document/image. Identify visible text, entities, tables and risks."
+            ),
             "word":"Preserve headings, clauses, parties, dates and numerical details.",
             "spreadsheet":"Focus on tables, totals, anomalies, formulas represented in the extracted data and important numerical patterns.",
             "presentation":"Treat each slide as a separate information unit and identify key conclusions.",
@@ -4011,38 +4072,61 @@ async def analyze_document(
             "text":"Treat this as a text record and preserve its structure.",
         }.get(kind, "Treat this as a general uploaded file and explain what can be reliably inferred.")
 
-        audit_prompt = (
-            f"You are Paper Pilot, an expert document analyst and intelligent auditor.\n"
-            f"{lang_instruction}\n{type_guidance}\n\n"
-            "The goal is to make the user understand exactly what this file is about, in simple language, "
-            "while still being precise enough for serious document review.\n\n"
-            "GUIDELINES:\n"
-            "1. Start with a plain-English 'What this file is about' explanation in 2-4 sentences.\n"
-            "2. Then provide: Executive Summary; Key Information; Important Details / Clauses; "
-            "People, Organizations & Places; Dates & Deadlines; Financial / Numerical Data; "
-            "Risks / Things to Verify; What the User Should Do Next.\n"
-            "3. For images, treat the visual evidence report as primary source material and synthesize it carefully.\n"
-            "4. Preserve exact names, numbers, dates, phone numbers, addresses and wording when they are readable.\n"
-            "5. Explain technical/legal/financial terms in simple words immediately after using them.\n"
-            "6. Never invent facts. If a value is unreadable or uncertain, explicitly say so.\n"
-            "7. Distinguish clearly between facts visible in the file and reasonable observations/inferences.\n"
-            "8. Do not say 'OCR failed', 'content unavailable', or similar when usable evidence is present.\n"
-            "9. For posters, notices, invitations, receipts, IDs, forms and photographs, explain the purpose and "
-            "the practical meaning rather than forcing them into a financial/legal template.\n"
-            "10. End with 3-4 useful follow-up questions under EXPLORE_SUGGESTIONS.\n"
-            "At the very end, output exactly: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
-        )
+        if requested_mode == "plant":
+            audit_prompt = (
+                f"You are PaperPilot, a careful plant and crop photo assistant.\n"
+                f"{lang_instruction}\n{type_guidance}\n\n"
+                "Explain the findings in practical, accessible language suitable for a home gardener or farmer.\n"
+                "Use these sections: What I Can See; Possible Causes (not a confirmed diagnosis); What to Check; "
+                "Safe First Steps; When to Ask a Local Agricultural Expert; What Information Would Help Next.\n"
+                "Separate visible evidence from hypotheses. Do not invent the crop, location, season, weather, soil, "
+                "pest, or disease. Do not prescribe pesticides, chemical mixtures, application rates, or dosages from "
+                "a photo alone. Prefer low-risk observation and care steps; ask for crop name, location, growth stage, "
+                "watering pattern, and a clearer photo when these details materially affect the advice. Recommend a "
+                "local agricultural extension officer or qualified agronomist for serious or spreading crop damage.\n"
+                "End with 3 useful follow-up questions under EXPLORE_SUGGESTIONS.\n"
+                "At the very end, output exactly: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
+            )
+        else:
+            audit_prompt = (
+                f"You are Paper Pilot, an expert document analyst and intelligent auditor.\n"
+                f"{lang_instruction}\n{type_guidance}\n\n"
+                "The goal is to make the user understand exactly what this file is about, in simple language, "
+                "while still being precise enough for serious document review.\n\n"
+                "GUIDELINES:\n"
+                "1. Start with a plain-English 'What this file is about' explanation in 2-4 sentences.\n"
+                "2. Then provide: Executive Summary; Key Information; Important Details / Clauses; "
+                "People, Organizations & Places; Dates & Deadlines; Financial / Numerical Data; "
+                "Risks / Things to Verify; What the User Should Do Next.\n"
+                "3. For images, treat the visual evidence report as primary source material and synthesize it carefully.\n"
+                "4. Preserve exact names, numbers, dates, phone numbers, addresses and wording when they are readable.\n"
+                "5. Explain technical/legal/financial terms in simple words immediately after using them.\n"
+                "6. Never invent facts. If a value is unreadable or uncertain, explicitly say so.\n"
+                "7. Distinguish clearly between facts visible in the file and reasonable observations/inferences.\n"
+                "8. Do not say 'OCR failed', 'content unavailable', or similar when usable evidence is present.\n"
+                "9. For posters, notices, invitations, receipts, IDs, forms and photographs, explain the purpose and "
+                "the practical meaning rather than forcing them into a financial/legal template.\n"
+                "10. End with 3-4 useful follow-up questions under EXPLORE_SUGGESTIONS.\n"
+                "At the very end, output exactly: EXPLORE_SUGGESTIONS: [\"Question 1?\", \"Question 2?\", \"Question 3?\"]"
+            )
 
         analysis_raw = await ask_fast_text(
             f"DOCUMENT FILE: {filename}\nTYPE: {kind}\nMIME: {mime}\nPAGES/SLIDES/CHAPTERS: {total_pages_detected}\n\nSOURCE EVIDENCE / EXTRACTED CONTENT:\n{extracted_text[:120000]}",
             audit_prompt
         )
 
-        suggestions = [
-            "What are the primary financial details here?",
-            "Are there hidden liabilities or important risks?",
-            "What should I verify before relying on this file?"
-        ]
+        if requested_mode == "plant":
+            suggestions = [
+                "What extra details would help narrow down the possible causes?",
+                "What safe first steps can I take while I investigate?",
+                "What should I photograph or check next?",
+            ]
+        else:
+            suggestions = [
+                "What are the primary financial details here?",
+                "Are there hidden liabilities or important risks?",
+                "What should I verify before relying on this file?"
+            ]
         clean_text = analysis_raw
         if "EXPLORE_SUGGESTIONS:" in analysis_raw:
             parts = analysis_raw.split("EXPLORE_SUGGESTIONS:", 1)
@@ -4060,6 +4144,7 @@ async def analyze_document(
                 "document_title": filename,
                 "file_name": filename,
                 "file_type": kind,
+                "analysis_mode": requested_mode,
                 "mime_type": mime,
                 "extension": ext,
                 "size_bytes": len(file_bytes),
