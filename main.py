@@ -2663,8 +2663,10 @@ async def get_news_feed(
             "city": city.strip() or place or "city news",
             "national": (country.strip() or "India") + " news",
             "world": "world news",
-            # Focus financial headlines on Indian equities and benchmark indices. GNews supports OR groups.
-            "financial": '("Sensex" OR "Nifty" OR "NSE" OR "BSE" OR "Indian stock market" OR "stock market India" OR "Dalal Street")',
+            # Keep this feed focused on Indian equity-market reporting. The provider query is
+            # intentionally narrow; a second server-side relevance filter below prevents
+            # words such as "nifty" in sports stories from entering the market feed.
+            "financial": '("Sensex" OR "Nifty" OR "GIFT Nifty" OR "Indian stock market" OR "Dalal Street" OR "Indian equities") AND (stocks OR shares OR trading OR equities OR index OR market)',
             "business": "business startups companies",
             "sports": "sports",
             "technology": "technology AI innovation",
@@ -2699,20 +2701,60 @@ async def get_news_feed(
                     continue
                 articles = []
                 seen_urls = set()
+                seen_titles = set()
+                seen_title_tokens = []
                 for article in raw_articles:
-                    url = article.get("url")
-                    if url and url in seen_urls:
+                    title = (article.get("title") or "").strip()
+                    description = (article.get("description") or "").strip()
+                    url = (article.get("url") or "").strip()
+
+                    # Financial/market feed must not accept unrelated results just because
+                    # a word like "nifty" appears in ordinary prose. Require an Indian
+                    # index/market signal in the title plus financial context in title/body.
+                    if category == "financial":
+                        title_l = title.casefold()
+                        text_l = f"{title} {description}".casefold()
+                        index_signal = re.search(
+                            r"\b(sensex|nifty(?:\s*50)?|gift nifty|nse|bse|dalal street|indian stock market|indian equities|indian shares)\b",
+                            title_l,
+                        )
+                        finance_context = re.search(
+                            r"\b(stock(?:s)?|share(?:s)?|equities|equity|trading|market|markets|index|indices|investors|bourse|securities|benchmark|ipo)\b",
+                            text_l,
+                        )
+                        if not (index_signal and finance_context):
+                            continue
+
+                    # Deduplicate both identical URLs and repeated headlines from syndicated
+                    # stories published by different outlets.
+                    normalized_title = re.sub(r"[^a-z0-9]+", " ", title.casefold()).strip()
+                    title_tokens = {word for word in normalized_title.split() if len(word) > 2}
+                    duplicate_title = bool(normalized_title and normalized_title in seen_titles)
+                    if title_tokens and not duplicate_title:
+                        for prior_tokens in seen_title_tokens:
+                            union = title_tokens | prior_tokens
+                            overlap = len(title_tokens & prior_tokens) / len(union) if union else 0.0
+                            if overlap >= 0.78:
+                                duplicate_title = True
+                                break
+                    if (url and url in seen_urls) or duplicate_title:
                         continue
                     if url:
                         seen_urls.add(url)
+                    if normalized_title:
+                        seen_titles.add(normalized_title)
+                    if title_tokens:
+                        seen_title_tokens.append(title_tokens)
                     articles.append({
-                        "title": article.get("title"),
-                        "description": article.get("description"),
+                        "title": title or "Market update",
+                        "description": description,
                         "url": url,
                         "image": article.get("image"),
                         "published_at": article.get("publishedAt"),
                         "source": (article.get("source") or {}).get("name", "News source"),
                     })
+                    if len(articles) >= limit:
+                        break
                 if articles:
                     result = {
                         "status": "success", "provider": "GNews", "category": category,
