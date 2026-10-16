@@ -2663,7 +2663,8 @@ async def get_news_feed(
             "city": city.strip() or place or "city news",
             "national": (country.strip() or "India") + " news",
             "world": "world news",
-            "financial": "financial markets stock market economy",
+            # Focus financial headlines on Indian equities and benchmark indices. GNews supports OR groups.
+            "financial": '("Sensex" OR "Nifty" OR "NSE" OR "BSE" OR "Indian stock market" OR "stock market India" OR "Dalal Street")',
             "business": "business startups companies",
             "sports": "sports",
             "technology": "technology AI innovation",
