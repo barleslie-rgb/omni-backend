@@ -1396,24 +1396,14 @@ async def _google_place_details(place_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _google_photo_proxy_urls(photo_names: List[str], max_width: int = 1200) -> List[str]:
-    """Return absolute, app-loadable URLs for Google Places photos.
-
-    Flutter's Image.network cannot load a server-relative path such as
-    /api/v1/place-photo?... . Keep the Google key server-side and route all
-    photo requests through this backend.
-    """
-    public_backend_url = (
-        os.environ.get("OMNI_BACKEND_BASE_URL", "").strip()
-        or os.environ.get("RENDER_EXTERNAL_URL", "").strip()
-        or "https://omni-backend-pk28.onrender.com"
-    ).rstrip("/")
     urls: List[str] = []
     for raw_name in photo_names[:10]:
         name = str(raw_name or "").strip()
         if not name:
             continue
-        path = f"/api/v1/place-photo?name={urllib.parse.quote(name, safe='')}&max_width={int(max_width)}"
-        urls.append(f"{public_backend_url}{path}")
+        urls.append(
+            f"/api/v1/place-photo?name={urllib.parse.quote(name, safe='')}&max_width={int(max_width)}"
+        )
     return urls
 
 
@@ -5272,272 +5262,794 @@ def _community_google_place_to_row(place: Dict[str, Any], city: str, category: s
     }
     return row
 
-def _community_infer_category_from_query(query_text: str) -> str:
-    """Map broad category searches to the app's canonical category labels."""
-    q = re.sub(r"[^a-z0-9]+", " ", str(query_text or "").lower()).strip()
-    aliases = [
-        (("pharmacy", "chemist", "medical store", "drugstore"), "Pharmacy / Chemist"),
-        (("barber", "salon", "hairdresser", "beauty salon"), "Barber & Salon"),
-        (("grocery", "groceries", "kirana", "supermarket", "general store"), "Kirana & Essentials"),
-        (("ice cream", "dairy"), "Ice Cream & Dairy"),
-        (("butcher", "meat shop", "fish market", "meat market"), "Cold Storage & Meat"),
-        (("bakery", "bakeries", "bread", "cake shop", "sweets"), "Bakery & Sweets"),
-        (("chinese", "indo chinese", "snacks", "fast food"), "Indo-Chinese & Snacks"),
-        (("chai", "tea shop", "cafe", "café", "coffee shop", "coffee"), "Chai & Quick Bites"),
-        (("pizza", "burger", "sandwich", "restaurant", "restaurants", "food", "eatery", "bar and restaurant"), "Bar & Restaurant"),
-        (("seafood", "seafood restaurant", "diner"), "Diner & Seafood"),
-        (("market", "bazaar", "mall", "shopping"), "Market, Bazaar & Mall"),
-        (("cinema", "movie theater", "movie theatre", "theater", "theatre"), "Movie Cinema & Theater"),
-        (("park", "picnic", "viewpoint", "nature spot", "attraction"), "Picnic Spot & Landscape"),
-        (("resort", "farmhouse", "farm stay"), "Resort & Farmhouse"),
-        (("heritage", "historical place", "historic place", "museum", "temple", "tourist attraction"), "Heritage & Sight"),
-        (("hotel", "homestay", "guest house", "stay"), "Hotel & Stay"),
-    ]
-    for terms, category in aliases:
-        if any(term in q for term in terms):
-            return category
-    return "All"
+# -------------------------------------------------------------
+# COMMUNITY GEMS OPEN-DATA SEARCH ENGINE
+# Sources: OpenStreetMap (Photon, Nominatim, Overpass) + Wikipedia + Wikimedia Commons.
+# No API key is needed for any of these providers, so quota exhaustion on
+# Google/Geoapify no longer affects Community Gems search.
+# Optional: set COMMUNITY_USE_GOOGLE=true in Render to ALSO query Google Places
+# when a working key is available again.
+# -------------------------------------------------------------
+COMMUNITY_USE_GOOGLE = os.environ.get("COMMUNITY_USE_GOOGLE", "").strip().lower() in {"1", "true", "yes", "on"}
+PHOTON_API_URL = os.environ.get("PHOTON_API_URL", "https://photon.komoot.io/api/").strip()
 
+_OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
+_overpass_down_until: Dict[str, float] = {}
+_community_nominatim_last = 0.0
+_community_hub_cache: Dict[str, Tuple[float, float]] = {}
+_community_open_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_COMMUNITY_OPEN_TTL = 600
+_COMMUNITY_LOCAL_RADIUS_KM = 40.0
 
-_COMMUNITY_OSM_CATEGORY_SELECTORS: Dict[str, List[str]] = {
-    "All": [
-        '["amenity"~"restaurant|cafe|fast_food|pharmacy|clinic|doctors|hospital|bank|atm|cinema|theatre|pub|bar|marketplace|fuel|post_office|library|place_of_worship"]',
-        '["shop"]',
-        '["tourism"~"attraction|museum|hotel|guest_house|hostel|viewpoint|camp_site|theme_park|gallery"]',
-        '["leisure"~"park|nature_reserve|sports_centre|garden|playground|beach_resort|marina"]',
-        '["historic"]',
-    ],
-    "Pharmacy / Chemist": ['["amenity"="pharmacy"]', '["shop"~"chemist|pharmacy"]'],
-    "Barber & Salon": ['["shop"~"hairdresser|beauty"]', '["amenity"~"hairdresser|beauty_salon"]'],
-    "Kirana & Essentials": ['["shop"~"convenience|supermarket|grocery|general"]'],
-    "Ice Cream & Dairy": ['["shop"~"ice_cream|dairy"]', '["amenity"="ice_cream"]'],
-    "Cold Storage & Meat": ['["shop"~"butcher|seafood"]'],
-    "Indo-Chinese & Snacks": ['["cuisine"~"chinese|asian|noodle"]', '["amenity"="fast_food"]'],
-    "Chai & Quick Bites": ['["amenity"~"cafe|fast_food"]', '["cuisine"~"coffee|tea"]'],
-    "Bar & Restaurant": ['["amenity"~"restaurant|bar|pub"]'],
-    "Diner & Seafood": ['["cuisine"~"seafood"]', '["amenity"="restaurant"]'],
-    "Market, Bazaar & Mall": ['["shop"~"mall|department_store|supermarket|market|convenience"]', '["amenity"="marketplace"]'],
-    "Movie Cinema & Theater": ['["amenity"~"cinema|theatre"]'],
-    "Picnic Spot & Landscape": ['["leisure"~"park|garden|nature_reserve|playground"]', '["tourism"~"attraction|viewpoint"]', '["natural"="beach"]'],
-    "Resort & Farmhouse": ['["tourism"~"hotel|guest_house|hostel|chalet|camp_site"]', '["leisure"="resort"]'],
-    "Heritage & Sight": ['["historic"]', '["tourism"~"museum|attraction|gallery|artwork"]', '["amenity"="place_of_worship"]'],
-    "Hotel & Stay": ['["tourism"~"hotel|guest_house|hostel|chalet|camp_site"]'],
-    "Bakery & Sweets": ['["shop"~"bakery|confectionery|pastry"]'],
+# Fast, network-free centres for the app's common hubs. Any other hub is geocoded once
+# (Nominatim) and cached in memory.
+_COMMUNITY_HUB_FALLBACKS: Dict[str, Tuple[float, float]] = {
+    "vasai-virar": (19.4200, 72.8200),
+    "vasai": (19.3919, 72.8397),
+    "virar": (19.4559, 72.8118),
+    "mumbai": (19.0760, 72.8777),
+    "andheri": (19.1136, 72.8697),
+    "thane": (19.2183, 72.9781),
+}
+
+# Ordered: the first matching rule decides the displayed category.
+# Each selector is (osm_key, regex). The same regex is used in Python and in Overpass.
+_OSM_CATEGORY_RULES: List[Tuple[str, List[Tuple[str, str]]]] = [
+    ("Pharmacy / Chemist", [("amenity", "^(pharmacy)$"), ("shop", "^(chemist)$"), ("healthcare", "^(pharmacy)$")]),
+    ("Barber & Salon", [("shop", "^(hairdresser|beauty|barber|cosmetics)$"), ("amenity", "^(barber)$")]),
+    ("Ice Cream & Dairy", [("amenity", "^(ice_cream)$"), ("shop", "^(ice_cream|dairy)$")]),
+    ("Cold Storage & Meat", [("shop", "^(butcher|seafood|frozen_food)$")]),
+    ("Diner & Seafood", [("cuisine", "(^|;)(seafood|fish)(;|$)")]),
+    ("Indo-Chinese & Snacks", [("amenity", "^(fast_food|food_court)$"), ("cuisine", "(^|;)(chinese|indo_chinese|snack)(;|$)")]),
+    ("Chai & Quick Bites", [("amenity", "^(cafe)$"), ("shop", "^(tea|coffee|bakery|confectionery|pastry)$")]),
+    ("Bar & Restaurant", [("amenity", "^(restaurant|bar|pub|biergarten)$")]),
+    ("Movie Cinema & Theater", [("amenity", "^(cinema|theatre)$")]),
+    ("Market, Bazaar & Mall", [("amenity", "^(marketplace)$"), ("shop", "^(mall|department_store|clothes|shoes|jewelry|electronics|mobile_phone|books|gift|stationery|hardware|furniture|fashion|variety_store|bag)$")]),
+    ("Kirana & Essentials", [("shop", "^(convenience|supermarket|grocery|general|greengrocer|farm|wholesale)$")]),
+    ("Resort & Farmhouse", [("tourism", "^(resort|hotel|guest_house|motel|hostel|chalet|apartment)$")]),
+    ("Heritage & Sight", [("historic", "^.+$"), ("tourism", "^(attraction|museum|gallery|monument|artwork)$"), ("amenity", "^(place_of_worship)$")]),
+    ("Picnic Spot & Landscape", [("leisure", "^(park|garden|nature_reserve|picnic_site|beach_resort)$"), ("natural", "^(beach|waterfall|peak|cave_entrance)$"), ("tourism", "^(picnic_site|viewpoint|theme_park|zoo|aquarium)$")]),
+]
+_OSM_CATEGORY_SELECTORS: Dict[str, List[Tuple[str, str]]] = {name: sels for name, sels in _OSM_CATEGORY_RULES}
+_OSM_CATEGORY_HINT: Dict[str, str] = {
+    "Pharmacy / Chemist": "pharmacy", "Barber & Salon": "salon", "Kirana & Essentials": "supermarket",
+    "Ice Cream & Dairy": "ice cream", "Cold Storage & Meat": "butcher", "Indo-Chinese & Snacks": "fast food",
+    "Chai & Quick Bites": "cafe", "Bar & Restaurant": "restaurant", "Diner & Seafood": "seafood restaurant",
+    "Market, Bazaar & Mall": "market", "Movie Cinema & Theater": "cinema", "Picnic Spot & Landscape": "park",
+    "Resort & Farmhouse": "resort", "Heritage & Sight": "temple",
+}
+_AREA_VALUES = {
+    "city", "town", "village", "suburb", "neighbourhood", "neighborhood", "quarter", "borough", "municipality",
+    "city_district", "district", "locality", "hamlet", "county", "state_district", "administrative", "island",
 }
 
 
-def _community_is_broad_category_query(query_text: str, city: str) -> bool:
-    """Tell category intent (e.g. 'pharmacy near me') from a business-name query."""
-    q = re.sub(r"[^a-z0-9]+", " ", str(query_text or "").lower()).strip()
-    if not q:
+def _comm_slug(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+
+
+def _comm_norm_name(text: Any) -> str:
+    return re.sub(r"[^\w]+", "", str(text or "").lower())
+
+
+def _community_headers() -> Dict[str, str]:
+    return {"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"}
+
+
+def _osm_value_matches(tags: Dict[str, Any], key: str, regex: str) -> bool:
+    value = str(tags.get(key) or "").strip().lower()
+    if not value:
+        return False
+    return re.search(regex, value) is not None
+
+
+def _osm_category(tags: Dict[str, Any]) -> str:
+    for category, selectors in _OSM_CATEGORY_RULES:
+        for key, regex in selectors:
+            if _osm_value_matches(tags, key, regex):
+                return category
+    return "General"
+
+
+def _osm_matches_category(tags: Dict[str, Any], category: str) -> bool:
+    if not category or category == "All":
         return True
-    stop = {
-        "near", "nearby", "me", "around", "in", "at", "the", "best", "top", "popular",
-        "local", "places", "place", "find", "show", "all", "open", "now", "and", "of", "for",
-        "shop", "shops", "business", "businesses", "spot", "spots", "my", "area", "city",
+    for key, regex in _OSM_CATEGORY_SELECTORS.get(category, []):
+        if _osm_value_matches(tags, key, regex):
+            return True
+    return False
+
+
+def _osm_subcategory(tags: Dict[str, Any]) -> str:
+    for key in ("amenity", "shop", "tourism", "leisure", "historic", "natural", "healthcare", "place", "boundary"):
+        value = str(tags.get(key) or "").strip()
+        if value and value not in {"yes", "administrative"}:
+            return value.replace("_", " ").title()
+        if value == "administrative":
+            return "Area"
+    return ""
+
+
+def _comm_join_address(parts: List[Any]) -> str:
+    seen: List[str] = []
+    for part in parts:
+        text = str(part or "").strip()
+        if text and text.lower() not in [s.lower() for s in seen]:
+            seen.append(text)
+    return ", ".join(seen)
+
+
+def _comm_image_from_tags(tags: Dict[str, Any]) -> str:
+    direct = str(tags.get("image") or "").strip()
+    if direct.startswith(("https://", "http://")):
+        return direct
+    commons = str(tags.get("wikimedia_commons") or "").strip()
+    if commons.startswith("File:") and len(commons) > 5:
+        return "https://commons.wikimedia.org/wiki/Special:FilePath/" + urllib.parse.quote(commons[5:].strip(), safe="") + "?width=900"
+    return ""
+
+
+def _comm_hub_distance(lat: Any, lng: Any, hub: Optional[Tuple[float, float]]) -> Optional[float]:
+    if hub is None or lat is None or lng is None:
+        return None
+    try:
+        return round(_place_distance_km(float(lat), float(lng), hub[0], hub[1]), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _community_open_row(
+    *, name: str, lat: Any, lng: Any, tags: Dict[str, Any], osm_type: str, osm_id: Any,
+    provider: str, address: str, city: str, hub: Optional[Tuple[float, float]],
+) -> Dict[str, Any]:
+    tags = {k: v for k, v in (tags or {}).items() if v not in (None, "")}
+    image = _comm_image_from_tags(tags)
+    phone = str(tags.get("phone") or tags.get("contact:phone") or tags.get("contact:mobile") or "").strip()
+    website = str(tags.get("website") or tags.get("contact:website") or "").strip()
+    hours = str(tags.get("opening_hours") or "").strip()
+    dist = _comm_hub_distance(lat, lng, hub)
+    osm_ref = f"osm:{osm_type}/{osm_id}" if osm_type and osm_id not in (None, "") else f"osm:{_comm_norm_name(name)}:{lat}:{lng}"
+    maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lng}" if lat is not None and lng is not None else ""
+    return {
+        "id": osm_ref, "source": "OPENSTREETMAP", "provider": provider, "google_place_id": "",
+        "name": name, "category": _osm_category(tags), "subcategory": _osm_subcategory(tags),
+        "address": address or city, "city": city, "latitude": lat, "longitude": lng,
+        "rating": None, "review_count": None, "open_now": None,
+        "hours": [hours] if hours else [], "maps_url": maps_url,
+        "website_url": website if website.startswith(("https://", "http://")) else "",
+        "contact_phone": phone, "image_url": image, "photos": [image] if image else [],
+        "google_photo_names": [], "upvotes": 0, "community_endorsements": 0, "community_tags": [],
+        "must_try_tip": "", "contributor_name": "OpenStreetMap",
+        "community_notice": "OpenStreetMap listing - please verify current hours and details before visiting.",
+        "providers": {}, "booking": {}, "data_state": "VERIFIED_OPEN_DATA",
+        "attribution_required": "OpenStreetMap contributors",
+        "distance_km_from_hub": dist,
+        "scope": "local" if (dist is None or dist <= _COMMUNITY_LOCAL_RADIUS_KM) else "wide",
+        "_tags": tags, "_osm_type": osm_type, "_osm_id": str(osm_id or ""),
+        "_area": False, "_boost": 0.0,
     }
-    stop.update(re.findall(r"[a-z0-9]+", str(city or "").lower()))
-    tokens = re.findall(r"[a-z0-9]+", q)
-    category_tokens = {
-        "pharmacy", "chemist", "medical", "store", "drugstore", "barber", "salon", "hairdresser",
-        "beauty", "grocery", "groceries", "kirana", "supermarket", "ice", "cream", "dairy", "butcher",
-        "meat", "fish", "seafood", "chinese", "snacks", "snack", "fast", "food", "chai", "tea", "cafe",
-        "café", "coffee", "restaurant", "restaurants", "eatery", "diner", "market", "bazaar", "mall",
-        "shopping", "cinema", "movie", "theater", "theatre", "park", "picnic", "viewpoint", "nature",
-        "bakery", "bakeries", "bread", "cake", "sweets", "pizza", "burger", "sandwich",
-        "attraction", "resort", "farmhouse", "hotel", "homestay", "guest", "house", "stay", "heritage",
-        "historical", "historic", "museum", "temple", "tourist",
+
+
+def _photon_feature_to_row(feature: Dict[str, Any], hub, default_city: str) -> Optional[Dict[str, Any]]:
+    props = feature.get("properties") or {}
+    coords = (feature.get("geometry") or {}).get("coordinates") or []
+    name = str(props.get("name") or "").strip()
+    if not name or len(coords) < 2:
+        return None
+    try:
+        lng, lat = float(coords[0]), float(coords[1])
+    except (TypeError, ValueError):
+        return None
+    key, value = str(props.get("osm_key") or ""), str(props.get("osm_value") or "")
+    tags = {key: value} if key and value else {}
+    street = _comm_join_address([props.get("housenumber"), props.get("street")])
+    address = _comm_join_address([street, props.get("district") or props.get("locality"), props.get("city"), props.get("state"), props.get("postcode")])
+    osm_type = {"N": "node", "W": "way", "R": "relation"}.get(str(props.get("osm_type") or "").upper(), "")
+    row = _community_open_row(
+        name=name, lat=lat, lng=lng, tags=tags, osm_type=osm_type, osm_id=props.get("osm_id"),
+        provider="Photon (OpenStreetMap)", address=address, city=str(props.get("city") or props.get("county") or default_city or ""), hub=hub,
+    )
+    row["_area"] = key in {"place", "boundary"} and (value in _AREA_VALUES or key == "boundary")
+    row["_needs_enrich"] = bool(osm_type and props.get("osm_id") and not row["_area"])
+    if row["_area"] and not row["subcategory"]:
+        row["subcategory"] = value.replace("_", " ").title()
+    return row
+
+
+def _nominatim_item_to_row(item: Dict[str, Any], hub, default_city: str) -> Optional[Dict[str, Any]]:
+    try:
+        lat, lng = float(item.get("lat")), float(item.get("lon"))
+    except (TypeError, ValueError):
+        return None
+    address = item.get("address") or {}
+    names = item.get("namedetails") or {}
+    display = str(item.get("display_name") or "")
+    name = str(item.get("name") or names.get("name") or display.split(",", 1)[0]).strip()
+    if not name:
+        return None
+    cls, typ = str(item.get("class") or ""), str(item.get("type") or "")
+    tags: Dict[str, Any] = {cls: typ} if cls and typ else {}
+    extra = item.get("extratags") or {}
+    if isinstance(extra, dict):
+        for k in ("phone", "contact:phone", "contact:mobile", "website", "contact:website", "opening_hours", "image", "wikimedia_commons", "cuisine"):
+            if extra.get(k):
+                tags[k] = extra[k]
+    street = _comm_join_address([address.get("house_number"), address.get("road")])
+    city = str(address.get("city") or address.get("town") or address.get("village") or address.get("municipality") or address.get("county") or default_city or "")
+    full_address = _comm_join_address([
+        street, address.get("neighbourhood") or address.get("suburb") or address.get("city_district"),
+        city, address.get("state"), address.get("postcode"),
+    ]) or ", ".join(display.split(",")[:5]).strip()
+    row = _community_open_row(
+        name=name, lat=lat, lng=lng, tags=tags, osm_type=str(item.get("osm_type") or ""), osm_id=item.get("osm_id"),
+        provider="Nominatim (OpenStreetMap)", address=full_address, city=city, hub=hub,
+    )
+    row["_area"] = cls in {"place", "boundary"}
+    if row["_area"] and not row["subcategory"]:
+        row["subcategory"] = typ.replace("_", " ").title() or "Area"
+    try:
+        row["_importance"] = float(item.get("importance") or 0)
+    except (TypeError, ValueError):
+        row["_importance"] = 0.0
+    return row
+
+
+def _overpass_element_to_row(element: Dict[str, Any], hub, default_city: str) -> Optional[Dict[str, Any]]:
+    tags = element.get("tags") or {}
+    name = str(tags.get("name:en") or tags.get("name") or "").strip()
+    if not name:
+        return None
+    if element.get("lat") is not None and element.get("lon") is not None:
+        lat, lng = element.get("lat"), element.get("lon")
+    else:
+        center = element.get("center") or {}
+        lat, lng = center.get("lat"), center.get("lon")
+    if lat is None or lng is None:
+        return None
+    address = _comm_join_address([
+        _comm_join_address([tags.get("addr:housenumber"), tags.get("addr:street")]),
+        tags.get("addr:suburb") or tags.get("addr:neighbourhood"), tags.get("addr:city"), tags.get("addr:postcode"),
+    ])
+    return _community_open_row(
+        name=name, lat=float(lat), lng=float(lng), tags=tags, osm_type=str(element.get("type") or ""),
+        osm_id=element.get("id"), provider="Overpass (OpenStreetMap)", address=address,
+        city=str(tags.get("addr:city") or default_city or ""), hub=hub,
+    )
+
+
+def _wikipedia_page_to_row(page: Dict[str, Any], hub, default_city: str) -> Optional[Dict[str, Any]]:
+    coords = page.get("coordinates") or []
+    title = str(page.get("title") or "").strip()
+    if not coords or not title:
+        return None
+    try:
+        lat, lng = float(coords[0].get("lat")), float(coords[0].get("lon"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    desc = str(page.get("description") or "").strip()
+    thumb = str(((page.get("thumbnail") or {}).get("source")) or "").strip()
+    lowered = f"{title} {desc}".lower()
+    nature = any(w in lowered for w in ("park", "garden", "beach", "lake", "waterfall", "forest", "sanctuary", "hill", "island", "dam", "creek"))
+    page_id = page.get("pageid")
+    dist = _comm_hub_distance(lat, lng, hub)
+    wiki_url = f"https://en.wikipedia.org/?curid={page_id}" if page_id else ""
+    return {
+        "id": f"wiki:{page_id}", "source": "WIKIPEDIA", "provider": "Wikipedia", "google_place_id": "",
+        "name": title, "category": "Picnic Spot & Landscape" if nature else "Heritage & Sight",
+        "subcategory": desc[:60], "address": default_city, "city": default_city, "latitude": lat, "longitude": lng,
+        "description": desc, "rating": None, "review_count": None, "open_now": None, "hours": [],
+        "maps_url": f"https://www.google.com/maps/search/?api=1&query={lat},{lng}",
+        "website_url": wiki_url, "contact_phone": "", "image_url": thumb, "photos": [thumb] if thumb else [],
+        "google_photo_names": [], "upvotes": 0, "community_endorsements": 0, "community_tags": [],
+        "must_try_tip": "", "contributor_name": "Wikipedia",
+        "community_notice": "Landmark from Wikipedia - verify visiting details before you go.",
+        "providers": {}, "booking": {}, "data_state": "VERIFIED_OPEN_DATA",
+        "attribution_required": "Wikipedia / Wikimedia Commons",
+        "distance_km_from_hub": dist,
+        "scope": "local" if (dist is None or dist <= _COMMUNITY_LOCAL_RADIUS_KM) else "wide",
+        "_tags": {}, "_osm_type": "", "_osm_id": "", "_area": False, "_boost": 0.0,
     }
-    return all(token in stop or token in category_tokens for token in tokens)
+
+
+async def _community_get_json(url: str, params: Any, timeout: float = 10.0, headers: Optional[Dict[str, str]] = None) -> Any:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=5.0), follow_redirects=True) as client:
+        response = await client.get(url, params=params, headers=headers or _community_headers())
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    return response.json()
+
+
+async def _community_provider(name: str, coro, timeout: float, status: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Run one provider with its own timeout; record success/empty/error without ever raising."""
+    try:
+        rows = await asyncio.wait_for(coro, timeout)
+        rows = rows or []
+        status[name] = {"status": "ok" if rows else "empty", "count": len(rows)}
+        return rows
+    except asyncio.TimeoutError:
+        status[name] = {"status": "timeout", "count": 0}
+    except Exception as exc:
+        status[name] = {"status": "error", "count": 0, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    return []
+
+
+async def _community_hub_center(city: str, lat: Optional[float] = None, lng: Optional[float] = None) -> Optional[Tuple[float, float]]:
+    slug = _comm_slug(city)
+    if slug in _COMMUNITY_HUB_FALLBACKS:
+        return _COMMUNITY_HUB_FALLBACKS[slug]
+    if slug in _community_hub_cache:
+        return _community_hub_cache[slug]
+    for country in ("India", ""):
+        try:
+            dest = await asyncio.wait_for(_resolve_destination_with_open_data(city, "", country), 12)
+        except Exception:
+            dest = None
+        if dest and dest.get("latitude") is not None and dest.get("longitude") is not None:
+            center = (float(dest["latitude"]), float(dest["longitude"]))
+            _community_hub_cache[slug] = center
+            return center
+    if lat is not None and lng is not None:
+        return (float(lat), float(lng))
+    return None
+
+
+async def _photon_search(q: str, center: Optional[Tuple[float, float]], hub, default_city: str, limit: int = 20) -> List[Dict[str, Any]]:
+    params: Dict[str, Any] = {"q": q, "limit": str(max(1, min(limit, 40))), "lang": "en"}
+    if center is not None:
+        params["lat"], params["lon"] = f"{center[0]:.5f}", f"{center[1]:.5f}"
+        params["location_bias_scale"] = "0.4"
+    data = await _community_get_json(PHOTON_API_URL, params, timeout=9.0)
+    rows = []
+    for feature in (data or {}).get("features") or []:
+        row = _photon_feature_to_row(feature, hub, default_city)
+        if row:
+            rows.append(row)
+    return rows
+
+
+async def _nominatim_search(q: str, center: Optional[Tuple[float, float]], hub, default_city: str, limit: int = 15) -> List[Dict[str, Any]]:
+    global _community_nominatim_last
+    params: Dict[str, Any] = {
+        "q": q, "format": "jsonv2", "addressdetails": "1", "extratags": "1", "namedetails": "1",
+        "limit": str(max(1, min(limit, 30))), "accept-language": "en",
+    }
+    if center is not None:
+        d = 0.5
+        params["viewbox"] = f"{center[1] - d:.5f},{center[0] + d:.5f},{center[1] + d:.5f},{center[0] - d:.5f}"
+        params["bounded"] = "0"
+    async with _open_geo_semaphore:
+        wait = 1.05 - (time.monotonic() - _community_nominatim_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _community_nominatim_last = time.monotonic()
+        data = await _community_get_json(NOMINATIM_API_URL, params, timeout=11.0)
+    rows = []
+    for item in data if isinstance(data, list) else []:
+        row = _nominatim_item_to_row(item, hub, default_city)
+        if row:
+            rows.append(row)
+    return rows
+
+
+async def _wikipedia_query(extra: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    params = {
+        "action": "query", "format": "json", "prop": "coordinates|pageimages|description",
+        "piprop": "thumbnail", "pithumbsize": "800", "pilimit": str(limit), "colimit": str(limit), "origin": "*",
+    }
+    params.update(extra)
+    data = await _community_get_json(
+        WIKIPEDIA_API_URL, params, timeout=8.0,
+        headers={"User-Agent": WIKIMEDIA_USER_AGENT, "Accept": "application/json"},
+    )
+    pages = ((data or {}).get("query") or {}).get("pages") or {}
+    return sorted(pages.values(), key=lambda p: p.get("index", 999))
+
+
+async def _wikipedia_geo_rows(center: Tuple[float, float], hub, default_city: str, radius_m: int = 9000, limit: int = 20) -> List[Dict[str, Any]]:
+    pages = await _wikipedia_query({
+        "generator": "geosearch", "ggscoord": f"{center[0]}|{center[1]}",
+        "ggsradius": str(min(radius_m, 10000)), "ggslimit": str(limit),
+    }, limit)
+    return [r for r in (_wikipedia_page_to_row(p, hub, default_city) for p in pages) if r]
+
+
+async def _wikipedia_text_rows(q: str, hub, default_city: str, limit: int = 8) -> List[Dict[str, Any]]:
+    pages = await _wikipedia_query({"generator": "search", "gsrsearch": q, "gsrlimit": str(limit), "gsrnamespace": "0"}, limit)
+    return [r for r in (_wikipedia_page_to_row(p, hub, default_city) for p in pages) if r]
+
+
+async def _overpass_post(mirror: str, ql: str) -> Optional[List[Dict[str, Any]]]:
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(14.0, connect=4.0)) as client:
+            response = await client.post(mirror, data={"data": ql}, headers=_community_headers())
+        if response.status_code != 200:
+            _overpass_down_until[mirror] = time.time() + (60 if response.status_code in (429, 502, 503, 504) else 180)
+            print(f"[Community Overpass Notice] {mirror} HTTP {response.status_code}")
+            return None
+        data = response.json()
+        if isinstance(data, dict) and isinstance(data.get("elements"), list):
+            _overpass_down_until.pop(mirror, None)
+            return data["elements"]
+        return None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _overpass_down_until[mirror] = time.time() + 180
+        print(f"[Community Overpass Notice] {mirror}: {type(exc).__name__}: {exc}")
+        return None
+
+
+async def _overpass_run(ql: str, budget: float = 15.0) -> Optional[List[Dict[str, Any]]]:
+    """Race up to three healthy Overpass mirrors and return the first valid answer."""
+    now = time.time()
+    healthy = [m for m in _OVERPASS_MIRRORS if _overpass_down_until.get(m, 0) <= now]
+    mirrors = (healthy or _OVERPASS_MIRRORS)[:3]
+    tasks = [asyncio.create_task(_overpass_post(m, ql)) for m in mirrors]
+    try:
+        for future in asyncio.as_completed(tasks, timeout=budget):
+            result = await future
+            if result is not None:
+                return result
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        for task in tasks:
+            task.cancel()
+    return None
+
+
+def _overpass_category_query(lat: float, lng: float, radius_m: int, category: str, limit: int) -> str:
+    selectors: List[Tuple[str, str]] = []
+    if category and category != "All" and category in _OSM_CATEGORY_SELECTORS:
+        selectors = list(_OSM_CATEGORY_SELECTORS[category])
+    else:
+        for _name, sels in _OSM_CATEGORY_RULES:
+            selectors.extend(sels)
+    clauses = [f'nwr(around:{radius_m},{lat:.5f},{lng:.5f})["{k}"~"{rx}"]["name"];' for k, rx in selectors]
+    return "[out:json][timeout:20];\n(\n  " + "\n  ".join(clauses) + "\n);\nout center tags " + str(limit) + ";"
+
+
+def _overpass_name_query(lat: float, lng: float, radius_m: int, q: str, limit: int) -> Optional[str]:
+    tokens = [re.sub(r"[^\w]", "", t) for t in q.split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return None
+    pattern = ".*".join(tokens).replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        "[out:json][timeout:20];\n("
+        f'nwr(around:{radius_m},{lat:.5f},{lng:.5f})["name"~"{pattern}",i];'
+        f");\nout center tags {limit};"
+    )
+
+
+async def _overpass_rows(ql: Optional[str], hub, default_city: str) -> List[Dict[str, Any]]:
+    if not ql:
+        return []
+    elements = await _overpass_run(ql)
+    if elements is None:
+        raise RuntimeError("all Overpass mirrors unreachable")
+    return [r for r in (_overpass_element_to_row(e, hub, default_city) for e in elements) if r]
+
+
+async def _overpass_browse(center: Tuple[float, float], category: str, hub, default_city: str, limit: int = 200) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for radius in (6000, 15000):
+        ql = _overpass_category_query(center[0], center[1], radius, category, limit)
+        rows = await _overpass_rows(ql, hub, default_city)
+        if len(rows) >= 12:
+            break
+    return rows
+
+
+def _comm_rows_close(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    try:
+        d = _place_distance_km(float(a["latitude"]), float(a["longitude"]), float(b["latitude"]), float(b["longitude"]))
+    except (TypeError, ValueError, KeyError):
+        return True
+    if a.get("_area") and b.get("_area"):
+        return d <= 15.0  # the same city/suburb is reported with different centre points by Photon and Nominatim
+    return d <= 0.35
+
+
+def _comm_merge_into(target: Dict[str, Any], other: Dict[str, Any]) -> None:
+    for key in ("contact_phone", "website_url", "image_url", "address"):
+        if not target.get(key) and other.get(key):
+            target[key] = other[key]
+    if not target.get("hours") and other.get("hours"):
+        target["hours"] = other["hours"]
+    if not target.get("photos") and other.get("photos"):
+        target["photos"] = other["photos"]
+    if other.get("_tags"):
+        merged = dict(other["_tags"])
+        merged.update(target.get("_tags") or {})
+        target["_tags"] = merged
+    target["_area"] = bool(target.get("_area") or other.get("_area"))
+    target["_needs_enrich"] = bool(target.get("_needs_enrich") and other.get("_needs_enrich", True))
+    target["_importance"] = max(float(target.get("_importance") or 0), float(other.get("_importance") or 0))
+
+
+def _comm_dedupe(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        rid = str(row.get("id") or "")
+        if rid and rid in by_id:
+            _comm_merge_into(by_id[rid], row)
+            continue
+        nn = _comm_norm_name(row.get("name"))
+        match = next((o for o in by_name.get(nn, []) if _comm_rows_close(o, row)), None)
+        if match is not None:
+            _comm_merge_into(match, row)
+            continue
+        by_name.setdefault(nn, []).append(row)
+        if rid:
+            by_id[rid] = row
+        out.append(row)
+    return out
+
+
+def _comm_relevance(name: str, q: str) -> float:
+    n, qq = _comm_norm_name(name), _comm_norm_name(q)
+    if not qq:
+        return 0.0
+    if n == qq:
+        return 100.0
+    if n.startswith(qq):
+        return 70.0
+    tokens = [t for t in q.lower().split() if t]
+    lname = str(name).lower()
+    if tokens and all(t in lname for t in tokens):
+        return 50.0
+    if qq in n:
+        return 45.0
+    return 0.0
+
+
+def _comm_score(row: Dict[str, Any], q: str) -> float:
+    score = _comm_relevance(str(row.get("name") or ""), q) + float(row.get("_boost") or 0.0)
+    dist = row.get("distance_km_from_hub")
+    if row.get("scope") == "local":
+        score += 25.0
+    if dist is not None:
+        score -= min(float(dist), 150.0) * 0.25
+    if row.get("image_url"):
+        score += 4.0
+    if row.get("contact_phone"):
+        score += 3.0
+    if row.get("_area") and _comm_relevance(str(row.get("name") or ""), q) >= 70:
+        score += 15.0
+    return score
+
+
+def _comm_interleave(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        buckets.setdefault(str(row.get("category") or "General"), []).append(row)
+    out: List[Dict[str, Any]] = []
+    while len(out) < limit and any(buckets.values()):
+        for key in list(buckets.keys()):
+            if buckets[key]:
+                out.append(buckets[key].pop(0))
+                if len(out) >= limit:
+                    break
+    return out
+
+
+def _comm_filter_category(rows: List[Dict[str, Any]], category: str) -> List[Dict[str, Any]]:
+    if not category or category == "All":
+        return rows
+    out = []
+    for row in rows:
+        tags = row.get("_tags") or {}
+        if row.get("source") == "WIKIPEDIA":
+            if row.get("category") == category:
+                out.append(row)
+        elif _osm_matches_category(tags, category):
+            row["category"] = category
+            out.append(row)
+    return out
+
+
+async def _community_enrich_osm(rows: List[Dict[str, Any]]) -> None:
+    """Best-effort: fetch phone/website/hours/image for Photon rows through one Overpass id lookup."""
+    targets = [r for r in rows[:30] if r.get("_needs_enrich") and r.get("_osm_type") and r.get("_osm_id")]
+    if not targets:
+        return
+    ids: Dict[str, List[str]] = {"node": [], "way": [], "relation": []}
+    for r in targets:
+        if r["_osm_type"] in ids and r["_osm_id"].isdigit():
+            ids[r["_osm_type"]].append(r["_osm_id"])
+    parts = [f"{t}(id:{','.join(v)});" for t, v in ids.items() if v]
+    if not parts:
+        return
+    elements = await _overpass_run("[out:json][timeout:15];\n(" + "".join(parts) + ");\nout center tags;", budget=8.0)
+    if not elements:
+        return
+    lookup = {(str(e.get("type")), str(e.get("id"))): (e.get("tags") or {}) for e in elements}
+    for r in targets:
+        tags = lookup.get((r["_osm_type"], r["_osm_id"]))
+        if not tags:
+            continue
+        merged = dict(r.get("_tags") or {})
+        merged.update(tags)
+        r["_tags"] = merged
+        r["category"] = _osm_category(merged)
+        r["subcategory"] = _osm_subcategory(merged) or r.get("subcategory", "")
+        phone = str(tags.get("phone") or tags.get("contact:phone") or tags.get("contact:mobile") or "").strip()
+        website = str(tags.get("website") or tags.get("contact:website") or "").strip()
+        hours = str(tags.get("opening_hours") or "").strip()
+        image = _comm_image_from_tags(tags)
+        if phone and not r.get("contact_phone"):
+            r["contact_phone"] = phone
+        if website.startswith(("https://", "http://")) and not r.get("website_url"):
+            r["website_url"] = website
+        if hours and not r.get("hours"):
+            r["hours"] = [hours]
+        if image and not r.get("image_url"):
+            r["image_url"], r["photos"] = image, [image]
+
+
+async def _community_attach_commons_images(rows: List[Dict[str, Any]], max_rows: int = 6) -> None:
+    """Attach Wikimedia Commons photos to a few sights, only when the file title clearly matches the place."""
+    targets = [r for r in rows if not r.get("image_url") and r.get("category") in {"Heritage & Sight", "Picnic Spot & Landscape"}][:max_rows]
+
+    async def one(row: Dict[str, Any]) -> None:
+        try:
+            result = await asyncio.wait_for(_wikimedia_image_search(f"{row['name']} {row.get('city') or ''}".strip(), 1), 8)
+        except Exception:
+            return
+        images, credits = result.get("images") or [], result.get("credits") or []
+        if not images or not credits:
+            return
+        title = str(credits[0].get("title") or "").lower()
+        significant = [t for t in re.split(r"\W+", str(row["name"]).lower()) if len(t) >= 4]
+        if significant and not any(t in title for t in significant):
+            return
+        row["image_url"], row["photos"] = images[0], images[:3]
+        row["attribution_required"] = "OpenStreetMap contributors / Wikimedia Commons"
+
+    await asyncio.gather(*(one(r) for r in targets), return_exceptions=True)
+
+
+def _comm_public_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in row.items() if not k.startswith("_")}
+
+
+async def _community_open_engine(
+    city: str, q: str, category: str, limit: int, lat: Optional[float] = None, lng: Optional[float] = None,
+    allow_wide: bool = True, center_override: Optional[Tuple[float, float]] = None,
+) -> Dict[str, Any]:
+    """Hub-first search that automatically widens (other areas/cities) when local matches are few."""
+    city, q, category = city.strip(), q.strip(), (category or "All").strip() or "All"
+    cache_key = "|".join([
+        _comm_slug(city), q.lower(), category, str(limit), str(allow_wide),
+        f"{center_override[0]:.3f},{center_override[1]:.3f}" if center_override else "",
+    ])
+    cached = _community_open_cache.get(cache_key)
+    if cached and time.time() - cached[0] < _COMMUNITY_OPEN_TTL:
+        return {**cached[1], "cached": True}
+
+    status: Dict[str, Any] = {}
+    center = center_override or await _community_hub_center(city, lat, lng)
+    hub = center
+    default_city = city
+    widened = False
+    area_name: Optional[str] = None
+    rows: List[Dict[str, Any]] = []
+
+    if q:
+        tasks = [
+            _community_provider("photon", _photon_search(q, center, hub, default_city, 20), 10, status),
+            _community_provider("nominatim", _nominatim_search(q, center, hub, default_city, 15), 13, status),
+        ]
+        if center is not None:
+            tasks.append(_community_provider(
+                "overpass_name", _overpass_rows(_overpass_name_query(center[0], center[1], 20000, q, 60), hub, default_city), 16, status))
+        if allow_wide:
+            tasks.append(_community_provider("wikipedia_search", _wikipedia_text_rows(q, hub, default_city, 8), 9, status))
+        for batch in await asyncio.gather(*tasks):
+            rows.extend(batch)
+        rows = _comm_filter_category(_comm_dedupe(rows), category)
+
+        local_count = sum(1 for r in rows if r.get("scope") == "local" and not r.get("_area"))
+        area_candidates = [r for r in rows if r.get("_area") and _comm_relevance(str(r.get("name")), q) >= 45]
+        explore_area = max(area_candidates, key=lambda r: (_comm_relevance(str(r.get("name")), q), float(r.get("_importance") or 0)), default=None)
+        need_explore = allow_wide and explore_area is not None and (
+            local_count < max(6, limit // 4) or _comm_relevance(str(explore_area.get("name")), q) >= 70
+        )
+        if need_explore:
+            area_center = (float(explore_area["latitude"]), float(explore_area["longitude"]))
+            area_name = str(explore_area.get("name") or "")
+            area_city = area_name
+            explore_tasks = [
+                _community_provider("overpass_area", _overpass_browse(area_center, category, hub, area_city, 160), 17, status),
+            ]
+            if category in {"All", "Heritage & Sight", "Picnic Spot & Landscape"}:
+                explore_tasks.append(_community_provider("wikipedia_area", _wikipedia_geo_rows(area_center, hub, area_city, 9000, 20), 9, status))
+            explored: List[Dict[str, Any]] = []
+            for batch in await asyncio.gather(*explore_tasks):
+                explored.extend(batch)
+            explored = _comm_filter_category(_comm_dedupe(explored), category)
+            for r in explored:
+                r["scope"] = "wide" if r.get("scope") != "local" else "local"
+                try:
+                    r["_area_dist"] = _place_distance_km(float(r["latitude"]), float(r["longitude"]), area_center[0], area_center[1])
+                except (TypeError, ValueError):
+                    r["_area_dist"] = 20.0
+            explored.sort(key=lambda r: r.get("_area_dist", 20.0))
+            explored = _comm_interleave(explored, 40) if category == "All" else explored[:40]
+            for idx, r in enumerate(explored):
+                r["_boost"] = 30.0 - idx * 0.6
+            rows = _comm_dedupe(rows + explored)
+            widened = any(r.get("scope") == "wide" for r in rows)
+        elif allow_wide and any(r.get("scope") == "wide" for r in rows):
+            widened = True
+        rows.sort(key=lambda r: _comm_score(r, q), reverse=True)
+    else:
+        if center is None:
+            status["hub"] = {"status": "error", "count": 0, "error": "Could not locate the selected city."}
+        else:
+            browse_tasks = [_community_provider("overpass", _overpass_browse(center, category, hub, default_city), 18, status)]
+            if category in {"All", "Heritage & Sight", "Picnic Spot & Landscape"}:
+                browse_tasks.append(_community_provider("wikipedia", _wikipedia_geo_rows(center, hub, default_city, 9000, 20), 9, status))
+            for batch in await asyncio.gather(*browse_tasks):
+                rows.extend(batch)
+            rows = _comm_filter_category(_comm_dedupe(rows), category)
+            if len(rows) < 8:
+                hint = _OSM_CATEGORY_HINT.get(category, "restaurant")
+                fallback = await _community_provider("photon_browse", _photon_search(hint, center, hub, default_city, 25), 10, status)
+                rows = _comm_filter_category(_comm_dedupe(rows + fallback), category)
+            rows.sort(key=lambda r: float(r.get("distance_km_from_hub") if r.get("distance_km_from_hub") is not None else 999))
+            rows = _comm_interleave(rows, max(limit * 2, 40)) if category == "All" else rows
+
+    rows = rows[: max(limit * 2, 40)]
+    try:
+        await asyncio.wait_for(_community_enrich_osm(rows[:limit]), 9)
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(_community_attach_commons_images(rows[:limit]), 10)
+    except Exception:
+        pass
+
+    failed = [k for k, v in status.items() if v.get("status") in {"error", "timeout"}]
+    result: Dict[str, Any] = {
+        "rows": rows, "widened": widened, "area": area_name, "providers": status,
+        "degraded": bool(failed) and not rows,
+        "hub": {"lat": center[0], "lng": center[1]} if center else None, "cached": False,
+    }
+    if rows or not failed:
+        _community_open_cache[cache_key] = (time.time(), result)
+        if len(_community_open_cache) > 300:
+            for old_key in sorted(_community_open_cache, key=lambda k: _community_open_cache[k][0])[:100]:
+                _community_open_cache.pop(old_key, None)
+    elif cached:
+        return {**cached[1], "cached": True, "stale": True}
+    return result
+
+
+async def _community_open_engine_safe(*args, **kwargs) -> Dict[str, Any]:
+    try:
+        return await asyncio.wait_for(_community_open_engine(*args, **kwargs), 48)
+    except Exception as exc:
+        print(f"[Community open search error] {type(exc).__name__}: {exc}")
+        return {"rows": [], "widened": False, "area": None, "providers": {"engine": {"status": "error", "count": 0, "error": str(exc)[:120]}},
+                "degraded": True, "hub": None, "cached": False}
 
 
 async def _search_open_community_places(
-    city: str,
-    query_text: str,
-    category: str = "All",
-    limit: int = 10,
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
+    city: str, query_text: str, category: str = "All", limit: int = 10
 ) -> List[Dict[str, Any]]:
-    """Discover real OpenStreetMap places when Google is unavailable or sparse.
+    """Backwards-compatible helper used by older code paths."""
+    result = await _community_open_engine_safe(city, query_text, category, limit)
+    return [_comm_public_row(r) for r in result["rows"][:limit]]
 
-    Supports a blank-query city feed, category browsing, name search, and a
-    precise GPS center for Nearby. Only mapped OpenStreetMap records are returned.
-    """
-    clean_city, clean_query = str(city or "").strip(), str(query_text or "").strip()
-    requested_category = str(category or "All").strip() or "All"
-    if latitude is None or longitude is None:
-        if not clean_city:
-            return []
-        destination = await _resolve_destination_with_open_data(clean_city, "", "India")
-        if not destination:
-            print(f"[Community Open Data Notice] Could not resolve city center for {clean_city!r}.")
-            return []
-        try:
-            latitude, longitude = float(destination["latitude"]), float(destination["longitude"])
-        except (KeyError, TypeError, ValueError):
-            return []
-
-    try:
-        center_lat, center_lng = float(latitude), float(longitude)
-    except (TypeError, ValueError):
-        return []
-
-    inferred_category = _community_infer_category_from_query(clean_query) if requested_category == "All" else "All"
-    effective_category = requested_category if requested_category != "All" else inferred_category
-    selectors = _COMMUNITY_OSM_CATEGORY_SELECTORS.get(
-        effective_category, _COMMUNITY_OSM_CATEGORY_SELECTORS["All"]
-    )
-    broad_query = _community_is_broad_category_query(clean_query, clean_city)
-    safe_regex = re.escape(clean_query) if clean_query else ""
-    radius_m = 15000
-
-    clauses: List[str] = []
-    # A specific business-name search stays name-based (and honors the selected
-    # category). Category searches browse by actual OSM tags, not business names.
-    if clean_query and not broad_query and effective_category == "All":
-        clauses.append(
-            f'nwr(around:{radius_m},{center_lat},{center_lng})["name"~"{safe_regex}",i];'
-        )
-    else:
-        for selector in selectors:
-            if clean_query and not broad_query:
-                clauses.append(
-                    f'nwr(around:{radius_m},{center_lat},{center_lng}){selector}["name"~"{safe_regex}",i];'
-                )
-            else:
-                clauses.append(
-                    f'nwr(around:{radius_m},{center_lat},{center_lng}){selector}["name"];'
-                )
-        # If the category selector was inferred from the query, the category
-        # clauses above handle it; don't require that word to occur in the name.
-
-    if not clauses:
-        return []
-    overpass_query = "[out:json][timeout:10];\n(\n" + "\n".join(clauses) + "\n);\nout center tags;"
-
-    try:
-        async with _overpass_semaphore:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(14.0, connect=4.0)) as client:
-                response = await client.post(
-                    OVERPASS_API_URL,
-                    data={"data": overpass_query},
-                    headers={"User-Agent": OPEN_DATA_USER_AGENT, "Accept": "application/json"},
-                )
-        if response.status_code != 200:
-            print(f"[Community Open Data Notice] Overpass HTTP {response.status_code}: {response.text[:400]}")
-            return []
-
-        elements = (response.json() or {}).get("elements") or []
-        rows: List[Dict[str, Any]] = []
-        seen_names = set()
-        target_count = max(1, min(int(limit), 50))
-
-        def tag(tags: Dict[str, Any], key: str) -> str:
-            return str(tags.get(key) or "").strip()
-
-        for element in elements:
-            tags = element.get("tags") or {}
-            name = tag(tags, "name")
-            if not name:
-                continue
-            name_key = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
-            if not name_key:
-                continue
-
-            if element.get("lat") is not None and element.get("lon") is not None:
-                item_lat, item_lng = float(element["lat"]), float(element["lon"])
-            else:
-                center = element.get("center") or {}
-                if center.get("lat") is None or center.get("lon") is None:
-                    continue
-                item_lat, item_lng = float(center["lat"]), float(center["lon"])
-
-            dedupe_key = f"{name_key}|{round(item_lat, 4)}|{round(item_lng, 4)}"
-            if dedupe_key in seen_names:
-                continue
-
-            amenity = tag(tags, "amenity")
-            shop = tag(tags, "shop")
-            tourism = tag(tags, "tourism")
-            leisure = tag(tags, "leisure")
-            healthcare = tag(tags, "healthcare")
-            cuisine = tag(tags, "cuisine")
-            type_text = " ".join(x for x in [amenity, shop, tourism, leisure, healthcare, cuisine] if x)
-            mapped_category = effective_category if effective_category != "All" else _community_google_category(
-                {
-                    "primaryType": type_text,
-                    "primaryTypeDisplayName": {"text": type_text},
-                    "types": [amenity, shop, tourism, leisure, healthcare, cuisine],
-                },
-                "All",
-            )
-            if requested_category != "All" and mapped_category != requested_category:
-                # The type selectors can represent categories more accurately
-                # than the cross-provider mapper. Keep valid selected-category data.
-                mapped_category = requested_category
-
-            address = ", ".join(
-                x for x in [
-                    tag(tags, "addr:housenumber"), tag(tags, "addr:street"),
-                    tag(tags, "addr:suburb"), tag(tags, "addr:city"), tag(tags, "addr:postcode"),
-                ] if x
-            ) or clean_city or tag(tags, "addr:city")
-            osm_id = f"osm:{element.get('type', '')}/{element.get('id', '')}"
-            maps_url = f"https://www.openstreetmap.org/?mlat={item_lat}&mlon={item_lng}#map=17/{item_lat}/{item_lng}"
-            image = tag(tags, "image")
-            if not image:
-                commons_file = tag(tags, "wikimedia_commons")
-                if commons_file:
-                    if commons_file.startswith("File:"):
-                        commons_file = commons_file[5:]
-                    image = "https://commons.wikimedia.org/wiki/Special:FilePath/" + urllib.parse.quote(commons_file.replace(" ", "_"), safe="")
-            website = tag(tags, "website") or tag(tags, "contact:website")
-            phone = tag(tags, "phone") or tag(tags, "contact:phone")
-            if clean_query and not broad_query and effective_category == "All":
-                if not re.search(safe_regex, name, flags=re.IGNORECASE):
-                    continue
-
-            rows.append({
-                "id": osm_id,
-                "source": "OPENSTREETMAP",
-                "provider": "OpenStreetMap",
-                "google_place_id": "",
-                "name": name,
-                "category": mapped_category,
-                "subcategory": type_text,
-                "address": address,
-                "city": clean_city or "Nearby",
-                "latitude": item_lat,
-                "longitude": item_lng,
-                "rating": None,
-                "review_count": None,
-                "open_now": None,
-                "hours": [tag(tags, "opening_hours")] if tag(tags, "opening_hours") else [],
-                "maps_url": maps_url,
-                "website_url": website,
-                "contact_phone": phone,
-                "image_url": image if image.lower().startswith(("https://", "http://")) else "",
-                "photos": [image] if image.lower().startswith(("https://", "http://")) else [],
-                "google_photo_names": [],
-                "upvotes": 0,
-                "community_endorsements": 0,
-                "community_tags": [],
-                "must_try_tip": "",
-                "contributor_name": "OpenStreetMap",
-                "community_notice": "OpenStreetMap result. Verify current details before visiting.",
-                "providers": {},
-                "booking": {},
-                "data_state": "VERIFIED_OPEN_DATA",
-                "attribution_required": "OpenStreetMap",
-            })
-            seen_names.add(dedupe_key)
-            if len(rows) >= target_count:
-                break
-        return rows
-    except Exception as exc:
-        print(f"[Community Open Data Notice] {exc}")
-        return []
 
 @app.get("/api/v1/community/place-discovery/search")
 async def discover_community_place(
@@ -5546,17 +6058,13 @@ async def discover_community_place(
     clean_city, clean_q = city.strip(), q.strip()
     requested_category = category.strip() or "All"
     if not clean_q:
-        return {"status":"success","provider":"NONE","google_live":False,"places":[]}
-    category_hint = COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "")
-    google_query = " ".join(x for x in [clean_q, category_hint, clean_city] if x).strip()
-    google_places = await _google_text_search(google_query, max_result_count=limit)
-    if google_places:
-        rows = [_community_google_place_to_row(p, clean_city, requested_category) for p in google_places]
-        for row in rows:
-            row["provider"] = "Google Places"; row["data_state"] = "VERIFIED"
-        return {"status":"success","provider":"GOOGLE","google_live":True,"city":clean_city,"places":rows}
-    open_rows = await _search_open_community_places(clean_city, clean_q, requested_category, limit)
-    return {"status":"success","provider":"OPENSTREETMAP" if open_rows else "NONE","google_live":False,"city":clean_city,"places":open_rows}
+        return {"status": "success", "provider": "NONE", "google_live": False, "places": []}
+    result = await _community_open_engine_safe(clean_city, clean_q, requested_category, limit)
+    rows = [_comm_public_row(r) for r in result["rows"][:limit]]
+    return {
+        "status": "success", "provider": "OPENSTREETMAP" if rows else "NONE", "google_live": False,
+        "city": clean_city, "places": rows, "providers": result.get("providers"), "widened": result.get("widened", False),
+    }
 
 
 def _merge_community_place_with_google(community: Dict[str, Any], google: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -5579,34 +6087,35 @@ def _merge_community_place_with_google(community: Dict[str, Any], google: Option
     row["booking"] = row.get("booking") or {"url": row.get("booking_url") or "", "provider": row.get("booking_provider") or ""}
     return row
 
-def _community_place_dedupe_key(row: Dict[str, Any], fallback_city: str = "") -> str:
-    """Deduplicate the same branch without collapsing same-name branches."""
-    name = re.sub(r"[^a-z0-9]+", " ", str(row.get("name") or "").lower()).strip()
-    city = re.sub(r"[^a-z0-9]+", " ", str(row.get("city") or fallback_city).lower()).strip()
-    address = re.sub(r"[^a-z0-9]+", " ", str(row.get("address") or "").lower()).strip()
-    lat = row.get("latitude", row.get("lat"))
-    lng = row.get("longitude", row.get("lng", row.get("lon")))
-    if address and address != city and len(address) > 4:
-        location = address
-    else:
+def _community_supabase_search_sync(city: str, term: str, category: str, limit: int) -> List[Dict[str, Any]]:
+    """Community listings: the selected hub first, then (for text searches) matches from any other city."""
+    if not supabase:
+        return []
+    # PostgREST or-filters break on , ( ) and wildcard characters, so strip them from user text.
+    safe = re.sub(r"[,()%*\\\"']", " ", term).strip()
+    rows: List[Dict[str, Any]] = []
+    try:
+        query = supabase.table("community_places").select("*").eq("city", city)
+        if category != "All":
+            query = query.eq("category", category)
+        if safe:
+            query = query.or_(f"name.ilike.%{safe}%,address.ilike.%{safe}%,category.ilike.%{safe}%,description.ilike.%{safe}%")
+        rows = query.order("upvotes", desc=True).limit(limit).execute().data or []
+    except Exception as exc:
+        print(f"[Community Gems Supabase search notice]: {exc}")
+    if safe:
         try:
-            location = f"{round(float(lat), 4)}|{round(float(lng), 4)}"
-        except (TypeError, ValueError):
-            location = address or city
-    # Address/coordinates preserve separate branches with a shared brand name.
-    return f"{name}|{city}|{location}"
-
-
-@app.get("/api/v1/community/places/health")
-def community_places_health():
-    """Non-secret provider diagnostics for the Community Gems screen."""
-    return {
-        "status": "success",
-        "google_places_configured": bool(GOOGLE_PLACES_API_KEY),
-        "supabase_configured": bool(supabase),
-        "openstreetmap_fallback": True,
-        "photo_proxy": "/api/v1/place-photo",
-    }
+            other = supabase.table("community_places").select("*").neq("city", city)
+            if category != "All":
+                other = other.eq("category", category)
+            other = other.or_(f"name.ilike.%{safe}%,address.ilike.%{safe}%,city.ilike.%{safe}%,description.ilike.%{safe}%")
+            seen = {str(r.get("id")) for r in rows}
+            for r in (other.order("upvotes", desc=True).limit(10).execute().data or []):
+                if str(r.get("id")) not in seen:
+                    rows.append(r)
+        except Exception as exc:
+            print(f"[Community Gems Supabase wide search notice]: {exc}")
+    return rows
 
 
 @app.get("/api/v1/community/places/search")
@@ -5618,104 +6127,71 @@ async def search_community_places(
     lng: Optional[float] = Query(None),
     limit: int = Query(30, ge=1, le=50),
 ):
-    """Unified Community Gems feed: Google Places, OSM and community listings.
+    """Unified Community Gems feed built only from free sources.
 
-    Google remains the preferred source. OSM is queried when Google is missing
-    or returns a sparse result set, including the blank-query initial city feed.
+    Supabase community listings come first. They are combined with OpenStreetMap
+    (Photon / Nominatim / Overpass) and Wikipedia / Wikimedia results. The search is
+    hub-first and widens automatically when the hub has few matches.
     """
     clean_city = city.strip()
     requested_category = category.strip() or "All"
     search_term = q.strip()
-    category_hint = COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "")
-    if search_term:
-        google_query = " ".join(x for x in [search_term, category_hint, clean_city] if x).strip()
-    elif requested_category != "All":
-        google_query = " ".join(x for x in [category_hint, clean_city] if x).strip()
-    else:
-        google_query = f"popular local places businesses restaurants shops attractions in {clean_city}"
 
-    google_places = await _google_text_search(google_query, max_result_count=min(limit, 20))
-    google_rows = [_community_google_place_to_row(p, clean_city, requested_category) for p in google_places]
-    if requested_category != "All":
-        google_rows = [row for row in google_rows if row.get("category") == requested_category]
+    open_task = asyncio.create_task(_community_open_engine_safe(clean_city, search_term, requested_category, limit, lat, lng))
+    community_rows = await asyncio.to_thread(_community_supabase_search_sync, clean_city, search_term, requested_category, limit)
+    engine = await open_task
+    open_rows: List[Dict[str, Any]] = list(engine.get("rows") or [])
 
-    # If Google returns few/no results (including when its API key is absent or
-    # billing/permissions fail), fill from real OpenStreetMap records. This also
-    # fixes the previous blank-query case, which never attempted open-data search.
-    open_rows: List[Dict[str, Any]] = []
-    if len(google_rows) < min(5, limit):
-        open_rows = await _search_open_community_places(
-            clean_city, search_term, requested_category, min(limit, 30), latitude=lat, longitude=lng
-        )
-
-    community_rows: List[Dict[str, Any]] = []
-    if supabase:
+    google_live = False
+    if COMMUNITY_USE_GOOGLE and GOOGLE_PLACES_API_KEY:
         try:
-            query = supabase.table("community_places").select("*").eq("city", clean_city)
-            if requested_category != "All":
-                query = query.eq("category", requested_category)
-            if search_term:
-                safe_term = search_term.replace("%", "").replace("_", " ").strip()
-                if safe_term:
-                    query = query.or_(
-                        f"name.ilike.%{safe_term}%,address.ilike.%{safe_term}%,category.ilike.%{safe_term}%,description.ilike.%{safe_term}%"
-                    )
-            res = query.order("upvotes", desc=True).limit(limit).execute()
-            community_rows = res.data or []
+            hint = COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "")
+            gq = " ".join(x for x in [search_term, hint, clean_city] if x).strip()
+            g_places = await asyncio.wait_for(_google_text_search(gq, max_result_count=min(limit, 20)), 14)
+            for p in g_places:
+                g_row = _community_google_place_to_row(p, clean_city, requested_category)
+                g_row.update({"provider": "Google Places", "data_state": "VERIFIED", "scope": "local",
+                              "_tags": {}, "_osm_type": "", "_osm_id": "", "_area": False, "_boost": 5.0})
+                open_rows.append(g_row)
+            google_live = bool(g_places)
         except Exception as exc:
-            print(f"[Community Gems Supabase search notice]: {exc}")
+            print(f"[Community Google optional search notice]: {exc}")
 
-    # Merge known community entries with Google details, then append unique
-    # Google/OSM discoveries without allowing duplicates to crowd out results.
-    google_by_id = {str(r.get("google_place_id")): r for r in google_rows if r.get("google_place_id")}
-    google_by_key = {}
-    for row in google_rows:
-        google_by_key[_community_place_dedupe_key(row, clean_city)] = row
-
+    # Community listings win; matching open-data records only fill in missing details.
     merged: List[Dict[str, Any]] = []
-    used_external_ids = set()
-    known_keys = set()
-    for community in community_rows:
-        key = _community_place_dedupe_key(community, clean_city)
-        google_id = str(community.get("google_place_id") or "")
-        google = google_by_id.get(google_id) or google_by_key.get(key)
-        if google:
-            used_external_ids.add(str(google.get("id") or ""))
-        merged.append(_merge_community_place_with_google(community, google))
-        known_keys.add(key)
-
-    for external in [*google_rows, *open_rows]:
-        external_id = str(external.get("id") or "")
-        key = _community_place_dedupe_key(external, clean_city)
-        if external_id in used_external_ids or key in known_keys:
-            continue
-        merged.append(external)
-        used_external_ids.add(external_id)
-        known_keys.add(key)
-
-    # For city requests, put community recommendations first; if GPS coordinates
-    # were explicitly supplied, sort all providers by squared coordinate distance.
-    if lat is not None and lng is not None:
-        def distance_key(row: Dict[str, Any]) -> float:
+    used_open: set = set()
+    for c in community_rows:
+        c_key = _comm_norm_name(c.get("name"))
+        match = None
+        for idx, o in enumerate(open_rows):
+            if idx in used_open or _comm_norm_name(o.get("name")) != c_key:
+                continue
             try:
-                dlat = float(row.get("latitude")) - lat
-                dlng = float(row.get("longitude")) - lng
-                return dlat * dlat + dlng * dlng
+                close = _place_distance_km(float(c.get("latitude")), float(c.get("longitude")), float(o.get("latitude")), float(o.get("longitude"))) <= 0.4
             except (TypeError, ValueError):
-                return 10**9
-        merged.sort(key=distance_key)
-    else:
-        merged.sort(key=lambda row: (-(int(row.get("upvotes") or 0)), -(float(row.get("rating") or 0))))
+                close = str(c.get("city") or "").strip().lower() == clean_city.lower()
+            if close:
+                match, _ = o, used_open.add(idx)
+                break
+        row = _merge_community_place_with_google(c, _comm_public_row(match) if match else None)
+        row["source"] = "COMMUNITY+OPENSTREETMAP" if match else "COMMUNITY"
+        merged.append(row)
+    for idx, o in enumerate(open_rows):
+        if idx not in used_open:
+            merged.append(_comm_public_row(o))
 
-    return {
-        "status": "success",
-        "city": clean_city,
-        "places": merged[:limit],
-        "provider": "GOOGLE+OPENSTREETMAP" if google_rows and open_rows else ("GOOGLE" if google_rows else ("OPENSTREETMAP" if open_rows else "COMMUNITY" if community_rows else "NONE")),
-        "google_live": bool(google_places),
-        "open_data_live": bool(open_rows),
-        "google_places_configured": bool(GOOGLE_PLACES_API_KEY),
+    final = merged[:limit]
+    response: Dict[str, Any] = {
+        "status": "success", "city": clean_city, "places": final, "google_live": google_live,
+        "provider": "OPEN_DATA", "providers": engine.get("providers"), "widened": bool(engine.get("widened")),
+        "searched_area": engine.get("area"), "cached": bool(engine.get("cached")),
     }
+    if not final:
+        if engine.get("degraded"):
+            response["message"] = "Map data services could not be reached just now. Please pull to refresh in a moment."
+        elif search_term:
+            response["message"] = f"No places found for '{search_term}'. Try a different spelling or a nearby area name."
+    return response
 
 
 @app.get("/api/v1/community/places/nearby")
@@ -5725,46 +6201,28 @@ async def search_community_places_nearby(
     category: str = Query("All"),
     limit: int = Query(30, ge=1, le=50),
 ):
-    """Live nearby discovery, with real OpenStreetMap fallback if Google is sparse."""
+    """Live nearby discovery around the device position using OpenStreetMap + Wikipedia.
+    Location is only used when the user explicitly taps Nearby / Live View.
+    """
     requested_category = category.strip() or "All"
-    category_query = COMMUNITY_GOOGLE_CATEGORY_QUERIES.get(requested_category, "places")
-    query = "popular local places businesses restaurants shops attractions" if requested_category == "All" else category_query
-    google_places = await _google_text_search(
-        query,
-        max_result_count=min(limit, 20),
-        latitude=lat,
-        longitude=lng,
-        radius_meters=15000,
+    center = (float(lat), float(lng))
+    engine = await _community_open_engine_safe(
+        f"nearby-{lat:.3f}-{lng:.3f}", "", requested_category, limit, lat, lng, True, center,
     )
-    google_rows = [_community_google_place_to_row(place, "Nearby", requested_category) for place in google_places]
-    if requested_category != "All":
-        google_rows = [row for row in google_rows if row.get("category") == requested_category]
-
-    open_rows: List[Dict[str, Any]] = []
-    if len(google_rows) < min(10, limit):
-        open_rows = await _search_open_community_places(
-            "Nearby", "", requested_category, min(limit, 30), latitude=lat, longitude=lng
-        )
-
-    rows: List[Dict[str, Any]] = []
-    seen = set()
-    for row in [*google_rows, *open_rows]:
-        key = str(row.get("google_place_id") or "") or _community_place_dedupe_key(row, "Nearby")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        rows.append(row)
-        if len(rows) >= limit:
-            break
-
-    return {
-        "status": "success",
-        "provider": "GOOGLE+OPENSTREETMAP" if google_rows and open_rows else ("GOOGLE" if google_rows else ("OPENSTREETMAP" if open_rows else "NONE")),
-        "google_live": bool(google_rows),
-        "open_data_live": bool(open_rows),
-        "google_places_configured": bool(GOOGLE_PLACES_API_KEY),
-        "places": rows,
+    rows = [_comm_public_row(r) for r in (engine.get("rows") or [])][:limit]
+    for r in rows:
+        if not r.get("city") or r.get("city", "").startswith("nearby"):
+            r["city"] = "Nearby"
+        if not r.get("address") or str(r.get("address")).startswith("nearby"):
+            r["address"] = "Nearby"
+    response: Dict[str, Any] = {
+        "status": "success", "provider": "OPEN_DATA", "google_live": False,
+        "places": rows, "providers": engine.get("providers"),
     }
+    if not rows and engine.get("degraded"):
+        response["message"] = "Map data services could not be reached just now. Please try again shortly."
+    return response
+
 
 @app.post("/api/v1/community/places/upload-photo")
 async def upload_community_place_photo(file: UploadFile = File(...)):
