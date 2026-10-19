@@ -17,6 +17,7 @@ import mimetypes
 import subprocess
 import tempfile
 import urllib.parse
+from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Tuple
@@ -28,8 +29,15 @@ import requests
 from fastapi import FastAPI, UploadFile, File, Form, Request, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import Response
 from places import router as places_router
-from services.destination_engine import router as destination_router
+from services.destination_engine import (
+    router as destination_router,
+    set_supabase_client,
+)
 from gem_scout import GemScout
+from services.shared_places_catalog import (
+    search_shared_places,
+    upsert_validated_place,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
@@ -83,10 +91,12 @@ app.mount("/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
 # -------------------------------------------------------------
 # 0. SUPABASE CLIENT INITIALIZATION
 # -------------------------------------------------------------
+load_dotenv()
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().strip('"').strip("'")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip().strip('"').strip("'")
 supabase: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
-
+set_supabase_client(supabase)
 # -------------------------------------------------------------
 # RAILRADAR API CONFIGURATION
 # -------------------------------------------------------------
@@ -6130,6 +6140,86 @@ def _merge_community_place_with_google(community: Dict[str, Any], google: Option
     row["booking"] = row.get("booking") or {"url": row.get("booking_url") or "", "provider": row.get("booking_provider") or ""}
     return row
 
+
+def _persist_openstreetmap_discoveries_sync(
+    rows: List[Dict[str, Any]],
+    default_city: str,
+    max_records: int = 5,
+) -> int:
+    """Persist a small batch of eligible local OSM records only."""
+    if not supabase:
+        return 0
+
+    persisted = 0
+    attempted = 0
+
+    for row in rows or []:
+        provider = str(row.get("provider") or "").lower()
+        source_id = str(row.get("id") or "").strip()
+
+        # Never persist Google, Wikipedia, or other non-OSM search results.
+        if "openstreetmap" not in provider:
+            continue
+
+        # Require a stable OSM object ID, not a name/coordinate fallback ID.
+        if not re.fullmatch(r"osm:(?:node|way|relation)/\d+", source_id):
+            continue
+
+        # Keep only results from the selected local area.
+        if str(row.get("scope") or "").lower() != "local":
+            continue
+
+        name = str(row.get("name") or "").strip()
+        city_value = str(row.get("city") or default_city or "").strip()
+
+        try:
+            latitude = float(row.get("latitude"))
+            longitude = float(row.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+
+        if not name or not city_value:
+            continue
+
+        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+            continue
+
+        # Limit the number of database upserts per search request.
+        if attempted >= max_records:
+            break
+        attempted += 1
+
+        record = {
+            "name": name,
+            "category": row.get("category") or "Other",
+            "description": row.get("description"),
+            "city": city_value,
+            "state_region": row.get("state_region"),
+            "country": row.get("country"),
+            "address": row.get("address"),
+            "latitude": latitude,
+            "longitude": longitude,
+            "source_provider": "openstreetmap",
+            "source_place_id": source_id,
+            "external_url": row.get("website_url"),
+            "metadata": {
+                "attribution_required": "© OpenStreetMap contributors",
+                "database_license": "ODbL-1.0",
+                "provider_variant": row.get("provider"),
+                "discovery_scope": "local",
+            },
+        }
+
+        try:
+            saved_row = upsert_validated_place(supabase, record)
+            if saved_row:
+                persisted += 1
+        except Exception as exc:
+            # A catalogue write failure must not break place discovery.
+            print(f"[Shared Places persistence notice] {exc}")
+
+    return persisted
+
 def _community_supabase_search_sync(city: str, term: str, category: str, limit: int) -> List[Dict[str, Any]]:
     """Community listings: the selected hub first, then (for text searches) matches from any other city."""
     if not supabase:
@@ -6180,10 +6270,78 @@ async def search_community_places(
     requested_category = category.strip() or "All"
     search_term = q.strip()
 
-    open_task = asyncio.create_task(_community_open_engine_safe(clean_city, search_term, requested_category, limit, lat, lng))
-    community_rows = await asyncio.to_thread(_community_supabase_search_sync, clean_city, search_term, requested_category, limit)
+    open_task = asyncio.create_task(
+        _community_open_engine_safe(
+            clean_city, search_term, requested_category, limit, lat, lng
+        )
+    )
+    shared_task = asyncio.create_task(
+        asyncio.to_thread(
+            search_shared_places,
+            supabase,
+            city=clean_city,
+            query=search_term,
+            category=requested_category,
+            limit=limit,
+        )
+    )
+
+    community_rows = await asyncio.to_thread(
+        _community_supabase_search_sync,
+        clean_city,
+        search_term,
+        requested_category,
+        limit,
+    )
+    shared_rows = await shared_task
     engine = await open_task
     open_rows: List[Dict[str, Any]] = list(engine.get("rows") or [])
+        # Persist only eligible local OpenStreetMap discoveries.
+    persisted_open_data = await asyncio.to_thread(
+        _persist_openstreetmap_discoveries_sync,
+        open_rows,
+        clean_city,
+        5,
+    )
+
+    # Add shared-catalogue records without duplicating existing Community Gems.
+    for shared in shared_rows:
+        shared_name = _comm_norm_name(shared.get("name"))
+        duplicate = False
+
+        if shared_name:
+            for existing in community_rows:
+                if _comm_norm_name(existing.get("name")) != shared_name:
+                    continue
+
+                try:
+                    close = (
+                        _place_distance_km(
+                            float(existing["latitude"]),
+                            float(existing["longitude"]),
+                            float(shared["latitude"]),
+                            float(shared["longitude"]),
+                        )
+                        <= 0.4
+                    )
+                except (KeyError, TypeError, ValueError):
+                    existing_city = str(existing.get("city") or "").strip().lower()
+                    shared_city = str(shared.get("city") or "").strip().lower()
+                    existing_address = str(existing.get("address") or "").strip().lower()
+                    shared_address = str(shared.get("address") or "").strip().lower()
+                    close = (
+                        bool(existing_address)
+                        and existing_address == shared_address
+                        and existing_city == shared_city
+                    )
+
+                if close:
+                    duplicate = True
+                    break
+
+        if not duplicate:
+            community_rows.append(shared)
+
 
     google_live = False
     if COMMUNITY_USE_GOOGLE and GOOGLE_PLACES_API_KEY:
@@ -6216,8 +6374,16 @@ async def search_community_places(
             if close:
                 match, _ = o, used_open.add(idx)
                 break
-        row = _merge_community_place_with_google(c, _comm_public_row(match) if match else None)
-        row["source"] = "COMMUNITY+OPENSTREETMAP" if match else "COMMUNITY"
+        is_shared_catalog = bool(c.get("source_provider"))
+        row = _merge_community_place_with_google(
+            c, _comm_public_row(match) if match else None
+        )
+
+        if is_shared_catalog:
+            row["source"] = "SHARED_CATALOG+OPEN_DATA" if match else "SHARED_CATALOG"
+        else:
+            row["source"] = "COMMUNITY+OPENSTREETMAP" if match else "COMMUNITY"
+
         merged.append(row)
     for idx, o in enumerate(open_rows):
         if idx not in used_open:

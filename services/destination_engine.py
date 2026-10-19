@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
+from .shared_places_catalog import is_generic_place_name, search_shared_places
 
 try:
     from groq import Groq
@@ -21,6 +22,13 @@ except Exception:  # pragma: no cover
 
 
 router = APIRouter(tags=["Destination Engine"])
+_shared_supabase_client = None
+
+
+def set_supabase_client(client: Any) -> None:
+    """Use the existing application Supabase client for shared places."""
+    global _shared_supabase_client
+    _shared_supabase_client = client
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 CATALOG_PATH = BASE_DIR / "data" / "destinations_arch" / "destination_catalog.json"
@@ -198,6 +206,155 @@ def _catalog_places(city: str, state: str, country: str) -> List[Dict[str, Any]]
         }
         output.append(item)
     output.sort(key=lambda x: (x.get("distance_km", 999999), x.get("name", "")))
+    return output
+
+def _shared_catalog_places(
+    city: str,
+    state: str,
+    country: str,
+    destination: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Convert published shared-catalogue records to Destination Engine format."""
+    client = _shared_supabase_client
+    if not client:
+        return []
+
+    origin_lat = destination.get("latitude", destination.get("lat"))
+    origin_lng = destination.get("longitude", destination.get("lng"))
+
+    try:
+        # Prefer exact city matches. If there are none, broaden the lookup and
+        # use coordinates to include only nearby records (for example, Pune
+        # results recorded under the neighbouring city Pimpri-Chinchwad).
+        records = search_shared_places(
+            client,
+            city=city,
+            query="",
+            category="All",
+            limit=100,
+        )
+        if not records:
+            records = search_shared_places(
+                client,
+                city="",
+                query="",
+                category="All",
+                limit=100,
+            )
+            nearby_fallback = True
+        else:
+            nearby_fallback = False
+    except Exception as exc:
+        print(f"[Destination Shared Catalogue Notice] {exc}")
+        return []
+
+    output: List[Dict[str, Any]] = []
+
+    for record in records:
+        record_country = str(record.get("country") or "").strip()
+        record_state = str(record.get("state_region") or "").strip()
+        record_city = str(record.get("city") or "").strip()
+
+        if country and record_country and _norm(record_country) != _norm(country):
+            continue
+        if state and record_state and _norm(record_state) != _norm(state):
+            continue
+
+        name = str(record.get("name") or "").strip()
+        if not name:
+            continue
+
+        # Skip records that contain only a generic feature type rather than a
+        # useful place name (for example, five OpenStreetMap entries named "Park").
+        # Keep the published database rows untouched; filter them only from this feed.
+        generic_names = {
+            "park", "garden", "temple", "church", "mosque", "museum",
+            "market", "mall", "hotel", "restaurant", "beach", "school",
+            "hospital", "station", "monument", "attraction", "place", "building",
+        }
+        if _norm(name) in generic_names:
+            continue
+
+        lat = record.get("latitude")
+        lng = record.get("longitude")
+        distance = None
+
+        try:
+            if lat is not None and lng is not None:
+                lat = float(lat)
+                lng = float(lng)
+                if origin_lat is not None and origin_lng is not None:
+                    distance = _distance_km(
+                        float(origin_lat),
+                        float(origin_lng),
+                        lat,
+                        lng,
+                    )
+        except (TypeError, ValueError):
+            lat = None
+            lng = None
+            distance = None
+
+        # Broad fallback results must be geographically local. Do not let an
+        # unrelated catalogue entry appear in a destination simply because
+        # its city/state metadata is missing or uses a neighbouring city name.
+        if nearby_fallback and _norm(record_city) != _norm(city):
+            if distance is None or distance > 50:
+                continue
+
+        provider = str(record.get("source_provider") or "unknown")
+        provider_id = str(record.get("source_place_id") or record.get("id") or "")
+        image_url = record.get("image_url")
+        image_attribution = record.get("image_attribution")
+        image_license = record.get("image_license")
+        image_source_url = record.get("image_source_url")
+
+        item = {
+            "name": name,
+            "category": record.get("category") or _category_for(name),
+            "city": record.get("city") or city,
+            "state": record.get("state_region") or state,
+            "country": record.get("country") or country,
+            "country_code": record.get("country_code"),
+            "description": record.get("description") or "",
+            "distance": (
+                f"{distance:.1f} km from Center"
+                if distance is not None
+                else "Distance unavailable"
+            ),
+            "distance_km": round(distance, 2) if distance is not None else None,
+            "distance_type": "straight_line" if distance is not None else None,
+            "timing": "See official source",
+            "entry": "See official source",
+            "lat": lat,
+            "lng": lng,
+            "address": record.get("address") or "",
+            "history": record.get("description") or "Published shared-catalogue place.",
+            "overview": record.get("description") or "Place listed in the shared catalogue.",
+            "best_food": [],
+            "things_to_do": [],
+            "best_time": "Check official information before visiting.",
+            "warnings": "Confirm current access and opening information before visiting.",
+            "rating": None,
+            "reviews": None,
+            "images": [image_url] if image_url else [],
+            "google_photo_names": [],
+            "image_provider": provider if image_url else "NONE",
+            "image_credits": [image_attribution] if image_attribution else [],
+            "image_license": image_license,
+            "image_source_url": image_source_url,
+            "maps_url": _map_url(name, lat, lng) if lat is not None and lng is not None else None,
+            "website_url": record.get("external_url"),
+            "place_id": f"shared:{provider}:{provider_id}",
+            "source_provider": provider,
+            "source_place_id": provider_id,
+            "source": "SHARED_CATALOG",
+            "data_state": "PUBLISHED_SHARED_CATALOG_RECORD",
+            "provider_verified": False,
+            "attribution_required": image_attribution or f"Place source: {provider}",
+        }
+        output.append(item)
+
     return output
 
 
@@ -626,7 +783,68 @@ async def explore_city_new(request: Request):
     if source_mode == "LOCAL_CATALOG":
         places = _catalog_places(city, state, country)
     else:
-        places = await _discover_places_with_nominatim(city, country, state, destination)
+        places = await _discover_places_with_nominatim(
+            city, country, state, destination
+        )
+
+    # Add published shared-catalogue records without replacing existing results.
+    shared_places = _shared_catalog_places(
+        city, state, country, destination
+    )
+    shared_added = 0
+
+    for shared in shared_places:
+        duplicate = False
+        shared_name = _norm(shared.get("name"))
+
+        if not shared_name:
+            continue
+
+        for existing in places:
+            if _norm(existing.get("name")) != shared_name:
+                continue
+
+            try:
+                existing_lat = existing.get("lat", existing.get("latitude"))
+                existing_lng = existing.get("lng", existing.get("longitude"))
+                shared_lat = shared.get("lat")
+                shared_lng = shared.get("lng")
+
+                if all(
+                    value is not None
+                    for value in (
+                        existing_lat,
+                        existing_lng,
+                        shared_lat,
+                        shared_lng,
+                    )
+                ):
+                    duplicate = (
+                        _distance_km(
+                            float(existing_lat),
+                            float(existing_lng),
+                            float(shared_lat),
+                            float(shared_lng),
+                        )
+                        <= 0.2
+                    )
+                else:
+                    existing_address = _norm(existing.get("address"))
+                    shared_address = _norm(shared.get("address"))
+                    duplicate = bool(
+                        existing_address
+                        and existing_address == shared_address
+                    )
+            except (TypeError, ValueError):
+                duplicate = False
+
+            if duplicate:
+                break
+
+        if not duplicate:
+            places.append(shared)
+            shared_added += 1
+
 
     # Images are non-critical: failure never prevents attractions from loading.
     await _enrich_images(places, city, country, limit_places=8)
@@ -652,7 +870,10 @@ async def explore_city_new(request: Request):
         "adults": int(body.get("adults", 2)),
         "kids": int(body.get("kids", 0)),
         "child_ages": list(body.get("child_ages") or []),
-        "places_provider": "Omni Local Catalog" if source_mode == "LOCAL_CATALOG" else "OpenStreetMap Nominatim",
+        "places_provider": (
+            "Omni Local Catalog" if source_mode == "LOCAL_CATALOG"
+            else "OpenStreetMap Nominatim"
+        ) + (" + Shared Places Catalog" if shared_added else ""),
         "places_state": "VERIFIED" if places else "EMPTY",
         "landmarks": places,
         "places": places,
@@ -665,6 +886,7 @@ async def explore_city_new(request: Request):
         "destination_engine": {
             "architecture": "local-catalog-first",
             "source_mode": source_mode,
+            "shared_catalog_places_added": shared_added,
             "overpass_used": False,
             "wikipedia_geosearch_used": False,
             "google_places_required": False,
