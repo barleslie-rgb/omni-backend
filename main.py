@@ -19,6 +19,7 @@ import tempfile
 import urllib.parse
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Tuple
 import xml.etree.ElementTree as ET
@@ -602,12 +603,14 @@ _google_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 _open_destination_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 _open_places_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
 _wikimedia_image_cache: Dict[str, Dict[str, Any]] = {}
-_wikimedia_semaphore = asyncio.Semaphore(3)
+_wikimedia_semaphore = asyncio.Semaphore(2)
+_wikimedia_blocked = False
+_wikimedia_cooldown_until = 0.0
 _open_geo_semaphore = asyncio.Semaphore(1)
 _overpass_semaphore = asyncio.Semaphore(1)
 _google_places_disabled = False
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
-WIKIMEDIA_USER_AGENT = "OmniTouristOS/1.0 (destination image service)"
+WIKIMEDIA_USER_AGENT = "OmniTouristOS/1.1 (https://github.com/barleslie-rgb/omni-backend; contact via repository)"
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 OPEN_DATA_USER_AGENT = "OmniTouristOS/1.0 (destination explorer; contact via app)"
 NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/search"
@@ -799,10 +802,12 @@ def _booking_headers() -> Dict[str, str]:
 async def _wikimedia_image_search(query: str, limit: int = 5) -> Dict[str, Any]:
     """Find openly hosted destination images on Wikimedia Commons.
 
-    This is deliberately independent of Google Places billing/quota. Commons
-    exposes public MediaWiki APIs and the returned image URLs are direct HTTPS
-    URLs suitable for Flutter Image.network().
+    Uses an identifiable User-Agent, limits request concurrency, respects
+    Retry-After for temporary rate limiting, and stops issuing Commons queries
+    after a robot-policy 403 rather than repeatedly hitting a blocked API.
     """
+    global _wikimedia_blocked, _wikimedia_cooldown_until
+
     clean_query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not clean_query:
         return {"images": [], "credits": []}
@@ -811,6 +816,10 @@ async def _wikimedia_image_search(query: str, limit: int = 5) -> Dict[str, Any]:
     cached = _wikimedia_image_cache.get(cache_key)
     if cached is not None:
         return cached
+
+    empty_result: Dict[str, Any] = {"images": [], "credits": []}
+    if _wikimedia_blocked or time.monotonic() < _wikimedia_cooldown_until:
+        return empty_result
 
     params = {
         "action": "query",
@@ -828,14 +837,50 @@ async def _wikimedia_image_search(query: str, limit: int = 5) -> Dict[str, Any]:
     result: Dict[str, Any] = {"images": [], "credits": []}
     try:
         async with _wikimedia_semaphore:
+            # Check again after acquiring the semaphore so queued tasks do not
+            # send additional requests after an earlier request was blocked.
+            if _wikimedia_blocked or time.monotonic() < _wikimedia_cooldown_until:
+                return result
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=4.0)) as client:
                 response = await client.get(
                     WIKIMEDIA_API_URL,
                     params=params,
                     headers={"User-Agent": WIKIMEDIA_USER_AGENT, "Accept": "application/json"},
                 )
+
+        if response.status_code == 403:
+            _wikimedia_blocked = True
+            print(
+                "[Wikimedia Image Notice] HTTP 403 robot-policy response. "
+                "Commons image requests are paused for this process; verify the "
+                "User-Agent/contact details and contact Wikimedia if the block persists."
+            )
+            _wikimedia_image_cache[cache_key] = result
+            return result
+
+        if response.status_code in (429, 503):
+            retry_after = str(response.headers.get("Retry-After") or "").strip()
+            delay_seconds = 60.0
+            if retry_after:
+                try:
+                    delay_seconds = max(1.0, float(retry_after))
+                except ValueError:
+                    try:
+                        retry_at = parsedate_to_datetime(retry_after).timestamp()
+                        delay_seconds = max(1.0, retry_at - time.time())
+                    except (TypeError, ValueError, OverflowError):
+                        delay_seconds = 60.0
+            _wikimedia_cooldown_until = time.monotonic() + delay_seconds
+            print(
+                f"[Wikimedia Image Notice] HTTP {response.status_code}; "
+                f"pausing Commons requests for about {int(delay_seconds)} seconds."
+            )
+            # Do not cache transient rate-limit results; a later request may retry
+            # after the server's cooldown has expired.
+            return result
+
         if response.status_code != 200:
-            print(f"[Wikimedia Image Notice] {response.status_code}: {response.text[:300]}")
+            print(f"[Wikimedia Image Notice] HTTP {response.status_code}: {response.text[:200]}")
             _wikimedia_image_cache[cache_key] = result
             return result
 
@@ -864,7 +909,7 @@ async def _wikimedia_image_search(query: str, limit: int = 5) -> Dict[str, Any]:
             page_id = page.get("pageid")
             source_url = (
                 f"https://commons.wikimedia.org/wiki/Special:Redirect/file/"
-                f"{urllib.parse.quote(page_title.removeprefix('File:'), safe='') }"
+                f"{urllib.parse.quote(page_title.removeprefix('File:'), safe='')}"
             ) if page_title else "https://commons.wikimedia.org/"
 
             result["images"].append(image_url)
@@ -888,7 +933,7 @@ async def _attach_wikimedia_images(
     places: List[Dict[str, Any]],
     city: str,
     country: str,
-    limit_places: int = 15,
+    limit_places: int = 5,
     state: str = "",
 ) -> None:
     """Attach open destination photos, retrying with regional names for smaller places."""
@@ -904,12 +949,10 @@ async def _attach_wikimedia_images(
         # progressively broader regional variants without using unrelated stock imagery.
         context_parts = [str(city or "").strip(), str(state or "").strip(), str(country or "").strip()]
         specific_query = " ".join(part for part in context_parts if part)
-        queries = [
-            f"{name} {specific_query}".strip(),
-            f"{name} {city} {country}".strip(),
-        ]
-        if state:
-            queries.append(f"{name} {state} {country}".strip())
+        queries = [f"{name} {specific_query}".strip()]
+        fallback_query = f"{name} {city} {country}".strip()
+        if fallback_query and fallback_query.casefold() != queries[0].casefold():
+            queries.append(fallback_query)
 
         seen_queries = set()
         for query in queries:
@@ -1767,7 +1810,7 @@ async def _load_google_destination_places(city: str, state: str, country: str) -
 
     normalized.sort(key=lambda x: (-(float(x.get("rating") or 0)), -(int(x.get("reviews") or 0))))
     normalized = normalized[:20]
-    await _attach_wikimedia_images(normalized, city, country, limit_places=20, state=state)
+    await _attach_wikimedia_images(normalized, city, country, limit_places=5, state=state)
     return destination, normalized
 
 
@@ -5948,7 +5991,7 @@ async def _community_enrich_osm(rows: List[Dict[str, Any]]) -> None:
             r["image_url"], r["photos"] = image, [image]
 
 
-async def _community_attach_commons_images(rows: List[Dict[str, Any]], max_rows: int = 6) -> None:
+async def _community_attach_commons_images(rows: List[Dict[str, Any]], max_rows: int = 3) -> None:
     """Attach Wikimedia Commons photos to a few sights, only when the file title clearly matches the place."""
     targets = [r for r in rows if not r.get("image_url") and r.get("category") in {"Heritage & Sight", "Picnic Spot & Landscape"}][:max_rows]
 
