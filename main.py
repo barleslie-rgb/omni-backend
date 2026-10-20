@@ -3722,15 +3722,27 @@ async def street_voice_translate(
     source_language: str = Form("English"),
     target_language: str = Form("Marathi")
 ):
-    clean_text = text.strip()
+    """Real-time two-way conversational translation for Street Translator.
+
+    Returns only the target-language phrase so the Flutter client can display
+    and speak the translated side of the conversation.
+    """
+    clean_text = str(text or "").strip()
     if not clean_text:
-        return {"status": "error", "translation": ""}
+        return {"status": "error", "translation": "", "message": "Empty text."}
+
+    src = str(source_language or "Auto").strip() or "Auto"
+    tgt = str(target_language or "English").strip() or "English"
 
     sys_prompt = (
-        f"You are a real-time conversational voice interpreter. "
-        f"Translate spoken speech directly from {source_language} into natural, colloquial {target_language}. "
-        f"CRITICAL: Output ONLY the direct translated phrase in the target script. "
-        f"Do NOT include explanations, romanizations, quotes, or conversational preamble."
+        f"You are a real-time conversational street interpreter between two people. "
+        f"Translate the speaker's words from {src} into natural, spoken {tgt}. "
+        f"Preserve meaning, politeness level, and urgency. "
+        f"CRITICAL RULES: "
+        f"1) Output ONLY the translated phrase in the correct script for {tgt}. "
+        f"2) No explanations, romanization, quotes, labels, or preamble. "
+        f"3) If the input is already in {tgt}, return it cleaned and natural. "
+        f"4) Keep short speech short; do not expand into essays."
     )
 
     client = get_groq_client()
@@ -3741,20 +3753,32 @@ async def street_voice_translate(
                     model=model_id,
                     messages=[
                         {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": clean_text}
+                        {"role": "user", "content": clean_text},
                     ],
                     temperature=0.1,
-                    max_tokens=256,
-                    timeout=15
+                    max_tokens=400,
+                    timeout=18,
                 )
-                raw_ans = comp.choices[0].message.content.strip().strip('"')
-                if raw_ans:
-                    return {"status": "success", "translation": sanitize_ai_output(raw_ans)}
+                raw_ans = (comp.choices[0].message.content or "").strip().strip('"').strip("'")
+                cleaned = sanitize_ai_output(raw_ans)
+                if cleaned:
+                    return {
+                        "status": "success",
+                        "translation": cleaned,
+                        "source_language": src,
+                        "target_language": tgt,
+                    }
             except Exception as e:
                 print(f"[Street Voice Notice with {model_id}]: {e}")
                 continue
 
-    return {"status": "error", "translation": "Translation failed. Check connection."}
+    return {
+        "status": "error",
+        "translation": "",
+        "message": "Translation failed. Check connection.",
+        "source_language": src,
+        "target_language": tgt,
+    }
 
 # -------------------------------------------------------------
 # 12. STREET LENS
@@ -3762,17 +3786,113 @@ async def street_voice_translate(
 @app.post("/api/v1/street-lens")
 async def street_lens(
     file: UploadFile = File(...),
-    target_language: str = Form("English")
+    target_language: str = Form("English"),
+    source_language: str = Form("Auto"),
 ):
+    """Street Lens: OCR + practical meaning for signs, menus, notices, labels.
+
+    Uses the multimodal vision pipeline so the uploaded image is actually read.
+    Output is written in the traveler's preferred language.
+    """
     try:
         file_bytes = await file.read()
         img_bytes = prepare_image_bytes(file_bytes)
         if not img_bytes:
             return {"status": "error", "message": "Could not decode photo."}
-        analysis = await ask_fast_text("Interpret this sign and its practical meaning for a traveler.", "You are a visual assistant.")
-        return {"status": "success", "interpretation": analysis}
+
+        lang = str(target_language or "English").strip() or "English"
+        filename = file.filename or "street_lens.jpg"
+
+        # Prefer dedicated street-sign prompt via vision model.
+        vision_report = await ask_fast_vision(
+            img_bytes,
+            filename,
+            lang,
+            analysis_mode="document",
+        )
+
+        # If vision returned a generic document report, ask a focused street interpreter pass.
+        focused = ""
+        if vision_report and len(vision_report.strip()) > 20:
+            focus_prompt = (
+                f"You are Street Lens for travelers. Using ONLY the evidence below from a photo "
+                f"of a sign, menu, notice, ticket, or street label, write a clear traveler briefing "
+                f"in {lang}.\n\n"
+                f"EVIDENCE REPORT:\n{vision_report[:12000]}\n\n"
+                f"Return these sections when useful:\n"
+                f"WHAT IT SAYS (faithful translation / reading)\n"
+                f"WHAT IT MEANS FOR YOU (practical action)\n"
+                f"KEY NUMBERS / TIMES / PRICES / WARNINGS\n"
+                f"UNCERTAIN PARTS\n\n"
+                f"Rules: do not invent text that was not visible; keep it concise and useful on the street."
+            )
+            try:
+                focused = await ask_fast_text(
+                    focus_prompt,
+                    f"You are a precise street-sign interpreter. Answer only in {lang}.",
+                )
+            except Exception as exc:
+                print(f"[Street Lens focus notice]: {exc}")
+                focused = vision_report
+        else:
+            # Direct multimodal street prompt if document-style vision was empty.
+            client = get_groq_client()
+            if client:
+                try:
+                    encoded = base64.b64encode(img_bytes).decode("ascii")
+                    completion = client.chat.completions.create(
+                        model="qwen/qwen3.8-27b",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"You are Street Lens, a traveler sign/menu interpreter. "
+                                    f"Read visible text carefully and explain practical meaning in {lang}."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Analyze this photo of a sign, menu, notice, ticket, or street label. "
+                                            "Transcribe readable text, translate into the target language, and explain "
+                                            "what a traveler should do. Do not invent unreadable text. "
+                                            f"Write in {lang}."
+                                        ),
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                                    },
+                                ],
+                            },
+                        ],
+                        temperature=0.1,
+                        max_completion_tokens=4000,
+                        timeout=90,
+                    )
+                    focused = sanitize_ai_output(completion.choices[0].message.content or "")
+                except Exception as exc:
+                    print(f"[Street Lens direct vision notice]: {exc}")
+
+        if not focused or not focused.strip():
+            return {
+                "status": "error",
+                "message": "Could not read this image. Try a clearer, well-lit photo of the sign.",
+                "interpretation": "",
+            }
+
+        return {
+            "status": "success",
+            "interpretation": focused.strip(),
+            "target_language": lang,
+            "source_language": str(source_language or "Auto"),
+        }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        print(f"[Street Lens error]: {e}")
+        return {"status": "error", "message": str(e), "interpretation": ""}
 
 # -------------------------------------------------------------
 # 13. WIKIPEDIA PHOTO RESOLVER
