@@ -223,6 +223,28 @@ def _destination_category_key(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
 
 
+_DESTINATION_RESIDENTIAL_NAME_RE = re.compile(
+    r"\b(?:apartments?|flats?|housing\s+society|housing\s+complex|"
+    r"residential\s+(?:complex|society|tower|colony)|apartment\s+complex)\b",
+    re.IGNORECASE,
+)
+_DESTINATION_LOW_VALUE_NAME_RE = re.compile(
+    r"\b(?:dirty|polluted|sewage|stormwater|storm\s+water|wastewater|waste\s+water|"
+    r"garbage\s+dump|dumping\s+ground|landfill|drainage\s+pond)\b",
+    re.IGNORECASE,
+)
+_DESTINATION_VASAI_WATER_FEATURE_RE = re.compile(
+    r"\b(?:lake|talav|talab|pond|reservoir|water\s+tank)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_vasai_virar_destination(city: str, country: str) -> bool:
+    city_key = re.sub(r"[^a-z0-9]+", "", str(city or "").casefold())
+    country_key = re.sub(r"[^a-z0-9]+", "", str(country or "").casefold())
+    return city_key in {"vasaivirar", "vasaivirarcity"} and country_key in {"india", "in"}
+
+
 def _is_destination_attraction_record(record: Dict[str, Any]) -> bool:
     """Reject general commercial/service listings from Destination Hub.
 
@@ -237,6 +259,10 @@ def _is_destination_attraction_record(record: Dict[str, Any]) -> bool:
 
     name_key = _destination_category_key(name)
     if name_key in _DESTINATION_GENERIC_NAMES or _DESTINATION_WEEKDAY_MARKET_RE.fullmatch(name_key):
+        return False
+    # The Destination Hub is for places people may visit, not apartment blocks,
+    # residential societies, or water features explicitly labelled polluted/dirty.
+    if _DESTINATION_RESIDENTIAL_NAME_RE.search(name) or _DESTINATION_LOW_VALUE_NAME_RE.search(name):
         return False
     # Transport infrastructure is not a sightseeing attraction.
     if re.search(
@@ -336,6 +362,16 @@ def _deduplicate_destination_places(
                 value = candidate.get(field)
                 if value not in (None, "", [], {}):
                     kept[field] = value
+
+        kept_evidence = kept.get("_destination_evidence")
+        candidate_evidence = candidate.get("_destination_evidence")
+        if isinstance(candidate_evidence, dict):
+            if not isinstance(kept_evidence, dict):
+                kept_evidence = {}
+                kept["_destination_evidence"] = kept_evidence
+            for evidence_key, evidence_value in candidate_evidence.items():
+                if evidence_value and not kept_evidence.get(evidence_key):
+                    kept_evidence[evidence_key] = evidence_value
 
         images = list(kept.get("images") or [])
         credits = list(kept.get("image_credits") or [])
@@ -488,6 +524,134 @@ def _catalog_places(city: str, state: str, country: str) -> List[Dict[str, Any]]
         output.append(item)
     output.sort(key=lambda x: (x.get("distance_km", 999999), x.get("name", "")))
     return output
+
+
+# Curated from the Mumbai Metropolitan Region Heritage Conservation Society
+# (MMR-HCS) heritage inventory. These are named built-heritage attractions, not
+# generated entries. Dates and coordinates are based on the survey records.
+_VASAI_VIRAR_HISTORIC_CHURCHES = (
+    {
+        "name": "St. James Church, Agashi",
+        "lat": 19.46362695924282, "lng": 72.7728913912984,
+        "date": "1568; rebuilt in 1760",
+        "history": "MMR-HCS records this as the first Portuguese church built outside Vasai Fort; it was damaged in 1739 and rebuilt in 1760.",
+        "pdf": "44_St-James_Church.pdf",
+    },
+    {
+        "name": "Holy Spirit Church, Nandakhal",
+        "lat": 19.43940937061478, "lng": 72.78321195779057,
+        "date": "1573 (heritage survey date)",
+        "history": "A sixteenth-century Franciscan church between Agashi and Nirmal; the heritage survey notes that it survived the 1739 Maratha invasion.",
+        "pdf": "60b_Holy_Spirit_Church.pdf",
+    },
+    {
+        "name": "Holy Cross Church, Nirmal",
+        "lat": 19.40223963197819, "lng": 72.77978530147904,
+        "date": "1580; rebuilt in 1856",
+        "history": "The heritage inventory records a Franciscan church founded in 1580 and rebuilt at its original site in 1856.",
+        "pdf": "81_Holy_Cross_Church.pdf",
+    },
+    {
+        "name": "Our Lady of Remedies Church, Vasai",
+        "lat": 19.34896439813528, "lng": 72.80048834937297,
+        "date": "1577 (heritage survey date)",
+        "history": "A Portuguese-period church identified in the MMR-HCS heritage inventory for its historic façade and religious-heritage value.",
+        "pdf": "22_Our_Lady_of_Remedies_Church.pdf",
+    },
+    {
+        "name": "Our Lady of Grace Cathedral, Papdy",
+        "lat": 19.3509596260427, "lng": 72.81192203417351,
+        "date": "1600s (heritage survey date)",
+        "history": "A historic church at Papdy documented in the MMR-HCS inventory as a Portuguese-style heritage building.",
+        "pdf": "40_Our_Lady_of_Grace_Church_Papdy.pdf",
+    },
+    {
+        "name": "St. Michael's Church, Vasai",
+        "lat": 19.37263887660183, "lng": 72.82774450284016,
+        "date": "1606; rebuilt in 1739",
+        "history": "The MMR-HCS heritage record dates the church to 1606 and notes rebuilding in 1739; its altar was brought from a church in Vasai Fort.",
+        "pdf": "19a_St-Michael_Church.pdf",
+    },
+    {
+        "name": "St. Anthony's Church Ruins, Vasai Fort",
+        "lat": 19.33050077875013, "lng": 72.81080239146125,
+        "date": "1537 (heritage survey date)",
+        "history": "Ruins of a Portuguese-period church inside Vasai Fort; the heritage survey describes its stone choir arch and semicircular courtyard colonnade.",
+        "pdf": "34b_St-Anthonys_CHurch.pdf",
+    },
+    {
+        "name": "Church of the Holy Name of Jesus Ruins, Vasai Fort",
+        "lat": 19.32871998452023, "lng": 72.81215388822021,
+        "date": "1549–1578 (heritage survey date range)",
+        "history": "A Jesuit church ruin within Vasai Fort, documented by MMR-HCS for its historic façade and Jesuit monogram.",
+        "pdf": "34c_Church_of_the_Holy_Name_of_Jesus.pdf",
+    },
+    {
+        "name": "Church of Our Lady of Life Ruins, Vasai Fort",
+        "lat": 19.32950411833571, "lng": 72.81442947680618,
+        "date": "1536 (heritage survey date)",
+        "history": "A sixteenth-century garrison church ruin in the Vasai Fort precinct, listed in the MMR-HCS heritage inventory.",
+        "pdf": "34e_Church_of_Our_Lady_of_Life.pdf",
+    },
+    {
+        "name": "St. Peter's Church, Vasai West",
+        "lat": 19.33754890321148, "lng": 72.80394629465512,
+        "date": "1913 (heritage survey date)",
+        "history": "A locally listed historic church on Killa Bunder Road, noted in the MMR-HCS inventory for its architectural details and patterned mosaic tiles.",
+        "pdf": "33_St-Peters_Church.pdf",
+    },
+)
+
+
+def _vasai_virar_heritage_records(destination: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return verified built-heritage church records for Vasai-Virar only."""
+    try:
+        origin_lat = float(destination.get("latitude", destination.get("lat")))
+        origin_lng = float(destination.get("longitude", destination.get("lng")))
+    except (TypeError, ValueError):
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for site in _VASAI_VIRAR_HISTORIC_CHURCHES:
+        lat, lng = float(site["lat"]), float(site["lng"])
+        distance = _distance_km(origin_lat, origin_lng, lat, lng)
+        if distance > 20.0:
+            continue
+        pdf_url = "https://www.mmrhcs.org.in/images/Location_PDFS/" + site["pdf"]
+        records.append({
+            "name": site["name"],
+            "category": "Historic Churches & Heritage",
+            "distance": f"{distance:.1f} km from Center",
+            "distance_km": round(distance, 2),
+            "distance_type": "straight_line",
+            "timing": "Confirm parish visiting hours before visiting",
+            "entry": "Confirm access; church services may be in progress",
+            "lat": lat,
+            "lng": lng,
+            "address": ", ".join(part for part in (site["name"], "Vasai-Virar", "Maharashtra", "India") if part),
+            "history": site["history"],
+            "overview": f"Historic church heritage site; survey date: {site['date']}. Please verify present access before visiting.",
+            "best_food": [],
+            "things_to_do": ["View the historic architecture respectfully", "Check public access and service times before arrival"],
+            "best_time": "Daylight hours; confirm access with the parish or local authority",
+            "warnings": "Respect worship services and restricted areas; confirm access before visiting.",
+            "rating": None,
+            "reviews": None,
+            "images": [],
+            "google_photo_names": [],
+            "image_provider": "NONE",
+            "image_credits": [],
+            "maps_url": _map_url(site["name"], lat, lng),
+            "website_url": pdf_url,
+            "place_id": "mmrhcs:vasai-virar:" + _destination_category_key(site["name"]).replace(" ", "-"),
+            "source": "MMR-HCS Heritage Register",
+            "data_state": "VERIFIED_HERITAGE_REGISTER",
+            "provider_verified": True,
+            "attribution_required": "Mumbai Metropolitan Region Heritage Conservation Society (MMR-HCS)",
+            "_destination_priority": 25,
+        })
+    return records
+
 
 def _shared_catalog_places(
     city: str,
@@ -975,6 +1139,15 @@ out center tags;
             "website_url": website,
             "place_id": f"osm:{osm_kind}/{osm_id}",
             "source": "OpenStreetMap Overpass",
+            "_destination_evidence": {
+                "wikipedia": tags.get("wikipedia"),
+                "wikidata": tags.get("wikidata"),
+                "tourism": tags.get("tourism"),
+                "historic": tags.get("historic"),
+                "heritage": tags.get("heritage"),
+                "leisure": tags.get("leisure"),
+                "natural": tags.get("natural"),
+            },
             "data_state": "VERIFIED_OPEN_DATA",
             "provider_verified": True,
             "attribution_required": "OpenStreetMap",
@@ -1108,6 +1281,15 @@ async def _discover_places_with_nominatim(
             "website_url": website if isinstance(website, str) and website.startswith(("https://", "http://")) else None,
             "place_id": f"osm:{item.get('osm_type','')}/{item.get('osm_id','')}",
             "source": "OpenStreetMap Nominatim",
+            "_destination_evidence": {
+                "wikipedia": extratags.get("wikipedia") if isinstance(extratags, dict) else None,
+                "wikidata": extratags.get("wikidata") if isinstance(extratags, dict) else None,
+                "tourism": extratags.get("tourism") if isinstance(extratags, dict) else None,
+                "historic": extratags.get("historic") if isinstance(extratags, dict) else None,
+                "heritage": extratags.get("heritage") if isinstance(extratags, dict) else None,
+                "leisure": extratags.get("leisure") if isinstance(extratags, dict) else None,
+                "natural": extratags.get("natural") if isinstance(extratags, dict) else None,
+            },
             "data_state": "VERIFIED_OPEN_DATA",
             "provider_verified": True,
             "attribution_required": "OpenStreetMap",
@@ -1326,7 +1508,7 @@ _DEST_IMAGE_TOKEN_ALIASES = {
     "museums": "museum", "palaces": "palace", "gates": "gate", "gateways": "gateway",
     "beaches": "beach", "shore": "beach", "coast": "beach", "coastal": "beach",
     "waterfalls": "waterfall", "falls": "waterfall", "cascade": "waterfall", "cascades": "waterfall",
-    "ghats": "ghat", "lakes": "lake", "rivers": "river", "dams": "dam",
+    "ghats": "ghat", "lakes": "lake", "talav": "lake", "talavs": "lake", "talab": "lake", "talabs": "lake", "ponds": "pond", "rivers": "river", "dams": "dam",
     "parks": "park", "gardens": "garden", "sanctuaries": "sanctuary", "reserves": "reserve",
     "caves": "cave", "caverns": "cave", "monuments": "monument", "memorials": "memorial",
     "markets": "market", "bazaars": "bazaar", "malls": "mall",
@@ -1347,7 +1529,7 @@ _DEST_IMAGE_TYPE_GROUPS = (
     {"temple"}, {"mosque"}, {"dargah", "shrine", "tomb", "mausoleum"},
     {"church", "cathedral", "gurdwara", "synagogue"},
     {"fort", "citadel"}, {"museum"}, {"palace"}, {"gate", "gateway"},
-    {"beach"}, {"waterfall"}, {"ghat"}, {"lake"}, {"river"}, {"dam"},
+    {"beach"}, {"waterfall"}, {"ghat"}, {"lake", "pond"}, {"river"}, {"dam"},
     {"park", "garden", "sanctuary", "reserve"}, {"cave"},
     {"monument", "memorial"}, {"market", "bazaar", "mall", "supermarket", "hypermarket", "grocer", "shop", "store"},
     {"pharmacy", "chemist"}, {"salon", "barber"}, {"cafe"},
@@ -1490,6 +1672,12 @@ def _destination_image_relevance(
     business_like = _destination_is_business_like(place_name, category)
     ambiguous_common_name = bool(name_token_set.intersection(_DEST_IMAGE_AMBIGUOUS_NAME_WORDS))
     city_match = _destination_title_has_city_context(candidate_title, city)
+    # Parks, lakes, ponds and gardens often have repeated names. Exact-looking
+    # file titles can still depict a different city; don't attach those photos
+    # unless the file title also anchors the image to the requested locality.
+    generic_local_feature = bool(name_token_set.intersection({"park", "lake", "pond", "garden", "talav", "talab", "dam"}))
+    if generic_local_feature and city.strip() and not city_match:
+        return 0.0
     if business_like and city.strip() and not city_match:
         return 0.0
     if ambiguous_common_name and city.strip() and not city_match:
@@ -1817,9 +2005,13 @@ async def _enrich_images(
     state: str = "",
 ) -> None:
     """Enrich blank destination cards without attaching cross-city business photos."""
-    targets = [
-        place for place in places if not place.get("images")
-    ][:max(0, min(int(limit_places), 30))]
+    targets = [place for place in places if not place.get("images")]
+    targets.sort(key=lambda place: (
+        0 if str(place.get("source") or "") == "MMR-HCS Heritage Register" else 1,
+        -int(place.get("_destination_priority") or 0),
+        _norm(place.get("name")),
+    ))
+    targets = targets[:max(0, min(int(limit_places), 30))]
     if not targets:
         return
 
@@ -2072,6 +2264,16 @@ async def explore_city_new(request: Request):
             city, country, state, destination
         )
 
+    # Keep a small, sourced heritage register for Vasai-Virar so centuries-old
+    # churches aren't omitted simply because the public map provider lacks tags.
+    heritage_places_added = False
+    if _is_vasai_virar_destination(city, country):
+        heritage_places = _vasai_virar_heritage_records(destination)
+        if heritage_places:
+            places = heritage_places + places
+            heritage_places_added = True
+            print(f"[Destination Heritage] Added {len(heritage_places)} sourced historic church record(s) for {city}.")
+
     # Add structured attraction discovery even when a local catalogue entry exists.
     # The helper returns only named OSM attraction features and applies the same
     # business/transport exclusion filter used by the Nominatim results.
@@ -2246,6 +2448,46 @@ async def explore_city_new(request: Request):
                 f"attractions for {city}; retaining {len(places)} existing place(s)."
             )
 
+    # Do not let building/apartment records or arbitrary water-body map labels
+    # displace genuine visitor attractions. On Vasai-Virar, low-confidence lakes,
+    # ponds and talavs are hidden unless the source supplies heritage/tourism/wiki
+    # evidence; curated catalogue and MMR-HCS heritage records remain untouched.
+    before_quality_count = len(places)
+    quality_places: List[Dict[str, Any]] = []
+    for place in places:
+        name = str(place.get("name") or "")
+        source = str(place.get("source") or "")
+        evidence = place.get("_destination_evidence") if isinstance(place.get("_destination_evidence"), dict) else {}
+        if _DESTINATION_RESIDENTIAL_NAME_RE.search(name) or _DESTINATION_LOW_VALUE_NAME_RE.search(name):
+            continue
+        if (
+            _is_vasai_virar_destination(city, country)
+            and source in {"OpenStreetMap Nominatim", "OpenStreetMap Overpass"}
+            and _DESTINATION_VASAI_WATER_FEATURE_RE.search(name)
+            and not any(evidence.get(key) for key in ("wikipedia", "wikidata", "tourism", "historic", "heritage", "leisure"))
+        ):
+            continue
+        # Restrict dynamic Vasai-Virar results to the city area rather than a
+        # broad 50 km geocoder search that can pull unrelated outskirts.
+        if _is_vasai_virar_destination(city, country):
+            distance_km = place.get("distance_km")
+            if distance_km is None:
+                try:
+                    plat = float(place.get("lat", place.get("latitude")))
+                    plng = float(place.get("lng", place.get("longitude")))
+                    origin_lat = float(destination.get("latitude", destination.get("lat")))
+                    origin_lng = float(destination.get("longitude", destination.get("lng")))
+                    distance_km = _distance_km(origin_lat, origin_lng, plat, plng)
+                except (TypeError, ValueError):
+                    distance_km = None
+            if distance_km is None or float(distance_km) > 20.0:
+                continue
+        quality_places.append(place)
+    places = quality_places
+    removed_quality_count = before_quality_count - len(places)
+    if removed_quality_count:
+        print(f"[Destination Places] Removed {removed_quality_count} low-quality or out-of-area record(s) for {city}.")
+
     # Keep curated local-catalogue entries first; then prefer well-described OSM
     # attractions (Wikipedia/Wikidata, heritage/nature tags, and worship sites).
     places.sort(key=lambda place: (
@@ -2257,6 +2499,7 @@ async def explore_city_new(request: Request):
     places = places[:30]
     for place in places:
         place.pop("_destination_priority", None)
+        place.pop("_destination_evidence", None)
 
     # Images are non-critical: failure never prevents attractions from loading.
     await _enrich_images(places, city, country, limit_places=30, state=state)
@@ -2285,7 +2528,7 @@ async def explore_city_new(request: Request):
         "places_provider": (
             "Omni Local Catalog" if source_mode == "LOCAL_CATALOG"
             else "OpenStreetMap Nominatim"
-        ) + (" + OpenStreetMap Overpass" if overpass_places else "") + (" + OpenStreetMap Nominatim" if nominatim_supplement_used else "") + (" + Expanded Nominatim" if nominatim_expanded_used else "") + (" + Wikipedia Geosearch" if wikipedia_geosearch_used else "") + (" + Shared Places Catalog" if shared_added else ""),
+        ) + (" + OpenStreetMap Overpass" if overpass_places else "") + (" + OpenStreetMap Nominatim" if nominatim_supplement_used else "") + (" + Expanded Nominatim" if nominatim_expanded_used else "") + (" + Wikipedia Geosearch" if wikipedia_geosearch_used else "") + (" + Shared Places Catalog" if shared_added else "") + (" + MMR-HCS Heritage Register" if heritage_places_added else ""),
         "places_state": "VERIFIED" if places else "EMPTY",
         "landmarks": places,
         "places": places,
@@ -2303,6 +2546,7 @@ async def explore_city_new(request: Request):
             "nominatim_supplement_used": nominatim_supplement_used,
             "nominatim_expanded_used": nominatim_expanded_used,
             "wikipedia_geosearch_used": wikipedia_geosearch_used,
+            "heritage_records_added": heritage_places_added,
             "google_places_required": False,
         },
     }
