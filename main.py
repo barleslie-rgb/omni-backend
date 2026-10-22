@@ -9910,3 +9910,374 @@ async def destination_discover(
     except Exception as exc:
         print(f"[destination-discover] catalogue query failed: {exc}")
         raise HTTPException(status_code=503, detail="Destination catalogue is temporarily unavailable.")
+# -----------------------------------------------------------------------------
+# CRICKET CENTRE: live scores and upcoming international fixtures
+# The API key remains server-side. Cache current scores for 20 minutes and the
+# fixture list for 6 hours by default to stay within CricketData.org's 100/day
+# free quota (72 current-score calls + 4 fixture calls in a stable 24h period).
+# A paid plan can lower these TTLs via Render environment variables.
+# -----------------------------------------------------------------------------
+CRICKET_DATA_API_KEY = os.environ.get("CRICKET_DATA_API_KEY", "").strip().strip('"').strip("'")
+CRICKET_DATA_BASE_URL = "https://api.cricapi.com/v1"
+CRICKET_CURRENT_CACHE_TTL_SECONDS = max(
+    120, min(int(os.environ.get("CRICKET_CURRENT_CACHE_TTL_SECONDS", "1200")), 86400)
+)
+CRICKET_FIXTURE_CACHE_TTL_SECONDS = max(
+    1800, min(int(os.environ.get("CRICKET_FIXTURE_CACHE_TTL_SECONDS", "21600")), 86400)
+)
+CRICKET_DATA_TIMEOUT_SECONDS = max(
+    5.0, min(float(os.environ.get("CRICKET_DATA_TIMEOUT_SECONDS", "12")), 30.0)
+)
+_cricket_current_cache: Dict[str, Any] = {
+    "data": [], "fetched_at": None, "expires_at": 0.0,
+    "retry_after": 0.0, "has_success": False, "error": None,
+}
+_cricket_fixture_cache: Dict[str, Any] = {
+    "data": [], "fetched_at": None, "expires_at": 0.0,
+    "retry_after": 0.0, "has_success": False, "error": None,
+}
+_cricket_current_lock = asyncio.Lock()
+_cricket_fixture_lock = asyncio.Lock()
+
+
+def _cricket_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _cricket_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.strptime(raw[:10], "%Y-%m-%d")
+            return parsed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+
+def _cricket_gender_hint(name: str, series_name: str, teams: List[str]) -> str:
+    text_value = " ".join([name, series_name, *teams]).casefold()
+    women_tokens = ("women", "women's", "womens", "female", "girls")
+    return "women" if any(token in text_value for token in women_tokens) else "men"
+
+
+_CRICKET_NATIONAL_TEAMS = {
+    "afghanistan", "australia", "bangladesh", "bermuda", "botswana", "canada",
+    "cayman islands", "china", "denmark", "england", "fiji", "finland", "france",
+    "germany", "hong kong", "india", "ireland", "isle of man", "italy", "japan",
+    "jersey", "kenya", "kuwait", "malawi", "malaysia", "maldives", "nepal",
+    "namibia", "netherlands", "new zealand", "nigeria", "norway", "oman", "papua new guinea",
+    "qatar", "rwanda", "saudi arabia", "scotland", "singapore", "south africa",
+    "south korea", "sri lanka", "tanzania", "thailand", "uganda", "united arab emirates",
+    "united states", "usa", "uae", "vanuatu", "west indies", "zimbabwe", "zambia",
+}
+_CRICKET_DOMESTIC_COMPETITIONS = (
+    "indian premier league", "ipl", "big bash", "bbl", "pakistan super league", "psl",
+    "caribbean premier league", "cpl", "the hundred", "sa20", "women's premier league",
+    "wpl", "county championship", "vitality blast", "t20 blast", "lanka premier league",
+    "bangladesh premier league", "major league cricket", "ilt20", "abu dhabi t10",
+    "super smash", "sheffield shield", "ranji trophy", "duleep trophy", "vijay hazare",
+    "syed mushtaq ali", "big bash league", "csa t20 challenge",
+)
+_CRICKET_INTERNATIONAL_MARKERS = (
+    "icc", "international", "world cup", "world test championship", "champions trophy",
+    "asia cup", "tri-series", "tour of", "test series", "odi series", "t20i",
+)
+_CRICKET_DOMESTIC_SHORT_NAMES = {"ipl", "bbl", "psl", "cpl", "wpl", "sa20", "ilt20"}
+
+
+def _cricket_team_is_national(team_name: str) -> bool:
+    value = re.sub(r"[^a-z0-9]+", " ", str(team_name or "").casefold()).strip()
+    if not value:
+        return False
+    # Franchise and domestic development sides should not be mistaken for senior national teams.
+    if re.search(r"\b(?:lions|warriors|kingsmen|super kings|royals|knights|titans|strikers|riders|challengers|sunrisers|capitals|gladiators|comets|falcons|dragons|phoenix|stars|sixes|heat|hurricanes|scorchers|renegades|thunder|blaze|academy|county|xi)\b", value):
+        return False
+    value = re.sub(r"\b(?:women|woman|men|male|female|a|u ?19|under 19|under ?19|emerging|development)\b", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return any(value == country or value.startswith(country + " ") for country in _CRICKET_NATIONAL_TEAMS)
+
+
+def _cricket_normalize_match(raw: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+
+    team_names_raw = raw.get("teams") or raw.get("teamNames") or raw.get("team_names") or []
+    if isinstance(team_names_raw, str):
+        team_names_raw = [part.strip() for part in re.split(r"\s+(?:vs\.?|v)\s+", team_names_raw, flags=re.I) if part.strip()]
+    teams = [str(name).strip() for name in team_names_raw if str(name or "").strip()] if isinstance(team_names_raw, list) else []
+
+    team_info_raw = raw.get("teamInfo") or raw.get("team_info") or []
+    team_info: List[Dict[str, Any]] = []
+    if isinstance(team_info_raw, list):
+        for team in team_info_raw:
+            if not isinstance(team, dict):
+                continue
+            normalized_team = {
+                "name": str(team.get("name") or team.get("teamName") or "").strip(),
+                "shortname": str(team.get("shortname") or team.get("shortName") or "").strip(),
+                "image": str(team.get("img") or team.get("image") or "").strip(),
+            }
+            if normalized_team["name"] or normalized_team["shortname"]:
+                team_info.append(normalized_team)
+    if not teams and team_info:
+        teams = [team["name"] or team["shortname"] for team in team_info]
+
+    match_name = str(raw.get("name") or raw.get("matchName") or "International cricket match").strip()
+    if len(teams) < 2 and re.search(r"\s+(?:vs\.?|v)\s+", match_name, flags=re.I):
+        split = re.split(r"\s+(?:vs\.?|v)\s+", match_name, maxsplit=1, flags=re.I)
+        right_team = re.split(r"[,|]", split[1], maxsplit=1)[0].strip() if len(split) > 1 else ""
+        left_team = re.split(r"[,|]", split[0], maxsplit=1)[0].strip()
+        candidates = [candidate for candidate in (left_team, right_team) if candidate]
+        if len(candidates) >= 2:
+            teams = candidates[:2]
+
+    score_raw = raw.get("score") or raw.get("scores") or []
+    if isinstance(score_raw, dict):
+        score_raw = [score_raw]
+    scores: List[Dict[str, Any]] = []
+    if isinstance(score_raw, list):
+        for item in score_raw:
+            if not isinstance(item, dict):
+                continue
+            scores.append({
+                "inning": str(item.get("inning") or item.get("innings") or "").strip(),
+                "runs": item.get("r", item.get("runs", item.get("score"))),
+                "wickets": item.get("w", item.get("wickets")),
+                "overs": item.get("o", item.get("overs")),
+            })
+
+    status = str(raw.get("status") or raw.get("matchStatus") or "").strip()
+    status_lower = status.casefold()
+    started = _cricket_bool(raw.get("matchStarted", raw.get("match_started", False)))
+    ended = _cricket_bool(raw.get("matchEnded", raw.get("match_ended", False)))
+    finished_markers = (
+        "won by", "drawn", "match tied", "tied match", "no result", "abandoned",
+        "cancelled", "canceled", "completed", "match complete", "result:",
+    )
+    if any(marker in status_lower for marker in finished_markers):
+        ended = True
+    if any(marker in status_lower for marker in ("not started", "yet to start", "upcoming", "starts at")):
+        started = False
+        ended = False
+    elif any(marker in status_lower for marker in ("live", "in progress", "innings break", "stumps")):
+        started = True
+    is_live = started and not ended
+    is_finished = ended
+    is_upcoming = not started and not ended
+
+    date_time = str(raw.get("dateTimeGMT") or raw.get("date_time_gmt") or raw.get("dateTime") or "").strip()
+    date_value = str(raw.get("date") or date_time[:10] or "").strip()
+    date_obj = _cricket_datetime(date_time or date_value)
+    now = datetime.now(timezone.utc)
+    # Exclude stale historical fixtures; retain recent results for a useful fallback.
+    if is_finished and date_obj and date_obj < now - timedelta(days=2):
+        return None
+    if is_upcoming and date_obj and date_obj < now - timedelta(days=1):
+        return None
+    if is_upcoming and date_obj and date_obj > now + timedelta(days=60):
+        return None
+
+    series_value = raw.get("seriesName") or raw.get("series_name") or raw.get("series") or ""
+    if isinstance(series_value, dict):
+        series_value = series_value.get("name") or series_value.get("seriesName") or ""
+    series_name = str(series_value or "").strip()
+    match_type = str(raw.get("matchType") or raw.get("match_type") or raw.get("type") or "").strip()
+    gender = _cricket_gender_hint(match_name, series_name, teams)
+    india_match = any("india" in team.casefold() for team in teams) or "india" in match_name.casefold()
+    competition_text = " ".join((match_name, series_name, match_type)).casefold()
+    is_domestic_competition = (
+        any(marker in competition_text for marker in _CRICKET_DOMESTIC_COMPETITIONS if marker not in _CRICKET_DOMESTIC_SHORT_NAMES)
+        or any(re.search(r"\b" + re.escape(marker) + r"\b", competition_text) for marker in _CRICKET_DOMESTIC_SHORT_NAMES)
+    )
+    national_sides = len(teams) >= 2 and all(_cricket_team_is_national(team) for team in teams[:2])
+    international_marker = (
+        any(marker in competition_text for marker in _CRICKET_INTERNATIONAL_MARKERS)
+        or bool(re.search(r"\b(?:odi|test)\b", match_type.casefold()))
+    )
+    is_international = not is_domestic_competition and (national_sides or international_marker)
+
+    match_id = str(raw.get("id") or raw.get("matchId") or raw.get("match_id") or "").strip()
+    return {
+        "id": match_id,
+        "name": match_name,
+        "series_name": series_name,
+        "match_type": match_type,
+        "teams": teams[:2],
+        "team_info": team_info[:2],
+        "scores": scores,
+        "status": status or ("Live" if is_live else ("Upcoming" if is_upcoming else "Result")),
+        "venue": str(raw.get("venue") or "").strip(),
+        "date": date_value,
+        "date_time_gmt": date_time,
+        "match_started": started,
+        "match_ended": ended,
+        "is_live": is_live,
+        "is_upcoming": is_upcoming,
+        "is_finished": is_finished,
+        "gender": gender,
+        "is_india_match": india_match,
+        "is_international": is_international,
+        "source_endpoint": source,
+    }
+
+
+async def _cricket_fetch_cached(
+    endpoint: str,
+    cache: Dict[str, Any],
+    lock: asyncio.Lock,
+    ttl_seconds: int,
+) -> Dict[str, Any]:
+    """Fetch one provider endpoint with in-process caching and failure backoff."""
+    now = time.monotonic()
+    if cache["has_success"] and now < cache["expires_at"]:
+        return {"data": list(cache["data"]), "fetched_at": cache["fetched_at"], "stale": False, "error": None, "ok": True}
+    if now < cache["retry_after"]:
+        return {"data": list(cache["data"]), "fetched_at": cache["fetched_at"], "stale": bool(cache["has_success"]), "error": cache["error"], "ok": bool(cache["has_success"])}
+
+    async with lock:
+        now = time.monotonic()
+        if cache["has_success"] and now < cache["expires_at"]:
+            return {"data": list(cache["data"]), "fetched_at": cache["fetched_at"], "stale": False, "error": None, "ok": True}
+        if now < cache["retry_after"]:
+            return {"data": list(cache["data"]), "fetched_at": cache["fetched_at"], "stale": bool(cache["has_success"]), "error": cache["error"], "ok": bool(cache["has_success"])}
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(CRICKET_DATA_TIMEOUT_SECONDS, connect=5.0),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    f"{CRICKET_DATA_BASE_URL}/{endpoint}",
+                    params={"apikey": CRICKET_DATA_API_KEY, "offset": 0},
+                    headers={"Accept": "application/json", "User-Agent": "OmniTouristOS/1.0 cricket-centre"},
+                )
+            if response.status_code != 200:
+                cache["error"] = f"Provider returned HTTP {response.status_code}."
+                raise ValueError(f"HTTP {response.status_code}")
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            provider_status = str((payload or {}).get("status") or "").casefold() if isinstance(payload, dict) else ""
+            if provider_status not in {"", "success"} or not isinstance(data, list):
+                cache["error"] = str((payload or {}).get("reason") or (payload or {}).get("message") or "Invalid provider response.")[:240] if isinstance(payload, dict) else "Invalid provider response."
+                raise ValueError("Provider response did not include a match list")
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            cache.update({
+                "data": data,
+                "fetched_at": fetched_at,
+                "expires_at": time.monotonic() + ttl_seconds,
+                "retry_after": 0.0,
+                "has_success": True,
+                "error": None,
+            })
+            return {"data": list(data), "fetched_at": fetched_at, "stale": False, "error": None, "ok": True}
+        except Exception as exc:
+            # Do not log URLs or exception strings; the URL contains the API key.
+            if not cache.get("error"):
+                cache["error"] = f"Provider request failed ({type(exc).__name__})."
+            cache["retry_after"] = time.monotonic() + 300
+            print(f"[Cricket Centre Notice] {endpoint} request failed ({type(exc).__name__}); cached data will be retained if available.")
+            return {
+                "data": list(cache["data"]),
+                "fetched_at": cache["fetched_at"],
+                "stale": bool(cache["has_success"]),
+                "error": cache["error"],
+                "ok": bool(cache["has_success"]),
+            }
+
+
+def _cricket_match_sort_key(match: Dict[str, Any]) -> Tuple[int, str, str]:
+    india = bool(match.get("is_india_match"))
+    if match.get("is_live"):
+        priority = 0 if india else 1
+    elif match.get("is_upcoming"):
+        priority = 2 if india else 3
+    elif match.get("is_finished"):
+        priority = 4 if india else 5
+    else:
+        priority = 6
+    return (priority, str(match.get("date_time_gmt") or match.get("date") or "9999"), str(match.get("name") or "").casefold())
+
+
+@app.get("/api/v1/cricket/scoreboard")
+async def cricket_scoreboard():
+    """Return cached current scores and upcoming fixtures without exposing the provider key."""
+    if not CRICKET_DATA_API_KEY:
+        return {
+            "status": "unavailable",
+            "provider": "Cricket Data",
+            "message": "Cricket score API key is not configured on the backend.",
+            "matches": [],
+            "updated_at": None,
+            "data_delay_note": "Provider data may lag live play by several minutes.",
+        }
+
+    current_task = _cricket_fetch_cached(
+        "currentMatches", _cricket_current_cache, _cricket_current_lock,
+        CRICKET_CURRENT_CACHE_TTL_SECONDS,
+    )
+    fixtures_task = _cricket_fetch_cached(
+        "matches", _cricket_fixture_cache, _cricket_fixture_lock,
+        CRICKET_FIXTURE_CACHE_TTL_SECONDS,
+    )
+    current_result, fixtures_result = await asyncio.gather(current_task, fixtures_task)
+
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for source_result in (current_result, fixtures_result):
+        for raw in source_result["data"]:
+            normalized = _cricket_normalize_match(raw, "currentMatches" if source_result is current_result else "matches")
+            if not normalized:
+                continue
+            # This centre is for international cricket: exclude domestic franchise,
+            # county and regional league fixtures from the default feed.
+            if not normalized.get("is_international"):
+                continue
+            # The match list endpoint can span historical matches; only show active,
+            # upcoming and very recent results in the dashboard centre.
+            if not (normalized["is_live"] or normalized["is_upcoming"] or normalized["is_finished"]):
+                continue
+            match_id = normalized.get("id")
+            dedupe_key = ("id:" + match_id) if match_id else "|".join((
+                re.sub(r"\W+", " ", normalized.get("name", "").casefold()).strip(),
+                normalized.get("date", ""), normalized.get("venue", "").casefold(),
+            ))
+            if not dedupe_key.strip("|") or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            merged.append(normalized)
+
+    merged.sort(key=_cricket_match_sort_key)
+    merged = merged[:40]
+    fetched_values = [value for value in (current_result.get("fetched_at"), fixtures_result.get("fetched_at")) if value]
+    updated_at = current_result.get("fetched_at") or (max(fetched_values) if fetched_values else None)
+    at_least_one_source_ok = bool(current_result.get("ok") or fixtures_result.get("ok"))
+    if not at_least_one_source_ok:
+        return {
+            "status": "unavailable",
+            "provider": "Cricket Data",
+            "message": "Cricket scores are temporarily unavailable. Please retry later.",
+            "matches": [],
+            "updated_at": updated_at,
+            "data_delay_note": "Provider data may lag live play by several minutes.",
+        }
+
+    return {
+        "status": "success",
+        "provider": "Cricket Data",
+        "matches": merged,
+        "updated_at": updated_at,
+        "current_matches_updated_at": current_result.get("fetched_at"),
+        "fixtures_updated_at": fixtures_result.get("fetched_at"),
+        "is_stale": bool(current_result.get("stale") or fixtures_result.get("stale")),
+        "data_delay_note": "Provider data may lag live play by several minutes.",
+        "cache_ttl_seconds": CRICKET_CURRENT_CACHE_TTL_SECONDS,
+    }
