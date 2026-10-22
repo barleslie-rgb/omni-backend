@@ -37,8 +37,9 @@ CATALOG_PATH = BASE_DIR / "data" / "destinations_arch" / "destination_catalog.js
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OVERPASS_URLS = (
-    # This instance is listed as a global public Overpass provider; use the
-    # official FOSSGIS instance once as a fallback if it is busy/unavailable.
+    # Alternate global instance, followed by the two existing providers.
+    # Public instances can be busy, so failed endpoints are temporarily cooled down.
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 )
@@ -61,6 +62,11 @@ _image_cache: Dict[str, Dict[str, Any]] = {}
 _overpass_sem = asyncio.Semaphore(1)
 _overpass_places_cache: Dict[str, Dict[str, Any]] = {}
 _OVERPASS_CACHE_TTL = 6 * 60 * 60
+_overpass_endpoint_cooldowns: Dict[str, float] = {}
+_OVERPASS_ENDPOINT_COOLDOWN_SECONDS = 5 * 60
+_wikipedia_geo_sem = asyncio.Semaphore(2)
+_wikipedia_geo_places_cache: Dict[str, Dict[str, Any]] = {}
+_WIKIPEDIA_GEO_CACHE_TTL = 6 * 60 * 60
 
 _DEST_WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
 _DEST_WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
@@ -773,16 +779,23 @@ async def _discover_places_with_overpass(
 out center tags;
 """
 
-    # Retry once against a second public instance if the first is busy or times out.
-    # Failed lookups are not cached, so a transient outage will not poison future requests.
+    # Cycle through independent public instances. A failing endpoint is cooled down
+    # for five minutes so every destination request does not repeatedly wait on it.
     elements: Optional[List[Dict[str, Any]]] = None
     last_error = ""
-    for endpoint in OVERPASS_URLS:
+    for endpoint_index, endpoint in enumerate(OVERPASS_URLS):
         hostname = urllib.parse.urlparse(endpoint).hostname or endpoint
+        cooldown_until = _overpass_endpoint_cooldowns.get(hostname, 0.0)
+        if cooldown_until > time.monotonic():
+            print(f"[Destination Overpass Notice] Skipping cooling-down instance {hostname}.")
+            continue
+        # Give the additional map provider time to answer; use shorter waits on
+        # known fallbacks so one outage cannot stall destination loading indefinitely.
+        request_timeout = 18.0 if endpoint_index == 0 else 7.0
         try:
             async with _overpass_sem:
                 async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(24.0, connect=5.0),
+                    timeout=httpx.Timeout(request_timeout, connect=3.0),
                     follow_redirects=True,
                 ) as client:
                     response = await client.post(
@@ -792,18 +805,23 @@ out center tags;
                     )
             if response.status_code != 200:
                 last_error = f"HTTP {response.status_code} from {hostname}"
+                if response.status_code in (403, 408, 429, 500, 502, 503, 504):
+                    _overpass_endpoint_cooldowns[hostname] = time.monotonic() + _OVERPASS_ENDPOINT_COOLDOWN_SECONDS
                 print(f"[Destination Overpass Notice] {last_error}; trying fallback if available.")
                 continue
             payload = response.json()
             if not isinstance(payload, dict) or not isinstance(payload.get("elements"), list):
                 last_error = f"invalid JSON payload from {hostname}"
+                _overpass_endpoint_cooldowns[hostname] = time.monotonic() + _OVERPASS_ENDPOINT_COOLDOWN_SECONDS
                 print(f"[Destination Overpass Notice] {last_error}; trying fallback if available.")
                 continue
+            _overpass_endpoint_cooldowns.pop(hostname, None)
             elements = payload["elements"]
             print(f"[Destination Overpass] {hostname} returned {len(elements)} raw map features.")
             break
         except Exception as exc:
             last_error = f"{type(exc).__name__} from {hostname}"
+            _overpass_endpoint_cooldowns[hostname] = time.monotonic() + _OVERPASS_ENDPOINT_COOLDOWN_SECONDS
             print(f"[Destination Overpass Notice] {last_error}; trying fallback if available.")
 
     if elements is None:
@@ -982,28 +1000,50 @@ out center tags;
     return places
 
 
-async def _discover_places_with_nominatim(city: str, country: str, state: str, destination: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _discover_places_with_nominatim(
+    city: str,
+    country: str,
+    state: str,
+    destination: Dict[str, Any],
+    expanded: bool = False,
+) -> List[Dict[str, Any]]:
+    """Discover named OSM attractions; use focused extra queries only when needed."""
     key = _destination_key(city, state, country)
-    if key in _places_cache:
-        return _places_cache[key]
+    cache_key = f"{key}|expanded" if expanded else key
+    if cache_key in _places_cache:
+        return _places_cache[cache_key]
 
-    lat = float(destination["latitude"])
-    lng = float(destination["longitude"])
-    queries = [
-        "tourist attraction",
-        "historic landmark",
-        "museum",
-        "park",
-        "beach",
-        "temple",
-        "church",
-        "mosque",
-    ]
+    lat = float(destination.get("latitude", destination.get("lat")))
+    lng = float(destination.get("longitude", destination.get("lng")))
+    if expanded:
+        # Additional categories are called only if the first sources still return
+        # fewer than 30 attractions. Nominatim remains rate-limited by _nominatim_get.
+        queries = [
+            "fort",
+            "monument",
+            "heritage site",
+            "garden",
+            "waterfall",
+            "lake",
+            "viewpoint",
+            "zoo",
+        ]
+    else:
+        queries = [
+            "tourist attraction",
+            "historic landmark",
+            "museum",
+            "park",
+            "beach",
+            "temple",
+            "church",
+            "mosque",
+        ]
 
     raw_results: List[Dict[str, Any]] = []
     for term in queries:
         results = await _nominatim_get({
-            "q": f"{term} in {city}, {country}",
+            "q": ", ".join(part for part in (f"{term} in {city}", state, country) if part),
             "format": "jsonv2",
             "addressdetails": "1",
             "extratags": "1",
@@ -1075,8 +1115,204 @@ async def _discover_places_with_nominatim(city: str, country: str, state: str, d
 
     places.sort(key=lambda x: (x.get("distance_km", 999999), x.get("name", "")))
     places = places[:30]
-    _places_cache[key] = places
+    _places_cache[cache_key] = places
     return places
+
+
+
+_WIKIPEDIA_ATTRACTION_HINT_RE = re.compile(
+    r"\b(?:attraction|landmark|monument|heritage|historic|historical|fort|fortress|"
+    r"palace|temple|church|mosque|cathedral|gurdwara|gurudwara|shrine|tomb|"
+    r"mausoleum|museum|beach|park|garden|waterfall|lake|hill|mountain|cave|"
+    r"zoo|sanctuary|wildlife|island|lighthouse|memorial|ruins|archaeolog(?:y|ical)|"
+    r"viewpoint|dam|reservoir|botanical|national park|nature reserve|pilgrimage)\b",
+    re.IGNORECASE,
+)
+_WIKIPEDIA_EXCLUDED_CATEGORY_RE = re.compile(
+    r"\b(?:disambiguation|films?|television|songs?|albums?|people|births|deaths|"
+    r"politicians|political parties|schools|colleges|universities|railway stations|"
+    r"bus stations|companies|businesses|languages|footballers|cricketers|species|"
+    r"fictional characters)\b",
+    re.IGNORECASE,
+)
+
+
+async def _discover_places_with_wikipedia_geosearch(
+    city: str,
+    country: str,
+    state: str,
+    destination: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Find additional geo-positioned attraction articles and useful article thumbnails."""
+    key = _destination_key(city, state, country)
+    now = time.monotonic()
+    cached = _wikipedia_geo_places_cache.get(key)
+    if isinstance(cached, dict) and now - float(cached.get("created_at") or 0.0) < _WIKIPEDIA_GEO_CACHE_TTL:
+        return [
+            dict(place,
+                 images=list(place.get("images") or []),
+                 image_credits=[dict(item) if isinstance(item, dict) else item for item in (place.get("image_credits") or [])])
+            for place in cached.get("places", [])
+        ]
+
+    try:
+        lat = float(destination.get("latitude", destination.get("lat")))
+        lng = float(destination.get("longitude", destination.get("lng")))
+    except (TypeError, ValueError):
+        return []
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "geosearch",
+        "ggscoord": f"{lat}|{lng}",
+        "ggsradius": "10000",
+        "ggslimit": "50",
+        "ggsnamespace": "0",
+        "prop": "coordinates|pageimages|categories",
+        "piprop": "thumbnail",
+        "pithumbsize": "640",
+        "cllimit": "20",
+        "clshow": "!hidden",
+    }
+
+    try:
+        async with _wikipedia_geo_sem:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(7.0, connect=3.0),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    _DEST_WIKIPEDIA_API_URL,
+                    params=params,
+                    headers={
+                        "User-Agent": _DEST_IMAGE_USER_AGENT,
+                        "Accept": "application/json",
+                    },
+                )
+        if response.status_code != 200:
+            print(f"[Destination Wikipedia Geosearch Notice] HTTP {response.status_code} for {city}.")
+            return []
+        payload = response.json() or {}
+        page_map = ((payload.get("query") or {}).get("pages") or {})
+        candidates: List[Dict[str, Any]] = []
+        seen_names: set[str] = set()
+        seen_ids: set[str] = set()
+
+        for page in page_map.values():
+            if not isinstance(page, dict):
+                continue
+            title = re.sub(r"\s+", " ", str(page.get("title") or "").replace("_", " ")).strip()
+            if not title:
+                continue
+
+            categories = [
+                str(category.get("title") or "").replace("Category:", "").strip()
+                for category in (page.get("categories") or [])
+                if isinstance(category, dict)
+            ]
+            category_text = " ".join(categories)
+            title_hint = bool(_WIKIPEDIA_ATTRACTION_HINT_RE.search(title))
+            category_hint = bool(_WIKIPEDIA_ATTRACTION_HINT_RE.search(category_text))
+            if not (title_hint or category_hint):
+                continue
+            if _WIKIPEDIA_EXCLUDED_CATEGORY_RE.search(category_text) and not title_hint:
+                continue
+            if not _is_destination_attraction_record({"name": title, "category": _category_for(f"{title} {category_text}")}):
+                continue
+
+            coords = page.get("coordinates") or []
+            if not coords or not isinstance(coords[0], dict):
+                continue
+            try:
+                place_lat = float(coords[0].get("lat"))
+                place_lng = float(coords[0].get("lon"))
+            except (TypeError, ValueError):
+                continue
+            distance = _distance_km(lat, lng, place_lat, place_lng)
+            if distance > 50.0:
+                continue
+
+            name_key = _destination_category_key(title)
+            page_id = str(page.get("pageid") or "")
+            if not name_key or name_key in seen_names or (page_id and page_id in seen_ids):
+                continue
+            seen_names.add(name_key)
+            if page_id:
+                seen_ids.add(page_id)
+
+            article_url = "https://en.wikipedia.org/wiki/" + urllib.parse.quote(
+                title.replace(" ", "_"), safe="_:()'")
+            category = _category_for(f"{title} {category_text}")
+            thumbnail = page.get("thumbnail") or {}
+            thumbnail_url = str(thumbnail.get("source") or "").strip() if isinstance(thumbnail, dict) else ""
+            images = [thumbnail_url] if thumbnail_url.startswith("https://") else []
+            credits = []
+            image_provider = "NONE"
+            attribution_required = "OpenStreetMap coordinates not supplied; Wikipedia geosearch article location"
+            if images:
+                image_provider = "Wikipedia article thumbnail"
+                credits = [{
+                    "title": title,
+                    "source_url": article_url,
+                    "artist": "",
+                    "license": "Check the linked article and original image file for creator and license terms.",
+                    "provider": "Wikipedia geosearch article thumbnail",
+                }]
+                attribution_required = "Wikipedia article thumbnail; verify original image attribution/license"
+
+            candidates.append({
+                "name": title,
+                "category": category,
+                "distance": f"{distance:.1f} km from Center",
+                "distance_km": round(distance, 2),
+                "distance_type": "straight_line",
+                "timing": "See official source",
+                "entry": "See official source",
+                "lat": place_lat,
+                "lng": place_lng,
+                "address": ", ".join(part for part in (city, state, country) if part),
+                "history": f"Geographically indexed Wikipedia article: {title}.",
+                "overview": f"{title} has a georeferenced article near {city}. Confirm current visitor access from an official source.",
+                "best_food": [],
+                "things_to_do": [],
+                "best_time": "Check official information and local conditions before visiting.",
+                "warnings": "Confirm current access, opening hours, fees and local safety conditions before visiting.",
+                "rating": None,
+                "reviews": None,
+                "images": images,
+                "google_photo_names": [],
+                "image_provider": image_provider,
+                "image_credits": credits,
+                "maps_url": _map_url(title, place_lat, place_lng),
+                "website_url": article_url,
+                "place_id": f"wikipedia:{page_id or _destination_category_key(title)}",
+                "source": "Wikipedia Geosearch",
+                "data_state": "WIKIPEDIA_GEOREFERENCE",
+                "provider_verified": True,
+                "attribution_required": attribution_required,
+                "_destination_priority": 3 if title_hint else 1,
+            })
+
+        candidates.sort(key=lambda place: (
+            -int(place.get("_destination_priority") or 0),
+            float(place.get("distance_km") or 999999),
+            _norm(place.get("name")),
+        ))
+        _wikipedia_geo_places_cache[key] = {
+            "created_at": time.monotonic(),
+            "places": [
+                dict(place,
+                     images=list(place.get("images") or []),
+                     image_credits=[dict(item) if isinstance(item, dict) else item for item in (place.get("image_credits") or [])])
+                for place in candidates
+            ],
+        }
+        print(f"[Destination Wikipedia Geosearch] {city}: found {len(candidates)} additional candidate attraction(s).")
+        return candidates
+    except Exception as exc:
+        print(f"[Destination Wikipedia Geosearch Notice] {type(exc).__name__} for {city}; retaining existing results.")
+        return []
 
 
 
@@ -1785,8 +2021,8 @@ async def destination_health():
             "wikipedia": "last-resort-thumbnail",
             "groq": "optional-guidance",
             "google_places": "optional-enrichment",
-            "overpass": "structured attraction discovery with six-hour cache",
-            "wikipedia_geosearch": "not-used",
+            "overpass": "structured attraction discovery via three public instances with cooldown and six-hour result cache",
+            "wikipedia_geosearch": "fallback for destinations with fewer than 30 attractions",
         },
         "catalog_destinations": len(CATALOG.get("destinations", {})),
         "image_fallback_version": "location-aware-v2-single-url-normalization-30-places",
@@ -1921,6 +2157,8 @@ async def explore_city_new(request: Request):
         )
 
     nominatim_supplement_used = False
+    nominatim_expanded_used = False
+    wikipedia_geosearch_used = False
 
     # A local-catalogue destination may start with only a few curated records.
     # If Overpass is unavailable or returns too few attractions, supplement the
@@ -1948,6 +2186,64 @@ async def explore_city_new(request: Request):
             print(
                 f"[Destination Places] Nominatim supplement returned no usable "
                 f"additional attractions for {city}; retaining {len(places)} existing place(s)."
+            )
+
+    # If the baseline result remains below target, try additional map-search terms
+    # and Wikipedia Geosearch concurrently. This keeps the added discovery time close
+    # to the slower provider rather than serially paying for both network calls.
+    if len(places) < 30:
+        expanded_result, wikipedia_result = await asyncio.gather(
+            _discover_places_with_nominatim(
+                city, country, state, destination, expanded=True
+            ),
+            _discover_places_with_wikipedia_geosearch(
+                city, country, state, destination
+            ),
+            return_exceptions=True,
+        )
+
+        expanded_places: List[Dict[str, Any]] = []
+        wikipedia_places: List[Dict[str, Any]] = []
+        if isinstance(expanded_result, BaseException):
+            print(f"[Destination Places Notice] Expanded Nominatim search failed for {city}: {type(expanded_result).__name__}.")
+        elif isinstance(expanded_result, list):
+            expanded_places = expanded_result
+        if isinstance(wikipedia_result, BaseException):
+            print(f"[Destination Wikipedia Geosearch Notice] {type(wikipedia_result).__name__} for {city}; retaining existing results.")
+        elif isinstance(wikipedia_result, list):
+            wikipedia_places = wikipedia_result
+
+        if expanded_places:
+            before_expanded_count = len(places)
+            places.extend(
+                place for place in expanded_places
+                if _is_destination_attraction_record(place)
+            )
+            places = _deduplicate_destination_places(places)
+            added_count = max(0, len(places) - before_expanded_count)
+            nominatim_expanded_used = added_count > 0
+            print(
+                f"[Destination Places] Expanded Nominatim search for {city}: "
+                f"added {added_count} new attraction(s); total before Wikipedia={len(places)}."
+            )
+
+        if wikipedia_places:
+            before_wikipedia_count = len(places)
+            places.extend(
+                place for place in wikipedia_places
+                if _is_destination_attraction_record(place)
+            )
+            places = _deduplicate_destination_places(places)
+            added_count = max(0, len(places) - before_wikipedia_count)
+            wikipedia_geosearch_used = added_count > 0
+            print(
+                f"[Destination Places] Wikipedia geosearch supplement for {city}: "
+                f"added {added_count} new attraction(s); total before cap={len(places)}."
+            )
+        elif not isinstance(wikipedia_result, BaseException):
+            print(
+                f"[Destination Places] Wikipedia geosearch found no usable additional "
+                f"attractions for {city}; retaining {len(places)} existing place(s)."
             )
 
     # Keep curated local-catalogue entries first; then prefer well-described OSM
@@ -1989,7 +2285,7 @@ async def explore_city_new(request: Request):
         "places_provider": (
             "Omni Local Catalog" if source_mode == "LOCAL_CATALOG"
             else "OpenStreetMap Nominatim"
-        ) + (" + OpenStreetMap Overpass" if overpass_places else "") + (" + OpenStreetMap Nominatim" if nominatim_supplement_used else "") + (" + Shared Places Catalog" if shared_added else ""),
+        ) + (" + OpenStreetMap Overpass" if overpass_places else "") + (" + OpenStreetMap Nominatim" if nominatim_supplement_used else "") + (" + Expanded Nominatim" if nominatim_expanded_used else "") + (" + Wikipedia Geosearch" if wikipedia_geosearch_used else "") + (" + Shared Places Catalog" if shared_added else ""),
         "places_state": "VERIFIED" if places else "EMPTY",
         "landmarks": places,
         "places": places,
@@ -2000,12 +2296,13 @@ async def explore_city_new(request: Request):
         "hotel_request_id": None,
         "attribution_required": ["OpenStreetMap", "Wikimedia Commons", "Wikipedia", "Openverse"],
         "destination_engine": {
-            "architecture": "local-catalog-first",
+            "architecture": "local-catalog-first-with-expanded-fallbacks",
             "source_mode": source_mode,
             "shared_catalog_places_added": shared_added,
             "overpass_used": bool(overpass_places),
             "nominatim_supplement_used": nominatim_supplement_used,
-            "wikipedia_geosearch_used": False,
+            "nominatim_expanded_used": nominatim_expanded_used,
+            "wikipedia_geosearch_used": wikipedia_geosearch_used,
             "google_places_required": False,
         },
     }
