@@ -10382,13 +10382,148 @@ def _cricket_find_list(data: Any, keys: Tuple[str, ...]) -> List[Dict[str, Any]]
     return []
 
 
+def _cricket_first_value(row: Dict[str, Any], keys: Tuple[str, ...], default: Any = None) -> Any:
+    """Get the first populated scorecard field without losing numeric zeroes."""
+    for key in keys:
+        if key not in row:
+            continue
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _cricket_player_display_name(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("name", "fullName", "full_name", "playerName", "shortname", "shortName", "displayName"):
+            candidate = value.get(key)
+            if candidate is not None and str(candidate).strip():
+                return str(candidate).strip()
+        return ""
+    return str(value).strip() if value is not None else ""
+
+
+def _cricket_number_source(row: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    value = _cricket_first_value(row, keys)
+    if value is not None:
+        return value
+    for container_key in ("totals", "total", "score", "inningsTotal", "innings_total"):
+        nested = row.get(container_key)
+        if isinstance(nested, dict):
+            value = _cricket_first_value(nested, keys)
+            if value is not None:
+                return value
+    return None
+
+
+def _cricket_normalize_batter(row: Dict[str, Any]) -> Dict[str, Any]:
+    player = _cricket_first_value(row, ("batsman", "batter", "player", "name", "batsmanName", "batterName"), "")
+    normalized = dict(row)
+    normalized.update({
+        "name": _cricket_player_display_name(player) or _cricket_player_display_name(row.get("name")) or "Batter",
+        "runs": _cricket_first_value(row, ("runs", "r", "score"), 0),
+        "balls": _cricket_first_value(row, ("balls", "b", "ballsFaced", "balls_faced"), 0),
+        "fours": _cricket_first_value(row, ("fours", "4s", "four"), 0),
+        "sixes": _cricket_first_value(row, ("sixes", "6s", "six"), 0),
+        "strike_rate": _cricket_first_value(row, ("strike_rate", "strikeRate", "sr"), "—"),
+        "dismissal": _cricket_first_value(row, ("dismissal", "dismissal-text", "dismissalText", "howOut", "out"), "—"),
+    })
+    return normalized
+
+
+def _cricket_normalize_bowler(row: Dict[str, Any]) -> Dict[str, Any]:
+    player = _cricket_first_value(row, ("bowler", "player", "name", "bowlerName"), "")
+    normalized = dict(row)
+    normalized.update({
+        "name": _cricket_player_display_name(player) or _cricket_player_display_name(row.get("name")) or "Bowler",
+        "overs": _cricket_first_value(row, ("overs", "o", "oversBowled", "overs_bowled"), "0"),
+        "maidens": _cricket_first_value(row, ("maidens", "maiden", "m"), 0),
+        "runs": _cricket_first_value(row, ("runs", "r", "conceded"), 0),
+        "wickets": _cricket_first_value(row, ("wickets", "w", "wkts"), 0),
+        "economy": _cricket_first_value(row, ("economy", "economyRate", "econ", "eco"), "—"),
+    })
+    return normalized
+
+
+def _cricket_normalize_scorecard_innings(raw_innings: List[Dict[str, Any]], teams: List[str]) -> List[Dict[str, Any]]:
+    normalized_innings: List[Dict[str, Any]] = []
+    for index, raw_inning in enumerate(raw_innings):
+        inning = dict(raw_inning)
+        label = str(_cricket_first_value(inning, ("inning", "innings", "team_name", "teamName", "team", "name"), f"Innings {index + 1}"))
+        label_lower = label.casefold()
+        country = ""
+        for team in teams:
+            if team and (label_lower == team.casefold() or label_lower.startswith(team.casefold() + " ") or team.casefold() in label_lower):
+                country = team
+                break
+        if not country:
+            raw_team = _cricket_first_value(inning, ("teamName", "team_name", "battingTeam", "batting_team", "team"), "")
+            country = _cricket_player_display_name(raw_team)
+        if not country:
+            country = label
+
+        batting_raw = _cricket_find_list(inning, ("batting", "batsmen", "battingScorecard", "batting_scorecard", "batterStats"))
+        bowling_raw = _cricket_find_list(inning, ("bowling", "bowlers", "bowlingScorecard", "bowling_scorecard", "bowlerStats"))
+        batting = [_cricket_normalize_batter(row) for row in batting_raw]
+        bowling = [_cricket_normalize_bowler(row) for row in bowling_raw]
+
+        extras = _cricket_first_value(inning, ("extras", "extra"), None)
+        extras_total = None
+        if isinstance(extras, dict):
+            extras_total = _cricket_first_value(extras, ("total", "r", "runs", "extras"), None)
+            if extras_total is None:
+                components = [extras.get(key) for key in ("b", "byes", "lb", "legByes", "w", "wides", "nb", "noBalls", "p", "penalty")]
+                numeric_components = []
+                for value in components:
+                    try:
+                        if value is not None:
+                            numeric_components.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+                if numeric_components:
+                    extras_total = sum(numeric_components)
+        elif extras is not None:
+            extras_total = extras
+
+        fow = _cricket_find_list(inning, ("fallOfWickets", "fall_of_wickets", "fallWickets", "fow"))
+        did_not_bat = _cricket_first_value(inning, ("didNotBat", "did_not_bat", "didNotBatsmen"), [])
+        partnerships = _cricket_find_list(inning, ("partnerships", "partnership"))
+
+        normalized = dict(inning)
+        normalized.update({
+            "team_name": country,
+            "inning_label": label,
+            "runs": _cricket_number_source(inning, ("runs", "r", "totalRuns", "total_runs")),
+            "wickets": _cricket_number_source(inning, ("wickets", "w", "totalWickets", "total_wickets")),
+            "overs": _cricket_number_source(inning, ("overs", "o", "oversPlayed", "overs_played")),
+            "batting": batting,
+            "bowling": bowling,
+            "extras": extras,
+            "extras_total": extras_total,
+            "fall_of_wickets": fow,
+            "did_not_bat": did_not_bat,
+            "partnerships": partnerships,
+        })
+        normalized_innings.append(normalized)
+    return normalized_innings
+
+
 def _cricket_scorecard_response(match_id: str, data: Dict[str, Any], fetched_at: str) -> Dict[str, Any]:
-    scorecard = _cricket_find_list(data, ("scorecard", "scoreCard", "innings", "inningScorecard"))
-    commentary = _cricket_find_list(data, ("commentary", "ballByBall", "ball_by_ball", "deliveries", "balls", "ballCommentary"))
+    teams_value = data.get("teams") if isinstance(data.get("teams"), list) else []
+    teams = [str(team).strip() for team in teams_value if str(team or "").strip()]
+    raw_scorecard = _cricket_find_list(data, ("scorecard", "scoreCard", "innings", "inningScorecard", "inning_scorecard"))
+    scorecard = _cricket_normalize_scorecard_innings(raw_scorecard, teams)
+    commentary = _cricket_find_list(data, (
+        "commentary", "ballByBall", "ball_by_ball", "deliveries", "balls",
+        "ballCommentary", "ball_commentary", "ballComments", "ball_comments",
+    ))
     if not commentary:
-        # Some provider payloads attach event lists to individual innings.
-        for inning in scorecard:
-            commentary.extend(_cricket_find_list(inning, ("commentary", "ballByBall", "ball_by_ball", "deliveries", "balls", "ballCommentary")))
+        for inning in raw_scorecard:
+            commentary.extend(_cricket_find_list(inning, (
+                "commentary", "ballByBall", "ball_by_ball", "deliveries", "balls",
+                "ballCommentary", "ball_commentary", "ballComments", "ball_comments",
+            )))
+    team_info = data.get("teamInfo") if isinstance(data.get("teamInfo"), list) else []
     return {
         "status": "success",
         "provider": "Cricket Data",
@@ -10398,20 +10533,21 @@ def _cricket_scorecard_response(match_id: str, data: Dict[str, Any], fetched_at:
             "match_type": str(data.get("matchType") or data.get("match_type") or ""),
             "status": str(data.get("status") or ""),
             "venue": str(data.get("venue") or ""),
-            "teams": data.get("teams") if isinstance(data.get("teams"), list) else [],
-            "team_info": data.get("teamInfo") if isinstance(data.get("teamInfo"), list) else [],
-            "toss_winner": str(data.get("tossWinner") or ""),
-            "toss_choice": str(data.get("tossChoice") or ""),
-            "match_winner": str(data.get("matchWinner") or ""),
+            "teams": teams,
+            "team_info": team_info,
+            "scores": data.get("score") if isinstance(data.get("score"), list) else (data.get("scores") if isinstance(data.get("scores"), list) else []),
+            "toss_winner": str(data.get("tossWinner") or data.get("toss_winner") or ""),
+            "toss_choice": str(data.get("tossChoice") or data.get("toss_choice") or ""),
+            "match_winner": str(data.get("matchWinner") or data.get("match_winner") or ""),
             "player_of_match": str(data.get("player_of_match") or data.get("playerOfMatch") or ""),
         },
         "scorecard": scorecard,
-        "scorecard_available": bool(scorecard),
+        "scorecard_available": any(item.get("batting") or item.get("bowling") or item.get("runs") is not None for item in scorecard),
         "commentary": commentary,
         "commentary_available": bool(commentary),
         "commentary_message": (
             None if commentary else
-            "The provider response did not include ball-by-ball commentary. Cricket Data's published documentation currently describes its Fantasy ball-by-ball API as in testing; no commentary has been invented."
+            "Ball-by-ball commentary is not included in the response available for this match or plan. No commentary has been invented."
         ),
         "data": data,
         "updated_at": fetched_at,
