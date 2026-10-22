@@ -393,6 +393,35 @@ def _catalog_destination(city: str, state: str, country: str) -> Optional[Dict[s
     return None
 
 
+def _destination_image_urls(value: Any) -> List[str]:
+    """Normalize catalogue image fields without splitting a single URL into characters."""
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    elif isinstance(value, dict):
+        values = [value]
+    else:
+        return []
+
+    output: List[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if isinstance(item, str):
+            url = item.strip()
+        elif isinstance(item, dict):
+            url = str(
+                item.get("url") or item.get("image_url") or item.get("thumbnail_url")
+                or item.get("thumbnail") or item.get("src") or ""
+            ).strip()
+        else:
+            continue
+        if url.startswith(("https://", "http://")) and url not in seen:
+            seen.add(url)
+            output.append(url)
+    return output
+
+
 def _catalog_places(city: str, state: str, country: str) -> List[Dict[str, Any]]:
     candidates = [_destination_key(city, state, country), _destination_key(city, "", country)]
     record = None
@@ -438,10 +467,10 @@ def _catalog_places(city: str, state: str, country: str) -> List[Dict[str, Any]]
             "warnings": raw.get("warnings") or "Check official access, opening hours and local conditions before visiting.",
             "rating": raw.get("rating"),
             "reviews": raw.get("reviews"),
-            "images": list(raw.get("images") or []),
+            "images": _destination_image_urls(raw.get("images") or raw.get("image_urls") or raw.get("image_url") or raw.get("photo_url") or raw.get("thumbnail_url")),
             "google_photo_names": [],
-            "image_provider": raw.get("image_provider") or ("Local catalog" if raw.get("images") else "NONE"),
-            "image_credits": list(raw.get("image_credits") or []),
+            "image_provider": raw.get("image_provider") or ("Local catalog" if _destination_image_urls(raw.get("images") or raw.get("image_urls") or raw.get("image_url") or raw.get("photo_url") or raw.get("thumbnail_url")) else "NONE"),
+            "image_credits": raw.get("image_credits") if isinstance(raw.get("image_credits"), list) else [],
             "maps_url": raw.get("maps_url") or _map_url(name, lat, lng),
             "website_url": raw.get("website_url"),
             "place_id": raw.get("place_id") or f"catalog:{_norm(country)}:{_norm(city)}:{_norm(name)}",
@@ -1548,13 +1577,13 @@ async def _enrich_images(
     places: List[Dict[str, Any]],
     city: str,
     country: str,
-    limit_places: int = 24,
+    limit_places: int = 30,
     state: str = "",
 ) -> None:
     """Enrich blank destination cards without attaching cross-city business photos."""
     targets = [
         place for place in places if not place.get("images")
-    ][:max(0, min(int(limit_places), 24))]
+    ][:max(0, min(int(limit_places), 30))]
     if not targets:
         return
 
@@ -1611,10 +1640,10 @@ async def _enrich_images(
         # Keep the API response bounded; enrichment must never prevent place details loading.
         await asyncio.wait_for(
             asyncio.gather(*(enrich_one(place) for place in targets), return_exceptions=True),
-            timeout=18.0,
+            timeout=24.0,
         )
     except asyncio.TimeoutError:
-        print("[Destination Images] Image enrichment reached the 18-second response budget; returning all images found so far.")
+        print("[Destination Images] Image enrichment reached the 24-second response budget; returning all images found so far.")
 
 
 async def _discover_hotels(city: str, country: str, state: str, destination: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1760,7 +1789,7 @@ async def destination_health():
             "wikipedia_geosearch": "not-used",
         },
         "catalog_destinations": len(CATALOG.get("destinations", {})),
-        "image_fallback_version": "location-aware-v1",
+        "image_fallback_version": "location-aware-v2-single-url-normalization-30-places",
         "destination_filter_version": "attractions-only-v2",
     }
 
@@ -1904,7 +1933,7 @@ async def explore_city_new(request: Request):
         place.pop("_destination_priority", None)
 
     # Images are non-critical: failure never prevents attractions from loading.
-    await _enrich_images(places, city, country, limit_places=24, state=state)
+    await _enrich_images(places, city, country, limit_places=30, state=state)
 
     hotels = await _discover_hotels(city, country, state, destination)
     destination_currency, destination_symbol = _country_currency(country)
