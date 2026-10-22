@@ -9993,6 +9993,22 @@ _CRICKET_INTERNATIONAL_MARKERS = (
 )
 _CRICKET_DOMESTIC_SHORT_NAMES = {"ipl", "bbl", "psl", "cpl", "wpl", "sa20", "ilt20"}
 
+# Current initial coverage: the agreed eight senior national teams. Domestic
+# leagues (including IPL) remain excluded until explicitly enabled in a future release.
+_CRICKET_TOP8_COUNTRY_ALIASES = {
+    "india": {"india", "ind"},
+    "australia": {"australia", "aus"},
+    "england": {"england", "eng"},
+    "south africa": {"south africa", "sa"},
+    "new zealand": {"new zealand", "nz"},
+    "pakistan": {"pakistan", "pak"},
+    "sri lanka": {"sri lanka", "sl"},
+    "west indies": {"west indies", "wi", "windies"},
+}
+_CRICKET_TOP8_ALIASES_TO_COUNTRY = {
+    alias: country for country, aliases in _CRICKET_TOP8_COUNTRY_ALIASES.items() for alias in aliases
+}
+
 
 _CRICKET_DEVELOPMENT_TEAM_MARKERS = re.compile(
     r"\b(?:a|b|xi|lions|warriors|kingsmen|super kings|royals|knights|titans|"
@@ -10018,6 +10034,39 @@ def _cricket_team_is_national(team_name: str) -> bool:
     value = re.sub(r"\b(?:women|woman|men|male|female)\b", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return any(value == country or value.startswith(country + " ") for country in _CRICKET_NATIONAL_TEAMS)
+
+
+def _cricket_top8_country(team_name: str) -> Optional[str]:
+    """Return the canonical top-eight country only for senior national teams."""
+    value = re.sub(r"[^a-z0-9]+", " ", str(team_name or "").casefold()).strip()
+    if not value or _CRICKET_DEVELOPMENT_TEAM_MARKERS.search(value):
+        return None
+    value = re.sub(r"\b(?:women|woman|men|male|female)\b", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return _CRICKET_TOP8_ALIASES_TO_COUNTRY.get(value)
+
+
+def _cricket_format_key(match_type: str, match_name: str = "", series_name: str = "") -> Optional[str]:
+    """Normalize only Test, ODI and T20 international formats.
+
+    Prefer the provider's explicit matchType so a multi-format tour name cannot
+    accidentally turn an ODI into a Test match (or vice versa).
+    """
+    def classify(value: str) -> Optional[str]:
+        if re.search(r"\btest(?:\s+match|\s+series|s)?\b|world test championship", value):
+            return "test"
+        if re.search(r"\b(?:t20i|t20 international|twenty20 international|t20)\b", value):
+            return "t20"
+        if re.search(r"\b(?:odi|one day international|one-day international)\b", value):
+            return "odi"
+        return None
+
+    explicit_type = str(match_type or "").casefold().strip()
+    explicit_format = classify(explicit_type)
+    if explicit_format:
+        return explicit_format
+    combined = " ".join((str(match_name or ""), str(series_name or ""))).casefold()
+    return classify(combined)
 
 
 def _cricket_normalize_match(raw: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
@@ -10106,22 +10155,25 @@ def _cricket_normalize_match(raw: Dict[str, Any], source: str) -> Optional[Dict[
     series_name = str(series_value or "").strip()
     match_type = str(raw.get("matchType") or raw.get("match_type") or raw.get("type") or "").strip()
     gender = _cricket_gender_hint(match_name, series_name, teams)
-    india_match = any("india" in team.casefold() for team in teams) or "india" in match_name.casefold()
+    format_key = _cricket_format_key(match_type, match_name, series_name)
+    top8_countries = [_cricket_top8_country(team) for team in teams[:2]]
+    india_match = any(country == "india" for country in top8_countries)
     competition_text = " ".join((match_name, series_name, match_type)).casefold()
     is_domestic_competition = (
         any(marker in competition_text for marker in _CRICKET_DOMESTIC_COMPETITIONS if marker not in _CRICKET_DOMESTIC_SHORT_NAMES)
         or any(re.search(r"\b" + re.escape(marker) + r"\b", competition_text) for marker in _CRICKET_DOMESTIC_SHORT_NAMES)
     )
-    national_sides = len(teams) >= 2 and all(_cricket_team_is_national(team) for team in teams[:2])
-    international_marker = (
-        any(marker in competition_text for marker in _CRICKET_INTERNATIONAL_MARKERS)
-        or bool(re.search(r"\b(?:odi|test)\b", match_type.casefold()))
-    )
     exhibition_or_development = any(marker in competition_text for marker in _CRICKET_EXHIBITION_MARKERS)
-    # A series title such as "tour of" must not promote A/Lions/XI teams to the
-    # international senior feed. Require both named sides to be senior national
-    # teams; retain ICC qualifiers and associate-nation internationals.
-    is_international = not is_domestic_competition and not exhibition_or_development and national_sides
+    # Strict rule: both sides must be senior teams from the agreed top eight,
+    # the format must be Test/ODI/T20I, and the fixture must not be a league,
+    # warm-up, A-team, XI, Lions, unofficial or development match.
+    is_international = (
+        len(top8_countries) >= 2
+        and all(country is not None for country in top8_countries)
+        and format_key in {"test", "odi", "t20"}
+        and not is_domestic_competition
+        and not exhibition_or_development
+    )
 
     match_id = str(raw.get("id") or raw.get("matchId") or raw.get("match_id") or "").strip()
     return {
@@ -10129,6 +10181,8 @@ def _cricket_normalize_match(raw: Dict[str, Any], source: str) -> Optional[Dict[
         "name": match_name,
         "series_name": series_name,
         "match_type": match_type,
+        "format": format_key or "other",
+        "format_label": {"odi": "ODI", "t20": "T20", "test": "Test"}.get(format_key, "Other"),
         "teams": teams[:2],
         "team_info": team_info[:2],
         "scores": scores,
@@ -10299,3 +10353,138 @@ async def cricket_scoreboard():
         "data_delay_note": "Provider data may lag live play by several minutes.",
         "cache_ttl_seconds": CRICKET_CURRENT_CACHE_TTL_SECONDS,
     }
+
+
+# On-demand details endpoint. Scorecards consume a separate upstream hit only when
+# a user opens a match, and are cached per match to protect the 100-hit/day plan.
+CRICKET_SCORECARD_CACHE_TTL_SECONDS = max(300, min(int(os.environ.get("CRICKET_SCORECARD_CACHE_TTL_SECONDS", "600")), 21600))
+CRICKET_SCORECARD_FAILURE_BACKOFF_SECONDS = max(600, min(int(os.environ.get("CRICKET_SCORECARD_FAILURE_BACKOFF_SECONDS", "1800")), 21600))
+_cricket_scorecard_cache: Dict[str, Dict[str, Any]] = {}
+_cricket_scorecard_lock = asyncio.Lock()
+
+
+def _cricket_find_list(data: Any, keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            normalized = [dict(item) for item in value if isinstance(item, dict)]
+            if normalized:
+                return normalized
+    # Some provider responses wrap match details under `data` or `match`.
+    for key in ("data", "match", "result"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            result = _cricket_find_list(nested, keys)
+            if result:
+                return result
+    return []
+
+
+def _cricket_scorecard_response(match_id: str, data: Dict[str, Any], fetched_at: str) -> Dict[str, Any]:
+    scorecard = _cricket_find_list(data, ("scorecard", "scoreCard", "innings", "inningScorecard"))
+    commentary = _cricket_find_list(data, ("commentary", "ballByBall", "ball_by_ball", "deliveries", "balls", "ballCommentary"))
+    if not commentary:
+        # Some provider payloads attach event lists to individual innings.
+        for inning in scorecard:
+            commentary.extend(_cricket_find_list(inning, ("commentary", "ballByBall", "ball_by_ball", "deliveries", "balls", "ballCommentary")))
+    return {
+        "status": "success",
+        "provider": "Cricket Data",
+        "match_id": match_id,
+        "match": {
+            "name": str(data.get("name") or data.get("matchName") or ""),
+            "match_type": str(data.get("matchType") or data.get("match_type") or ""),
+            "status": str(data.get("status") or ""),
+            "venue": str(data.get("venue") or ""),
+            "teams": data.get("teams") if isinstance(data.get("teams"), list) else [],
+            "team_info": data.get("teamInfo") if isinstance(data.get("teamInfo"), list) else [],
+            "toss_winner": str(data.get("tossWinner") or ""),
+            "toss_choice": str(data.get("tossChoice") or ""),
+            "match_winner": str(data.get("matchWinner") or ""),
+            "player_of_match": str(data.get("player_of_match") or data.get("playerOfMatch") or ""),
+        },
+        "scorecard": scorecard,
+        "scorecard_available": bool(scorecard),
+        "commentary": commentary,
+        "commentary_available": bool(commentary),
+        "commentary_message": (
+            None if commentary else
+            "The provider response did not include ball-by-ball commentary. Cricket Data's published documentation currently describes its Fantasy ball-by-ball API as in testing; no commentary has been invented."
+        ),
+        "data": data,
+        "updated_at": fetched_at,
+        "data_delay_note": "Scores and detailed data can be delayed by the provider.",
+    }
+
+
+@app.get("/api/v1/cricket/matches/{match_id}/scorecard")
+async def cricket_match_scorecard(match_id: str):
+    """Fetch a requested match scorecard on demand; return commentary only when supplied."""
+    safe_match_id = str(match_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", safe_match_id):
+        raise HTTPException(status_code=400, detail="Invalid cricket match ID.")
+    if not CRICKET_DATA_API_KEY:
+        return {"status": "unavailable", "message": "Cricket Data API key is not configured on the backend.", "scorecard": [], "commentary": []}
+
+    now = time.monotonic()
+    cached = _cricket_scorecard_cache.get(safe_match_id)
+    if cached and now < cached.get("expires_at", 0):
+        if cached.get("payload") is not None:
+            return dict(cached["payload"], cache_hit=True)
+        return {"status": "unavailable", "message": cached.get("error") or "Scorecard temporarily unavailable.", "scorecard": [], "commentary": [], "cache_hit": True}
+
+    async with _cricket_scorecard_lock:
+        now = time.monotonic()
+        cached = _cricket_scorecard_cache.get(safe_match_id)
+        if cached and now < cached.get("expires_at", 0):
+            if cached.get("payload") is not None:
+                return dict(cached["payload"], cache_hit=True)
+            return {"status": "unavailable", "message": cached.get("error") or "Scorecard temporarily unavailable.", "scorecard": [], "commentary": [], "cache_hit": True}
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(CRICKET_DATA_TIMEOUT_SECONDS, connect=5.0),
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(
+                    f"{CRICKET_DATA_BASE_URL}/match_scorecard",
+                    params={"apikey": CRICKET_DATA_API_KEY, "offset": 0, "id": safe_match_id},
+                    headers={"Accept": "application/json", "User-Agent": "OmniTouristOS/1.0 cricket-centre"},
+                )
+            if response.status_code != 200:
+                raise ValueError(f"Provider returned HTTP {response.status_code}.")
+            provider_payload = response.json()
+            provider_status = str(provider_payload.get("status") or "").casefold() if isinstance(provider_payload, dict) else ""
+            data = provider_payload.get("data") if isinstance(provider_payload, dict) else None
+            if provider_status not in {"", "success"} or not isinstance(data, dict):
+                # Deliberately don't log or return raw URLs: provider URLs contain the key.
+                message = str((provider_payload or {}).get("reason") or (provider_payload or {}).get("message") or "Detailed scorecard is unavailable for this match or API plan.") if isinstance(provider_payload, dict) else "Invalid scorecard response."
+                raise ValueError(message[:240])
+            fetched_at = datetime.now(timezone.utc).isoformat()
+            payload = _cricket_scorecard_response(safe_match_id, data, fetched_at)
+            _cricket_scorecard_cache[safe_match_id] = {
+                "payload": payload, "error": None,
+                "expires_at": time.monotonic() + CRICKET_SCORECARD_CACHE_TTL_SECONDS,
+            }
+            return payload
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, ValueError) else "Detailed scorecard request failed. Please retry later."
+            _cricket_scorecard_cache[safe_match_id] = {
+                "payload": None, "error": message[:240],
+                "expires_at": time.monotonic() + CRICKET_SCORECARD_FAILURE_BACKOFF_SECONDS,
+            }
+            print(f"[Cricket Centre Scorecard Notice] scorecard request failed ({type(exc).__name__}); failed response cached to protect the daily quota.")
+            return {
+                "status": "unavailable",
+                "provider": "Cricket Data",
+                "match_id": safe_match_id,
+                "message": message[:240],
+                "scorecard": [],
+                "scorecard_available": False,
+                "commentary": [],
+                "commentary_available": False,
+                "commentary_message": "Ball-by-ball commentary is not present in the available response.",
+                "updated_at": None,
+                "cache_hit": False,
+            }
