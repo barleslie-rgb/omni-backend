@@ -1920,6 +1920,36 @@ async def explore_city_new(request: Request):
             f"place name(s) for {city}."
         )
 
+    nominatim_supplement_used = False
+
+    # A local-catalogue destination may start with only a few curated records.
+    # If Overpass is unavailable or returns too few attractions, supplement the
+    # curated records with Nominatim results instead of silently returning only
+    # the small local list. Keep the curated records and let the existing
+    # attraction filter/deduplicator decide which additional records are useful.
+    if source_mode == "LOCAL_CATALOG" and len(places) < 30:
+        nominatim_places = await _discover_places_with_nominatim(
+            city, country, state, destination
+        )
+        if nominatim_places:
+            nominatim_supplement_used = True
+            before_nominatim_count = len(places)
+            places.extend(
+                place for place in nominatim_places
+                if _is_destination_attraction_record(place)
+            )
+            places = _deduplicate_destination_places(places)
+            added_count = max(0, len(places) - before_nominatim_count)
+            print(
+                f"[Destination Places] Nominatim supplement for {city}: "
+                f"added {added_count} new attraction(s); total before cap={len(places)}."
+            )
+        else:
+            print(
+                f"[Destination Places] Nominatim supplement returned no usable "
+                f"additional attractions for {city}; retaining {len(places)} existing place(s)."
+            )
+
     # Keep curated local-catalogue entries first; then prefer well-described OSM
     # attractions (Wikipedia/Wikidata, heritage/nature tags, and worship sites).
     places.sort(key=lambda place: (
@@ -1959,7 +1989,7 @@ async def explore_city_new(request: Request):
         "places_provider": (
             "Omni Local Catalog" if source_mode == "LOCAL_CATALOG"
             else "OpenStreetMap Nominatim"
-        ) + (" + OpenStreetMap Overpass" if overpass_places else "") + (" + Shared Places Catalog" if shared_added else ""),
+        ) + (" + OpenStreetMap Overpass" if overpass_places else "") + (" + OpenStreetMap Nominatim" if nominatim_supplement_used else "") + (" + Shared Places Catalog" if shared_added else ""),
         "places_state": "VERIFIED" if places else "EMPTY",
         "landmarks": places,
         "places": places,
@@ -1974,6 +2004,7 @@ async def explore_city_new(request: Request):
             "source_mode": source_mode,
             "shared_catalog_places_added": shared_added,
             "overpass_used": bool(overpass_places),
+            "nominatim_supplement_used": nominatim_supplement_used,
             "wikipedia_geosearch_used": False,
             "google_places_required": False,
         },
