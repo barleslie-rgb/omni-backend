@@ -9994,14 +9994,28 @@ _CRICKET_INTERNATIONAL_MARKERS = (
 _CRICKET_DOMESTIC_SHORT_NAMES = {"ipl", "bbl", "psl", "cpl", "wpl", "sa20", "ilt20"}
 
 
+_CRICKET_DEVELOPMENT_TEAM_MARKERS = re.compile(
+    r"\b(?:a|b|xi|lions|warriors|kingsmen|super kings|royals|knights|titans|"
+    r"strikers|riders|challengers|sunrisers|capitals|gladiators|comets|falcons|"
+    r"dragons|phoenix|stars|sixes|heat|hurricanes|scorchers|renegades|thunder|"
+    r"blaze|academy|county|emerging|development|u ?19|under ?19|under nineteen)\b"
+)
+_CRICKET_EXHIBITION_MARKERS = (
+    "warm-up", "warm up", "unofficial", "practice match", "tour match",
+    "intra-squad", "intra squad", "exhibition match", "development match",
+)
+
+
 def _cricket_team_is_national(team_name: str) -> bool:
     value = re.sub(r"[^a-z0-9]+", " ", str(team_name or "").casefold()).strip()
     if not value:
         return False
-    # Franchise and domestic development sides should not be mistaken for senior national teams.
-    if re.search(r"\b(?:lions|warriors|kingsmen|super kings|royals|knights|titans|strikers|riders|challengers|sunrisers|capitals|gladiators|comets|falcons|dragons|phoenix|stars|sixes|heat|hurricanes|scorchers|renegades|thunder|blaze|academy|county|xi)\b", value):
+    # Never treat an A/B, XI, Lions, academy, emerging, or other development side
+    # as the senior national team just because stripping that suffix leaves a
+    # recognized country name (e.g. "West Indies A").
+    if _CRICKET_DEVELOPMENT_TEAM_MARKERS.search(value):
         return False
-    value = re.sub(r"\b(?:women|woman|men|male|female|a|u ?19|under 19|under ?19|emerging|development)\b", " ", value)
+    value = re.sub(r"\b(?:women|woman|men|male|female)\b", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return any(value == country or value.startswith(country + " ") for country in _CRICKET_NATIONAL_TEAMS)
 
@@ -10103,7 +10117,11 @@ def _cricket_normalize_match(raw: Dict[str, Any], source: str) -> Optional[Dict[
         any(marker in competition_text for marker in _CRICKET_INTERNATIONAL_MARKERS)
         or bool(re.search(r"\b(?:odi|test)\b", match_type.casefold()))
     )
-    is_international = not is_domestic_competition and (national_sides or international_marker)
+    exhibition_or_development = any(marker in competition_text for marker in _CRICKET_EXHIBITION_MARKERS)
+    # A series title such as "tour of" must not promote A/Lions/XI teams to the
+    # international senior feed. Require both named sides to be senior national
+    # teams; retain ICC qualifiers and associate-nation internationals.
+    is_international = not is_domestic_competition and not exhibition_or_development and national_sides
 
     match_id = str(raw.get("id") or raw.get("matchId") or raw.get("match_id") or "").strip()
     return {
