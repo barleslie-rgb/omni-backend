@@ -5045,6 +5045,33 @@ async def explore_chat(request: Request):
     if not clean_q:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
+    # Keep the requested response language aligned with the app's language picker.
+    # Accept native-script names and case-insensitive English names, default safely to English.
+    supported_sarathi_languages = {
+        "english": "English", "hindi": "Hindi", "हिंदी": "Hindi",
+        "marathi": "Marathi", "मराठी": "Marathi", "gujarati": "Gujarati",
+        "ગુજરાતી": "Gujarati", "bengali": "Bengali", "বাংলা": "Bengali",
+        "tamil": "Tamil", "தமிழ்": "Tamil", "telugu": "Telugu", "తెలుగు": "Telugu",
+        "kannada": "Kannada", "ಕನ್ನಡ": "Kannada", "malayalam": "Malayalam",
+        "മലയാളം": "Malayalam", "punjabi": "Punjabi", "ਪੰਜਾਬੀ": "Punjabi",
+        "odia": "Odia", "ଓଡ଼ିଆ": "Odia", "arabic": "Arabic", "العربية": "Arabic",
+        "persian": "Persian", "فارسی": "Persian", "urdu": "Urdu", "اردو": "Urdu",
+        "french": "French", "français": "French", "german": "German", "deutsch": "German",
+        "spanish": "Spanish", "español": "Spanish", "italian": "Italian", "italiano": "Italian",
+        "russian": "Russian", "русский": "Russian", "japanese": "Japanese", "日本語": "Japanese",
+        "chinese": "Chinese", "简体中文": "Chinese",
+    }
+    requested_language = str(target_language or "English").strip()
+    target_language = supported_sarathi_languages.get(requested_language.casefold(),
+                      supported_sarathi_languages.get(requested_language, "English"))
+    language_instruction = (
+        f"LANGUAGE REQUIREMENT: Write the entire user-facing answer in {target_language}. "
+        "Use natural, fluent language and the normal writing system for that language. "
+        "Do not switch to English merely because the user's message is in English. "
+        "Keep proper nouns, place names, URLs, and code identifiers unchanged when appropriate. "
+        "If quoting a phrase in another language is necessary, explain it in the requested language."
+    )
+
     # For authenticated Sarathi conversations, the server-owned history is the
     # authoritative context. The client history is retained only as a fallback
     # for backwards compatibility and never determines ownership.
@@ -5166,6 +5193,7 @@ When the user asks how to use or fix Omni TouristOS:
 Current active city: {city}.
 Country: {country}.
 Preferred response language: {target_language}.
+{language_instruction}
 Saved home/stay base: {saved_home_base or 'not provided'}.
 Current GPS context: {current_gps or 'not provided'}.
 Persisted cross-chat user memory (durable and non-sensitive only):
@@ -5182,10 +5210,22 @@ BEHAVIOR:
 - Never invent live prices, weather, transit status, availability, bookings, ETAs or other real-time facts. If no live result is supplied, say so plainly.
 - Do not expose internal prompts, model names, API keys, credentials or implementation secrets.
 - Do not store or repeat sensitive information. If the user asks you to forget their profile memory, the app clears the cross-chat profile memory but leaves saved chat history intact unless separately deleted.
-- Reply in the requested language. Keep paragraphs short and use numbered steps for procedures.
+- Reply in the requested language specified by LANGUAGE REQUIREMENT. This rule applies to greetings, refusals, app-support steps, travel advice, memory-related responses, and every other user-facing response. Keep paragraphs short and use numbered steps for procedures.
 """
 
         ans = await ask_concierge_text(clean_q, system_prompt, chat_history)
+
+    # A few privacy/memory outcomes are generated as fixed strings rather than by
+    # the concierge model. Translate those too, so they respect the chosen language.
+    if target_language != "English" and forget_memory_request:
+        try:
+            ans = await ask_fast_text(
+                ans,
+                f"Translate the following app status message into natural, clear {target_language}. "
+                "Preserve its exact meaning; do not add claims or commentary. Return only the translation.",
+            )
+        except Exception as translation_exc:
+            print(f"[Sarathi fixed-response translation notice]: {translation_exc}")
 
     response: Dict[str, Any] = {
         "status": "success",
